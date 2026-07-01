@@ -9,8 +9,10 @@ from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from speculators import SpeculatorsConfig, VerifierConfig
-from speculators.models.dflash import DFlashSpeculatorConfig
+from speculators.models.dflash import DFlashSpeculatorConfig, GlmMoeDsaDraftConfig
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dspark.config import DSparkSpeculatorConfig
+from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3 import Eagle3SpeculatorConfig
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.mtp import MTPSpeculatorConfig
@@ -49,6 +51,30 @@ TINY_QWEN3_CONFIG = Qwen3Config(
     max_position_embeddings=256,
     rms_norm_eps=1e-6,
     tie_word_embeddings=False,
+)
+
+TINY_GLM_MOE_DSA_CONFIG = GlmMoeDsaDraftConfig(
+    vocab_size=128,
+    hidden_size=64,
+    intermediate_size=128,
+    num_hidden_layers=2,
+    num_attention_heads=4,
+    num_key_value_heads=4,
+    max_position_embeddings=256,
+    q_lora_rank=16,
+    kv_lora_rank=8,
+    qk_nope_head_dim=12,
+    qk_rope_head_dim=4,
+    v_head_dim=16,
+    n_routed_experts=4,
+    num_experts_per_tok=2,
+    n_shared_experts=1,
+    moe_intermediate_size=16,
+    first_k_dense_replace=1,
+    index_topk=8,
+    index_topk_freq=1,
+    rope_parameters={"rope_type": "default", "rope_theta": 10000.0},
+    _attn_implementation="eager",
 )
 
 TINY_QWEN3_5_KWARGS: dict = {
@@ -161,6 +187,84 @@ def make_dflash_model(
         ),
     )
     model = DFlashDraftModel(config)
+    _fill_nan_weights(model)
+    return model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
+
+
+def make_glm_dflash_model(
+    *,
+    draft_vocab_size: int = 64,
+    block_size: int = 4,
+    max_anchors: int = 8,
+    draft_attn_impl: str | None = "eager",
+    device: str = "cuda:0",
+    dtype: torch.dtype = torch.bfloat16,
+) -> DFlashDraftModel:
+    """Create a tiny GLM-style DFlash model with real initialized weights."""
+    transformer_config = copy.deepcopy(TINY_GLM_MOE_DSA_CONFIG)
+    if draft_attn_impl is not None:
+        transformer_config._attn_implementation = draft_attn_impl
+    config = DFlashSpeculatorConfig(
+        transformer_layer_config=transformer_config,
+        draft_vocab_size=draft_vocab_size,
+        block_size=block_size,
+        max_anchors=max_anchors,
+        aux_hidden_state_layer_ids=[0, 1, 2],
+        mask_token_id=0,
+        speculators_config=SpeculatorsConfig(
+            algorithm="dflash",
+            proposal_methods=[
+                GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+            ],
+            default_proposal_method="greedy",
+            verifier=VerifierConfig(
+                name_or_path=None,
+                architectures=["GlmMoeDsaForCausalLM"],
+            ),
+        ),
+    )
+    model = DFlashDraftModel(config)
+    _fill_nan_weights(model)
+    return model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
+
+
+def make_glm_dspark_model(
+    *,
+    draft_vocab_size: int = 64,
+    block_size: int = 4,
+    max_anchors: int = 8,
+    draft_attn_impl: str | None = "eager",
+    device: str = "cuda:0",
+    dtype: torch.dtype = torch.bfloat16,
+) -> DSparkDraftModel:
+    """Create a tiny GLM-style DSpark model with real initialized weights."""
+    transformer_config = copy.deepcopy(TINY_GLM_MOE_DSA_CONFIG)
+    if draft_attn_impl is not None:
+        transformer_config._attn_implementation = draft_attn_impl
+    config = DSparkSpeculatorConfig(
+        transformer_layer_config=transformer_config,
+        draft_vocab_size=draft_vocab_size,
+        block_size=block_size,
+        max_anchors=max_anchors,
+        aux_hidden_state_layer_ids=[0, 1, 2],
+        mask_token_id=0,
+        markov_rank=8,
+        markov_head_type="vanilla",
+        enable_confidence_head=True,
+        confidence_head_with_markov=True,
+        speculators_config=SpeculatorsConfig(
+            algorithm="dspark",
+            proposal_methods=[
+                GreedyTokenProposalConfig(speculative_tokens=block_size - 1)
+            ],
+            default_proposal_method="greedy",
+            verifier=VerifierConfig(
+                name_or_path=None,
+                architectures=["GlmMoeDsaForCausalLM"],
+            ),
+        ),
+    )
+    model = DSparkDraftModel(config)
     _fill_nan_weights(model)
     return model.to(device=device, dtype=dtype)  # type: ignore[call-arg]
 

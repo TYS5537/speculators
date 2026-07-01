@@ -18,6 +18,7 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
 )
+from speculators.models.dflash.config import GlmMoeDsaDraftConfig
 from speculators.model import SpeculatorModel
 from speculators.models.eagle3.data import shift_batch
 from speculators.models.metrics import resolve_loss_config
@@ -45,6 +46,7 @@ from speculators.utils.loading import is_config_only_dir
 logger = logging.getLogger(__name__)
 
 DRAFT_ARCH_CONFIGS: dict[str, type] = {
+    "glm_moe_dsa": GlmMoeDsaDraftConfig,
     "llama": LlamaConfig,
     "qwen3": Qwen3Config,
 }
@@ -77,7 +79,15 @@ def create_transformer_layer_config(  # noqa: C901
             f"Available: {list(DRAFT_ARCH_CONFIGS.keys())}"
         )
 
-    if draft_arch not in ("llama", "qwen3"):
+    if draft_arch == "glm_moe_dsa":
+        warnings.warn(
+            "Draft architecture 'glm_moe_dsa' is a native GLM-style "
+            "DFlash/DSpark training path. vLLM serving compatibility for this "
+            "speculator architecture is not implemented yet; use it for "
+            "training/dry-run only.",
+            stacklevel=2,
+        )
+    elif draft_arch not in ("llama", "qwen3"):
         warnings.warn(
             f"Draft architecture '{draft_arch}' is not yet supported in vLLM. "
             "The trained model may not be usable for inference in vLLM. "
@@ -127,6 +137,65 @@ def create_transformer_layer_config(  # noqa: C901
         "sliding_attention" if i in sliding_window_indices else "full_attention"
         for i in range(num_layers)
     ]
+
+    if draft_arch == "glm_moe_dsa":
+        rope_parameters = deepcopy(
+            getattr(
+                verifier_config,
+                "rope_parameters",
+                {"rope_type": "default", "rope_theta": 10000.0},
+            )
+        )
+        config = config_class(
+            vocab_size=verifier_config.vocab_size,
+            hidden_size=verifier_config.hidden_size,
+            intermediate_size=resolve_draft_intermediate_size(verifier_config),
+            num_hidden_layers=num_layers,
+            num_attention_heads=num_attention_heads,
+            num_key_value_heads=num_key_value_heads,
+            hidden_act=hidden_act,
+            max_position_embeddings=verifier_config.max_position_embeddings,
+            initializer_range=verifier_config.initializer_range,
+            rms_norm_eps=verifier_config.rms_norm_eps,
+            attention_bias=getattr(verifier_config, "attention_bias", False),
+            attention_dropout=getattr(verifier_config, "attention_dropout", 0.0),
+            q_lora_rank=getattr(verifier_config, "q_lora_rank", None),
+            kv_lora_rank=getattr(verifier_config, "kv_lora_rank", None),
+            qk_nope_head_dim=getattr(verifier_config, "qk_nope_head_dim", head_dim),
+            qk_rope_head_dim=getattr(verifier_config, "qk_rope_head_dim", 0),
+            v_head_dim=getattr(verifier_config, "v_head_dim", head_dim),
+            n_routed_experts=getattr(verifier_config, "n_routed_experts", 0),
+            num_experts_per_tok=getattr(verifier_config, "num_experts_per_tok", 1),
+            n_shared_experts=getattr(verifier_config, "n_shared_experts", 0),
+            moe_intermediate_size=getattr(
+                verifier_config,
+                "moe_intermediate_size",
+                resolve_draft_intermediate_size(verifier_config),
+            ),
+            first_k_dense_replace=getattr(verifier_config, "first_k_dense_replace", 0),
+            scoring_func=getattr(verifier_config, "scoring_func", "softmax"),
+            norm_topk_prob=getattr(verifier_config, "norm_topk_prob", True),
+            routed_scaling_factor=getattr(
+                verifier_config, "routed_scaling_factor", 1.0
+            ),
+            index_topk=getattr(verifier_config, "index_topk", None),
+            index_topk_freq=getattr(verifier_config, "index_topk_freq", 1),
+            index_skip_topk_offset=getattr(
+                verifier_config, "index_skip_topk_offset", 2
+            ),
+            index_topk_pattern=getattr(verifier_config, "index_topk_pattern", None),
+            indexer_rope_interleave=getattr(
+                verifier_config, "indexer_rope_interleave", False
+            ),
+            rope_interleave=getattr(verifier_config, "rope_interleave", False),
+            rope_parameters=rope_parameters,
+            tie_word_embeddings=False,
+            sliding_window=sliding_window,
+            layer_types=layer_types,
+        )
+        # TODO(glm): This config synthesis covers the first training milestone.
+        # Revisit once vLLM serving defines a loadable GLM speculator architecture.
+        return config
 
     config = config_class(
         vocab_size=verifier_config.vocab_size,
@@ -184,9 +253,10 @@ def load_draft_transformer_layer_config(
 
     ``draft_config`` may be a HF hub id, a local directory containing a
     ``config.json``, or a path to a config JSON file. It is expected to hold a
-    plain decoder config (``LlamaConfig`` for eagle3/peagle, ``Qwen3Config`` for
-    dflash). If a full speculator config is given instead, its nested
-    ``transformer_layer_config`` is extracted as a convenience.
+    plain decoder config (``LlamaConfig`` for eagle3/peagle, ``Qwen3Config`` or
+    ``GlmMoeDsaDraftConfig`` for dflash/dspark). If a full speculator config is
+    given instead, its nested ``transformer_layer_config`` is extracted as a
+    convenience.
 
     The decoder is reconciled against the verifier: ``hidden_size`` must match
     (draft/verifier hidden-size mismatch is not yet supported) and ``vocab_size``
@@ -202,10 +272,13 @@ def load_draft_transformer_layer_config(
     if not model_type:
         raise ValueError(
             "--draft-config must define a 'model_type' (e.g. 'llama' for "
-            "eagle3/peagle, 'qwen3' for dflash); none was found in the config "
-            f"loaded from '{draft_config}'."
+            "eagle3/peagle, 'qwen3' or 'glm_moe_dsa' for dflash/dspark); none "
+            f"was found in the config loaded from '{draft_config}'."
         )
-    config_class: type[PretrainedConfig] = type(AutoConfig.for_model(model_type))
+    if model_type == GlmMoeDsaDraftConfig.model_type:
+        config_class: type[PretrainedConfig] = GlmMoeDsaDraftConfig
+    else:
+        config_class = type(AutoConfig.for_model(model_type))
     draft_config_obj = config_class.from_dict(config_dict)
 
     verifier_config = get_verifier_config(verifier_name_or_path)

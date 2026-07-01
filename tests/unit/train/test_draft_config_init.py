@@ -30,6 +30,7 @@ from scripts.train import (
     parse_args,
 )
 from speculators import SpeculatorsConfig, VerifierConfig
+from speculators.models.dflash import GlmMoeDsaDraftConfig
 from speculators.models.eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.utils.loading import is_config_only_dir
@@ -408,12 +409,12 @@ def _make_verifier_namespace(**overrides) -> SimpleNamespace:
     return SimpleNamespace(**base)
 
 
-def _create_layer_config_for(verifier: SimpleNamespace):
+def _create_layer_config_for(verifier: SimpleNamespace, draft_arch: str = "qwen3"):
     with patch("scripts.train.AutoConfig.from_pretrained", return_value=verifier):
         return create_transformer_layer_config(
             "target",
             num_layers=2,
-            draft_arch="qwen3",
+            draft_arch=draft_arch,
             hidden_act=None,
             sliding_window=2048,
             sliding_window_indices=[],
@@ -426,6 +427,49 @@ def test_create_layer_config_uses_dense_intermediate_size():
     config = _create_layer_config_for(verifier)
 
     assert config.intermediate_size == 48
+
+
+def test_create_layer_config_synthesizes_glm_moe_dsa_draft():
+    verifier = _make_verifier_namespace(
+        model_type="glm_moe_dsa",
+        vocab_size=154880,
+        hidden_size=6144,
+        num_attention_heads=64,
+        num_key_value_heads=64,
+        intermediate_size=12288,
+        head_dim=192,
+        q_lora_rank=2048,
+        kv_lora_rank=512,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        v_head_dim=256,
+        n_routed_experts=256,
+        num_experts_per_tok=8,
+        n_shared_experts=1,
+        moe_intermediate_size=2048,
+        first_k_dense_replace=3,
+        index_topk=2048,
+        index_topk_freq=4,
+        index_skip_topk_offset=3,
+        indexer_rope_interleave=True,
+        rope_interleave=True,
+        rope_parameters={"rope_type": "default", "rope_theta": 8000000},
+    )
+
+    config = _create_layer_config_for(verifier, draft_arch="glm_moe_dsa")
+
+    assert isinstance(config, GlmMoeDsaDraftConfig)
+    assert config.model_type == "glm_moe_dsa"
+    assert config.num_hidden_layers == 2
+    assert config.q_lora_rank == 2048
+    assert config.kv_lora_rank == 512
+    assert config.qk_nope_head_dim == 192
+    assert config.qk_rope_head_dim == 64
+    assert config.v_head_dim == 256
+    assert config.n_routed_experts == 256
+    assert config.num_experts_per_tok == 8
+    assert config.index_topk == 2048
+    assert config.rope_parameters["rope_theta"] == 8000000
 
 
 def test_create_layer_config_infers_moe_intermediate_size():

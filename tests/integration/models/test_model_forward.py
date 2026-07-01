@@ -23,6 +23,8 @@ from tests.integration.conftest import (
     make_batch,
     make_dflash_model,
     make_eagle3_model,
+    make_glm_dflash_model,
+    make_glm_dspark_model,
     make_mtp_model,
     make_peagle_model,
     make_sample,
@@ -297,6 +299,22 @@ class TestDFlashParams:
                 rtol=1e-3,
                 msg=f"{backend} loss diverges from {ref_backend}",
             )
+
+
+@requires_cuda
+class TestGLMDFlashParams:
+    @pytest.mark.parametrize("factory", [make_glm_dflash_model, make_glm_dspark_model])
+    def test_glm_backbone_forward(self, factory):
+        model = factory()
+        samples = _make_samples([128])
+        batch = make_batch(max_len=MAX_LEN, samples=samples, hidden_size=HIDDEN_SIZE)
+
+        draft_tokens, loss, metrics = model(**batch)
+
+        assert draft_tokens.shape == (1, model.config.max_anchors * model.block_size)
+        assert loss.isfinite()
+        assert "loss_sum" in metrics
+        loss.backward()
 
 
 @requires_cuda
