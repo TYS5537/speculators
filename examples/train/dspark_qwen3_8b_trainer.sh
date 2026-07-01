@@ -24,7 +24,7 @@ VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=8192
 EPOCHS=5
-LR=3e-4
+LR=6e-4
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
@@ -32,7 +32,7 @@ BLOCK_SIZE=8
 MAX_ANCHORS=3072
 NUM_LAYERS=5
 DRAFT_VOCAB_SIZE=32000
-TARGET_LAYER_IDS="2 18 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
+TARGET_LAYER_IDS="1 9 17 25 33"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 
 # Markov + confidence head settings
