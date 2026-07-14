@@ -83,6 +83,8 @@ def compute_metrics(
     gamma: float = 4.0,
     confidence_head_alpha: float = 1.0,
     cat_mode: CatMode = "none",
+    base_logits: torch.Tensor | None = None,
+    curriculum_base_weight: torch.Tensor | float = 0.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -94,7 +96,7 @@ def compute_metrics(
         cat_mode, logits, targets, loss_mask, block_size
     )
 
-    loss, term_losses = compound_loss(
+    final_draft_loss, term_losses = compound_loss(
         logits,
         targets,
         loss_mask,
@@ -103,6 +105,29 @@ def compute_metrics(
         decay_fn=decay_fn,
         position_weights=cat_weights,
     )
+    base_loss = None
+    if base_logits is not None:
+        # The base objective intentionally has no CAT: it anchors the parallel
+        # backbone to the original DFlash position-decayed objective.
+        base_loss, _ = compound_loss(
+            base_logits,
+            targets,
+            loss_mask,
+            pos_idx,
+            loss_config=loss_config,
+            decay_fn=decay_fn,
+        )
+        base_weight = torch.as_tensor(
+            curriculum_base_weight,
+            device=final_draft_loss.device,
+            dtype=final_draft_loss.dtype,
+        ).clamp(0.0, 1.0)
+        loss = base_weight * base_loss + (1.0 - base_weight) * final_draft_loss
+    else:
+        base_weight = torch.zeros(
+            (), device=final_draft_loss.device, dtype=final_draft_loss.dtype
+        )
+        loss = final_draft_loss
 
     # Analytical per-position acceptance rate = distributional overlap.
     with torch.no_grad():
@@ -117,6 +142,13 @@ def compute_metrics(
         accept_prefix = (accept_blocks[:, 1:] * draft_mask).cumprod(dim=-1)
 
     metrics: dict[str, Any] = {}
+    if base_loss is not None:
+        metrics["base_loss_sum"] = base_loss.detach().clone()
+        metrics["base_loss_total"] = torch.ones((), device=device)
+        metrics["final_loss_sum"] = final_draft_loss.detach().clone()
+        metrics["final_loss_total"] = torch.ones((), device=device)
+        metrics["curriculum_base_weight_sum"] = base_weight.detach().clone()
+        metrics["curriculum_base_weight_total"] = torch.ones((), device=device)
     if confidence_logits is not None:
         c_star = accept_rate.detach().to(confidence_logits.dtype)
         bce = binary_cross_entropy_with_logits(

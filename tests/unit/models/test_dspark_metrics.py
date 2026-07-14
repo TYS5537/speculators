@@ -220,3 +220,41 @@ class TestComputeMetrics:
         # so draft-CAT loss should be <= unweighted loss for the same terms.
         assert float(loss_draft) <= float(loss_none) + 1e-5
         assert "cat_weight_mean_sum" in metrics
+
+    def test_base_to_final_curriculum_endpoints(self):
+        torch.manual_seed(4)
+        targets = torch.randn(1, 4, 8)
+        base_logits = targets.clone()
+        final_logits = -targets
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+        config = resolve_loss_config("tv")
+
+        base_loss, base_metrics = compute_metrics(
+            final_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=config,
+            base_logits=base_logits,
+            curriculum_base_weight=1.0,
+        )
+        final_loss, final_metrics = compute_metrics(
+            final_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=config,
+            base_logits=base_logits,
+            curriculum_base_weight=0.0,
+        )
+        assert float(base_loss) < float(final_loss)
+        assert torch.isclose(
+            base_metrics["curriculum_base_weight_sum"], torch.tensor(1.0)
+        )
+        assert torch.isclose(
+            final_metrics["curriculum_base_weight_sum"], torch.tensor(0.0)
+        )
+        assert "base_loss_sum" in final_metrics
+        assert "final_loss_sum" in final_metrics

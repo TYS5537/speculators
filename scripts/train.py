@@ -553,6 +553,11 @@ def main(args: argparse.Namespace):  # noqa: C901
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
+        curriculum_base_to_final=(
+            args.speculator_type == "dspark"
+            and args.enable_correction_head
+            and args.correction_curriculum
+        ),
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -1018,6 +1023,48 @@ def parse_args():
         help="DSpark: sequential head variant (default: vanilla).",
     )
     parser.add_argument(
+        "--enable-correction-head",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DSpark: replace the Markov head with a tiny causal "
+            "Transformer that predicts residual correction logits."
+        ),
+    )
+    parser.add_argument(
+        "--correction-hidden-size",
+        type=int,
+        default=512,
+        help="DSpark correction-head hidden width (default: 512).",
+    )
+    parser.add_argument(
+        "--correction-rank",
+        type=int,
+        default=256,
+        help="DSpark low-rank correction-logit bottleneck (default: 256).",
+    )
+    parser.add_argument(
+        "--correction-num-layers",
+        type=int,
+        default=1,
+        help="Number of tiny causal correction layers (default: 1).",
+    )
+    parser.add_argument(
+        "--correction-num-heads",
+        type=int,
+        default=8,
+        help="Attention heads per correction layer (default: 8).",
+    )
+    parser.add_argument(
+        "--correction-curriculum",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Linearly anneal DSpark correction training from base-logit loss to "
+            "corrected-logit loss (default: enabled)."
+        ),
+    )
+    parser.add_argument(
         "--enable-confidence-head",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -1042,7 +1089,7 @@ def parse_args():
         default="none",
         choices=["none", "target", "draft"],
         help=(
-            "DSpark: Confidence-Adaptive Token (CAT) loss reweighting. "
+            "Confidence-Adaptive Token (CAT) loss reweighting. "
             "'target' uses PARD-2 target GT-token confidence prefix products; "
             "'draft' uses analytical draft/target acceptance overlap prefix "
             "products; 'none' disables CAT (default)."

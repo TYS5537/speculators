@@ -20,6 +20,7 @@ from speculators import (
     VerifierConfig,
     reload_schemas,
 )
+from speculators.models.dspark import DSparkSpeculatorConfig
 from speculators.models.eagle3 import Eagle3SpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
@@ -538,3 +539,34 @@ def test_eagle3_config_norm_output_defaults():
         speculators_config=_make_eagle3_speculators_config(),
     )
     assert config.norm_output is False
+
+
+@pytest.mark.sanity
+def test_dspark_correction_config_roundtrip():
+    speculators_config = SpeculatorsConfig(
+        algorithm="dspark",
+        proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=3)],
+        default_proposal_method="greedy",
+        verifier=VerifierConfig(
+            name_or_path=None,
+            architectures=["LlamaForCausalLM"],
+        ),
+    )
+    original = DSparkSpeculatorConfig(
+        transformer_layer_config=copy.deepcopy(TINY_LLAMA_CONFIG),
+        draft_vocab_size=64,
+        block_size=4,
+        enable_correction_head=True,
+        correction_hidden_size=32,
+        correction_rank=8,
+        correction_num_layers=2,
+        correction_num_heads=4,
+        speculators_config=speculators_config,
+    )
+    reloaded = SpeculatorModelConfig.from_dict(original.to_dict())
+    assert isinstance(reloaded, DSparkSpeculatorConfig)
+    assert reloaded.enable_correction_head is True
+    assert reloaded.correction_hidden_size == 32
+    assert reloaded.correction_rank == 8
+    assert reloaded.correction_num_layers == 2
+    assert reloaded.correction_num_heads == 4

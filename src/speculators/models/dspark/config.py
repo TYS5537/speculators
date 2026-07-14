@@ -41,6 +41,35 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
+    # Causal correction head. When enabled it replaces the Markov head.
+    enable_correction_head: bool = Field(
+        default=False,
+        description=(
+            "Replace the Markov head with a tiny causal Transformer "
+            "that predicts low-rank residual corrections to DFlash logits."
+        ),
+    )
+    correction_hidden_size: int = Field(
+        default=512,
+        gt=0,
+        description="Hidden width of the causal correction head.",
+    )
+    correction_rank: int = Field(
+        default=256,
+        gt=0,
+        description="Low-rank bottleneck used to produce correction logits.",
+    )
+    correction_num_layers: int = Field(
+        default=1,
+        gt=0,
+        description="Number of tiny causal Transformer layers.",
+    )
+    correction_num_heads: int = Field(
+        default=8,
+        gt=0,
+        description="Number of attention heads in each correction layer.",
+    )
+
     # Confidence head.
     enable_confidence_head: bool = Field(
         default=True,
@@ -49,7 +78,8 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     confidence_head_with_markov: bool = Field(
         default=True,
         description=(
-            "Concatenate the Markov previous-token embedding with the backbone "
-            "hidden state as the confidence-head input."
+            "Concatenate the active sequential-head state (Markov embedding or "
+            "causal correction state) with the backbone hidden state as the "
+            "confidence-head input."
         ),
     )

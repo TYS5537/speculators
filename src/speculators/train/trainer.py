@@ -41,6 +41,14 @@ warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 MIN_STEP_PCT = 0.25
 
 
+def linear_base_curriculum_weight(global_step: int, total_steps: int) -> float:
+    """Linearly anneal the base-loss weight from 1 to 0, inclusive."""
+    if total_steps <= 0:
+        raise ValueError(f"total_steps must be positive, got {total_steps}")
+    denominator = max(total_steps - 1, 1)
+    return 1.0 - min(max(global_step, 0) / denominator, 1.0)
+
+
 class TrainerConfig(NamedTuple):
     lr: float
     num_epochs: int
@@ -63,6 +71,7 @@ class TrainerConfig(NamedTuple):
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
+    curriculum_base_to_final: bool = False
 
 
 class Trainer:
@@ -336,9 +345,27 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            _draft_tokens, loss, metrics = self.model(
-                **gpu_batch, **self.config.train_call_kwargs
-            )
+            call_kwargs = dict(self.config.train_call_kwargs)
+            if self.config.curriculum_base_to_final:
+                total_steps = self.config.scheduler_total_steps or (
+                    self.config.num_epochs * len(self.train_loader)
+                )
+                base_weight = linear_base_curriculum_weight(
+                    self.global_step, total_steps
+                )
+                # A 0-D tensor keeps the compiled forward signature stable while
+                # its value changes each optimization step.
+                batch_device = next(
+                    value.device
+                    for value in gpu_batch.values()
+                    if isinstance(value, torch.Tensor)
+                )
+                call_kwargs["curriculum_base_weight"] = torch.tensor(
+                    base_weight,
+                    device=batch_device,
+                    dtype=self.config.hidden_states_dtype,
+                )
+            _draft_tokens, loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
             self._optimizers_zero_grad()
             loss.backward()
@@ -404,9 +431,19 @@ class Trainer:
                 for k, v in batch.items()
             }
 
-            _draft_tokens, _loss, metrics = self.model(
-                **gpu_batch, **self.config.val_call_kwargs
-            )
+            call_kwargs = dict(self.config.val_call_kwargs)
+            if self.config.curriculum_base_to_final:
+                batch_device = next(
+                    value.device
+                    for value in gpu_batch.values()
+                    if isinstance(value, torch.Tensor)
+                )
+                call_kwargs["curriculum_base_weight"] = torch.tensor(
+                    0.0,
+                    device=batch_device,
+                    dtype=self.config.hidden_states_dtype,
+                )
+            _draft_tokens, _loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
             if self.is_distributed:
                 for m in metrics.values():

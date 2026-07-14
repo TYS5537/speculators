@@ -44,6 +44,11 @@ DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 # Markov + confidence head settings
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
+ENABLE_CORRECTION_HEAD=1
+CORRECTION_HIDDEN_SIZE=512
+CORRECTION_RANK=256
+CORRECTION_NUM_LAYERS=1
+CORRECTION_NUM_HEADS=8
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
 # CAT loss reweighting: none | target (PARD-2) | draft (accept-rate prefix)
@@ -87,6 +92,17 @@ if [[ "$MICRO_TOKEN_LAYER_GROWTH" == "1" ]]; then
         --max-prev-micro-tokens "$MAX_PREV_MICRO_TOKENS"
     )
 fi
+CORRECTION_ARGS=()
+if [[ "$ENABLE_CORRECTION_HEAD" == "1" ]]; then
+    CORRECTION_ARGS=(
+        --enable-correction-head
+        --correction-hidden-size "$CORRECTION_HIDDEN_SIZE"
+        --correction-rank "$CORRECTION_RANK"
+        --correction-num-layers "$CORRECTION_NUM_LAYERS"
+        --correction-num-heads "$CORRECTION_NUM_HEADS"
+        --correction-curriculum
+    )
+fi
 
 echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
 nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
@@ -112,6 +128,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --target-layer-ids $TARGET_LAYER_IDS \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
+    "${CORRECTION_ARGS[@]}" \
     --enable-confidence-head \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \

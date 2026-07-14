@@ -7,7 +7,11 @@ from speculators.model import SpeculatorModel
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics
-from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
+from speculators.models.dspark.model_definitions import (
+    CausalCorrectionHead,
+    ConfidenceHead,
+    MarkovHead,
+)
 from speculators.models.metrics import LossConfig, kl_div_loss, resolve_loss_config
 from speculators.models.utils import conditional_torch_compile
 
@@ -35,7 +39,18 @@ class DSparkDraftModel(DFlashDraftModel):
         hidden_size = config.transformer_layer_config.hidden_size
 
         self.markov_head: MarkovHead | None = None
-        if config.markov_rank > 0:
+        self.correction_head: CausalCorrectionHead | None = None
+        if config.enable_correction_head:
+            self.correction_head = CausalCorrectionHead(
+                input_hidden_size=hidden_size,
+                token_embedding_size=hidden_size,
+                correction_hidden_size=config.correction_hidden_size,
+                correction_rank=config.correction_rank,
+                draft_vocab_size=self.draft_vocab_size,
+                num_layers=config.correction_num_layers,
+                num_heads=config.correction_num_heads,
+            )
+        elif config.markov_rank > 0:
             self.markov_head = MarkovHead(
                 verifier_vocab_size=self.verifier_vocab_size,
                 draft_vocab_size=self.draft_vocab_size,
@@ -46,13 +61,23 @@ class DSparkDraftModel(DFlashDraftModel):
 
         self.confidence_head: ConfidenceHead | None = None
         if config.enable_confidence_head:
-            if config.confidence_head_with_markov and self.markov_head is None:
+            if (
+                config.confidence_head_with_markov
+                and self.markov_head is None
+                and self.correction_head is None
+            ):
                 raise ValueError(
-                    "confidence_head_with_markov=True requires markov_rank > 0."
+                    "confidence_head_with_markov=True requires an enabled Markov "
+                    "or correction head."
                 )
-            input_dim = hidden_size + (
-                config.markov_rank if config.confidence_head_with_markov else 0
-            )
+            sequential_dim = 0
+            if config.confidence_head_with_markov:
+                sequential_dim = (
+                    config.correction_hidden_size
+                    if self.correction_head is not None
+                    else config.markov_rank
+                )
+            input_dim = hidden_size + sequential_dim
             self.confidence_head = ConfidenceHead(input_dim)
 
     @classmethod
@@ -68,6 +93,11 @@ class DSparkDraftModel(DFlashDraftModel):
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
+            enable_correction_head=kwargs.get("enable_correction_head", False),
+            correction_hidden_size=kwargs.get("correction_hidden_size", 512),
+            correction_rank=kwargs.get("correction_rank", 256),
+            correction_num_layers=kwargs.get("correction_num_layers", 1),
+            correction_num_heads=kwargs.get("correction_num_heads", 8),
             enable_confidence_head=kwargs.get("enable_confidence_head", True),
             confidence_head_with_markov=kwargs.get("confidence_head_with_markov", True),
         )
@@ -105,6 +135,7 @@ class DSparkDraftModel(DFlashDraftModel):
         gamma: float = 4.0,
         confidence_head_alpha: float = 1.0,
         cat_mode: str = "none",
+        curriculum_base_weight: torch.Tensor | float = 0.0,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -119,10 +150,11 @@ class DSparkDraftModel(DFlashDraftModel):
             )
         )
 
-        # DSpark: add the Markov logit bias and predict per-position confidence.
+        # DSpark: add the active causal correction and predict confidence.
         num_blocks = self.config.max_anchors
         block = self.block_size
         mask_tokens_size = num_blocks * block
+        base_logits = logits
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
         # prev_token_ids[:, k] is the token preceding draft position k within the block.
@@ -130,10 +162,37 @@ class DSparkDraftModel(DFlashDraftModel):
             [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
         )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
+        base_logits_blocks = base_logits.view(num_blocks, block, -1)
 
         confidence_logits = None
         prev_emb = None
-        if self.markov_head is not None:
+        correction_states = None
+        if self.correction_head is not None:
+            # Teacher forcing: only previous GT tokens shift. DFlash hidden/base
+            # logits remain aligned with the current prediction positions.
+            prev_gt_ids = block_tokens[:, :-1]
+            with torch.no_grad():
+                prev_gt_emb = self.embed_tokens(prev_gt_ids)
+            correction, draft_states, _ = self.correction_head(
+                prev_gt_emb,
+                hidden_blocks[:, 1:],
+            )
+            logits_blocks = torch.cat(
+                [
+                    base_logits_blocks[:, :1],
+                    base_logits_blocks[:, 1:] + correction,
+                ],
+                dim=1,
+            )
+            logits = logits_blocks.reshape(1, mask_tokens_size, -1)
+            correction_states = torch.cat(
+                [
+                    draft_states.new_zeros(num_blocks, 1, draft_states.shape[-1]),
+                    draft_states,
+                ],
+                dim=1,
+            )
+        elif self.markov_head is not None:
             prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
             markov_bias = self.markov_head.block_bias(
                 prev_token_ids=prev_token_ids,
@@ -145,9 +204,14 @@ class DSparkDraftModel(DFlashDraftModel):
             )
 
         if self.confidence_head is not None:
-            # confidence_head_with_markov requires markov_rank > 0 (enforced in
-            # __init__), so prev_emb is always set when the flag is on.
-            if self.config.confidence_head_with_markov and prev_emb is not None:
+            if (
+                self.config.confidence_head_with_markov
+                and correction_states is not None
+            ):
+                conf_features = torch.cat(
+                    [hidden_blocks, correction_states.to(hidden_blocks.dtype)], dim=-1
+                )
+            elif self.config.confidence_head_with_markov and prev_emb is not None:
                 conf_features = torch.cat(
                     [hidden_blocks, prev_emb.to(hidden_blocks.dtype)], dim=-1
                 )
@@ -167,6 +231,69 @@ class DSparkDraftModel(DFlashDraftModel):
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
             cat_mode=cat_mode,  # type: ignore[arg-type]
+            base_logits=base_logits if self.correction_head is not None else None,
+            curriculum_base_weight=curriculum_base_weight,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
         return draft_tokens, loss, metrics
+
+    @torch.no_grad()
+    def rollout_correction(
+        self,
+        base_logits: torch.Tensor,  # [N, block_size, draft_vocab]
+        dflash_hidden: torch.Tensor,  # [N, block_size, hidden]
+        anchor_token_ids: torch.Tensor,  # [N], verifier vocab
+        *,
+        temperature: float = 0.0,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Generate a corrected draft block with sequential token feedback.
+
+        DFlash is not rerun here: callers provide its parallel hidden states and
+        base logits. Returned tensors exclude anchor slot 0.
+        """
+        if self.correction_head is None:
+            raise RuntimeError(
+                "rollout_correction requires enable_correction_head=True"
+            )
+        expected_ndim = 3
+        if base_logits.ndim != expected_ndim or dflash_hidden.ndim != expected_ndim:
+            raise ValueError("base_logits and dflash_hidden must both be rank-3")
+        if base_logits.shape[:2] != dflash_hidden.shape[:2]:
+            raise ValueError("base_logits and dflash_hidden block shapes must match")
+        if base_logits.shape[1] != self.block_size:
+            raise ValueError(
+                f"Expected block_size={self.block_size}, got {base_logits.shape[1]}"
+            )
+        if anchor_token_ids.shape != (base_logits.shape[0],):
+            raise ValueError(
+                f"Expected anchor_token_ids shape {(base_logits.shape[0],)}, "
+                f"got {anchor_token_ids.shape}"
+            )
+
+        previous_ids = anchor_token_ids.long()
+        cache = None
+        output_tokens = []
+        output_logits = []
+        for position in range(1, self.block_size):
+            previous_emb = self.embed_tokens(previous_ids).unsqueeze(1)
+            correction, _, cache = self.correction_head(
+                previous_emb,
+                dflash_hidden[:, position : position + 1],
+                cache=cache,
+                use_cache=True,
+            )
+            final_logits = base_logits[:, position] + correction[:, 0]
+            if temperature > 0:
+                probabilities = torch.softmax(
+                    final_logits.float() / temperature, dim=-1
+                )
+                draft_ids = torch.multinomial(probabilities, num_samples=1).squeeze(-1)
+            else:
+                draft_ids = torch.argmax(final_logits, dim=-1)
+            output_tokens.append(draft_ids)
+            output_logits.append(final_logits)
+            previous_ids = draft_ids
+            if self.d2t is not None:
+                previous_ids = previous_ids + self.d2t[previous_ids]
+
+        return torch.stack(output_tokens, dim=1), torch.stack(output_logits, dim=1)

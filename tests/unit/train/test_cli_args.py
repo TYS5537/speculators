@@ -181,3 +181,27 @@ def test_dspark_cat_mode_draft(monkeypatch):
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["cat_mode"] == "draft"
     assert val_kw["cat_mode"] == "draft"
+
+
+def test_dspark_correction_head_args(monkeypatch):
+    args = _parse(
+        monkeypatch,
+        [
+            "--enable-correction-head",
+            "--correction-hidden-size",
+            "256",
+            "--correction-rank",
+            "64",
+            "--correction-num-layers",
+            "2",
+            "--correction-num-heads",
+            "4",
+            "--no-correction-curriculum",
+        ],
+    )
+    assert args.enable_correction_head is True
+    assert args.correction_hidden_size == 256
+    assert args.correction_rank == 64
+    assert args.correction_num_layers == 2
+    assert args.correction_num_heads == 4
+    assert args.correction_curriculum is False
