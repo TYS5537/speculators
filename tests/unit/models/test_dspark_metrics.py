@@ -111,6 +111,232 @@ class TestComputeMetrics:
         )
         assert float(bias) > 0.5
 
+    def test_confidence_loss_ignores_position_decay_and_cat(self):
+        torch.manual_seed(5)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+        confidence_logits = torch.tensor([[0.0, -0.5, 0.5, 1.0]])
+
+        _, plain_metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            gamma=1.0,
+            cat_mode="none",
+        )
+        _, weighted_metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            gamma=100.0,
+            cat_mode="draft",
+        )
+        assert torch.allclose(
+            plain_metrics["confidence_loss_sum"],
+            weighted_metrics["confidence_loss_sum"],
+        )
+
+    def test_confidence_draft_weighting_uses_one_active_weight(self):
+        torch.manual_seed(6)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+        confidence_logits = torch.tensor([[0.0, -0.5, 0.5, 1.0]])
+
+        _, uniform_metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_loss_weighting="uniform",
+        )
+        _, draft_metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            confidence_loss_weighting="draft",
+        )
+        assert not torch.allclose(
+            uniform_metrics["confidence_loss_sum"],
+            draft_metrics["confidence_loss_sum"],
+        )
+
+        _, cat_fast_decay = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            gamma=1.0,
+            cat_mode="draft",
+            confidence_loss_weighting="draft",
+        )
+        _, cat_slow_decay = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            gamma=100.0,
+            cat_mode="draft",
+            confidence_loss_weighting="draft",
+        )
+        assert torch.allclose(
+            cat_fast_decay["confidence_loss_sum"],
+            cat_slow_decay["confidence_loss_sum"],
+        )
+
+    def test_cat_replaces_fixed_decay_for_final_draft_loss(self):
+        torch.manual_seed(7)
+        logits = torch.randn(1, 4, 8)
+        targets = torch.randn(1, 4, 8)
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+
+        loss_fast_decay, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            gamma=1.0,
+            cat_mode="draft",
+        )
+        loss_slow_decay, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            gamma=100.0,
+            cat_mode="draft",
+        )
+        assert torch.allclose(loss_fast_decay, loss_slow_decay)
+
+    def test_first_error_focal_targets_chain_breaker(self):
+        logits = _ids_to_logits(torch.tensor([[0, 4, 5, 3]]), 8)
+        targets = _ids_to_logits(torch.tensor([[0, 1, 2, 3]]), 8)
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+
+        base_loss, _ = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=0.0,
+        )
+        focal_loss, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=0.3,
+        )
+        focal_term = metrics["first_error_focal_loss_sum"]
+        assert float(focal_term) > 0
+        assert torch.allclose(focal_loss - base_loss, 0.3 * focal_term)
+        mean_breaker = (
+            metrics["first_error_position_sum"]
+            / metrics["first_error_position_total"]
+        )
+        assert torch.isclose(mean_breaker, torch.tensor(1.0))
+
+    def test_first_error_focal_is_zero_for_correct_block(self):
+        logits = _ids_to_logits(torch.tensor([[0, 1, 2, 3]]), 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            first_error_focal_alpha=0.3,
+        )
+        assert torch.isclose(
+            metrics["first_error_focal_loss_sum"], torch.tensor(0.0)
+        )
+
+    def test_curriculum_scales_first_error_focal_with_final_branch(self):
+        final_logits = _ids_to_logits(torch.tensor([[0, 4, 2, 3]]), 8)
+        targets = _ids_to_logits(torch.tensor([[0, 1, 2, 3]]), 8)
+        base_logits = targets.clone()
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0, 1.0]])
+
+        without_focal, _ = compute_metrics(
+            final_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+            curriculum_base_weight=1.0,
+            first_error_focal_alpha=0.0,
+        )
+        with_focal, _ = compute_metrics(
+            final_logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=4,
+            loss_config=_DEFAULT_LOSS,
+            base_logits=base_logits,
+            curriculum_base_weight=1.0,
+            first_error_focal_alpha=0.3,
+        )
+        assert torch.allclose(without_focal, with_focal)
+
+    def test_confidence_length_loss_changes_total_loss(self):
+        ids = torch.tensor([[0, 1, 2]])
+        logits = _ids_to_logits(ids, 8)
+        targets = logits.clone()
+        loss_mask = torch.tensor([[0.0, 1.0, 1.0]])
+        confidence_logits = torch.zeros(1, 3)
+
+        loss_without, _ = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=3,
+            loss_config=_DEFAULT_LOSS,
+            confidence_length_alpha=0.0,
+        )
+        loss_with, metrics = compute_metrics(
+            logits,
+            targets,
+            confidence_logits,
+            loss_mask,
+            block_size=3,
+            loss_config=_DEFAULT_LOSS,
+            confidence_length_alpha=1.0,
+        )
+        length_loss = metrics["confidence_length_loss_sum"]
+        assert float(length_loss) > 0
+        assert torch.allclose(loss_with - loss_without, length_loss)
+        assert "confidence_accept_len_pred_sum" in metrics
+
     def test_alpha_weighting(self):
         ids = torch.tensor([[0, 1, 0, 2]])
         logits = _ids_to_logits(ids, 8)
@@ -158,6 +384,8 @@ class TestComputeMetrics:
             "accept_len_sum",
             "accept_len_total",
             "confidence_cumprod_bias_sum",
+            "confidence_length_loss_sum",
+            "confidence_accept_len_pred_sum",
         ):
             assert key in metrics
         # all metric values must be tensors (so dist.reduce works in the trainer)

@@ -51,6 +51,9 @@ CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
+CONFIDENCE_LENGTH_ALPHA=0.1
+CONFIDENCE_LOSS_WEIGHTING="uniform"  # uniform | draft
+FIRST_ERROR_FOCAL_ALPHA=0.3
 # CAT loss reweighting: none | target (PARD-2) | draft (accept-rate prefix)
 CAT_MODE="none"
 
@@ -133,6 +136,9 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --confidence-head-with-markov \
     --loss-fn "$LOSS_FN" \
     --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --confidence-length-alpha "$CONFIDENCE_LENGTH_ALPHA" \
+    --confidence-loss-weighting "$CONFIDENCE_LOSS_WEIGHTING" \
+    --first-error-focal-alpha "$FIRST_ERROR_FOCAL_ALPHA" \
     --cat-mode "$CAT_MODE" \
     --on-missing generate \
     --on-generate delete \

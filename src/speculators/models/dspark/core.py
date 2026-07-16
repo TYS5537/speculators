@@ -113,11 +113,19 @@ class DSparkDraftModel(DFlashDraftModel):
         loss_config = resolve_loss_config(kwargs["loss_fn"])
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
+        confidence_length_alpha = kwargs.get("confidence_length_alpha", 0.0)
+        confidence_loss_weighting = kwargs.get(
+            "confidence_loss_weighting", "uniform"
+        )
+        first_error_focal_alpha = kwargs.get("first_error_focal_alpha", 0.0)
         cat_mode = kwargs.get("cat_mode", "none")
         shared = {
             "loss_config": loss_config,
             "gamma": gamma,
             "confidence_head_alpha": confidence_head_alpha,
+            "confidence_length_alpha": confidence_length_alpha,
+            "confidence_loss_weighting": confidence_loss_weighting,
+            "first_error_focal_alpha": first_error_focal_alpha,
             "cat_mode": cat_mode,
         }
         return dict(shared), dict(shared)
@@ -134,6 +142,9 @@ class DSparkDraftModel(DFlashDraftModel):
         loss_config: LossConfig | None = None,
         gamma: float = 4.0,
         confidence_head_alpha: float = 1.0,
+        confidence_length_alpha: float = 0.0,
+        confidence_loss_weighting: str = "uniform",
+        first_error_focal_alpha: float = 0.0,
         cat_mode: str = "none",
         curriculum_base_weight: torch.Tensor | float = 0.0,
         **kwargs,
@@ -230,6 +241,9 @@ class DSparkDraftModel(DFlashDraftModel):
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
             gamma=gamma,
             confidence_head_alpha=confidence_head_alpha,
+            confidence_length_alpha=confidence_length_alpha,
+            confidence_loss_weighting=confidence_loss_weighting,  # type: ignore[arg-type]
+            first_error_focal_alpha=first_error_focal_alpha,
             cat_mode=cat_mode,  # type: ignore[arg-type]
             base_logits=base_logits if self.correction_head is not None else None,
             curriculum_base_weight=curriculum_base_weight,

@@ -1084,6 +1084,36 @@ def parse_args():
         help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
     )
     parser.add_argument(
+        "--confidence-length-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "DSpark: weight of Smooth-L1 supervision on cumulative predicted "
+            "accept length (default: 0.0)."
+        ),
+    )
+    parser.add_argument(
+        "--confidence-loss-weighting",
+        type=str,
+        default="uniform",
+        choices=["uniform", "draft"],
+        help=(
+            "DSpark: confidence BCE position weighting. 'uniform' treats all valid "
+            "positions equally; 'draft' mirrors the active final-draft weighting "
+            "(fixed decay or CAT, which are mutually exclusive)."
+        ),
+    )
+    parser.add_argument(
+        "--first-error-focal-alpha",
+        type=float,
+        default=0.0,
+        help=(
+            "DSpark: auxiliary CE weight on each block's first greedy mismatch. "
+            "The term belongs to the final corrected objective and follows its "
+            "decay-or-CAT weighting (default: 0.0, disabled)."
+        ),
+    )
+    parser.add_argument(
         "--cat-mode",
         type=str,
         default="none",

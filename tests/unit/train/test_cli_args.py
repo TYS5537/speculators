@@ -155,10 +155,28 @@ def test_dspark_compound_loss(monkeypatch):
 
 
 def test_dspark_confidence_head_alpha(monkeypatch):
-    args = _parse(monkeypatch, ["--confidence-head-alpha", "0.5"])
+    args = _parse(
+        monkeypatch,
+        [
+            "--confidence-head-alpha",
+            "0.5",
+            "--confidence-length-alpha",
+            "0.2",
+            "--confidence-loss-weighting",
+            "draft",
+            "--first-error-focal-alpha",
+            "0.3",
+        ],
+    )
     train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw["confidence_head_alpha"] == 0.5
     assert val_kw["confidence_head_alpha"] == 0.5
+    assert train_kw["confidence_length_alpha"] == 0.2
+    assert val_kw["confidence_length_alpha"] == 0.2
+    assert train_kw["confidence_loss_weighting"] == "draft"
+    assert val_kw["confidence_loss_weighting"] == "draft"
+    assert train_kw["first_error_focal_alpha"] == 0.3
+    assert val_kw["first_error_focal_alpha"] == 0.3
 
 
 def test_dspark_cat_mode_default(monkeypatch):
