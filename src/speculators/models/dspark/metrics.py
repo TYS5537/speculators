@@ -30,6 +30,7 @@ from speculators.models.metrics import (
     compound_loss,
     compute_accuracy_multi_step,
     dflash_loss_decay,
+    dpace_loss_decay,
     draft_cat_weights,
     target_cat_weights,
 )
@@ -137,13 +138,26 @@ def compute_metrics(  # noqa: C901
     cat_mode: CatMode = "none",
     base_logits: torch.Tensor | None = None,
     curriculum_base_weight: torch.Tensor | float = 0.0,
+    per_position_loss_weight: str = "fixed-exp-decay",
+    dpace_alpha: float = 0.5,
+    sample_from_anchor: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
     device = logits.device
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
-    decay_fn = partial(dflash_loss_decay, gamma=gamma)
+    if per_position_loss_weight == "dpace":
+        decay_fn = partial(
+            dpace_loss_decay,
+            loss_mask=loss_mask,
+            block_size=block_size,
+            dpace_alpha=dpace_alpha,
+        )
+    else:
+        decay_fn = partial(
+            dflash_loss_decay, gamma=gamma, sample_from_anchor=sample_from_anchor
+        )
     cat_weights = _resolve_cat_weights(
         cat_mode, logits, targets, loss_mask, block_size
     )
@@ -302,7 +316,7 @@ def compute_metrics(  # noqa: C901
             metrics["confidence_abs_error_total"] = mask_total
             # Mean predicted vs. observed acceptance — a calibration sanity check.
             metrics["confidence_pred_mean_sum"] = (conf_prob * mask_f).sum()
-            metrics["confidence_pred_mean_total"] = mask_total
+            metrics["confidence_pred_mean_total"] = mask_total.clone()
             # Calibration of the cumulative acceptance product, which is what
             # dynamic draft-length thresholding consumes (signed pred - target).
             metrics["confidence_cumprod_bias_sum"] = (
@@ -315,7 +329,7 @@ def compute_metrics(  # noqa: C901
     metrics["loss_total"] = ones
     for term_name, term_val in term_losses.items():
         metrics[f"{term_name}_sum"] = term_val
-        metrics[f"{term_name}_total"] = ones
+        metrics[f"{term_name}_total"] = ones.clone()
 
     if cat_weights is not None:
         with torch.no_grad():
@@ -337,15 +351,17 @@ def compute_metrics(  # noqa: C901
         metrics["accept_len_sum"] = (per_block_len * block_valid).sum()
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 
-    # Per-position greedy accuracy (position 0 is the anchor — excluded).
+    # Per-position greedy accuracy
+    # Start position: 0 if sample_from_anchor else 1 (skip anchor)
+    start_pos = 0 if sample_from_anchor else 1
     pred_ids = torch.argmax(logits, dim=-1)
     target_ids = torch.argmax(targets, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
-    metrics["full_acc_sum"] = correct_per_pos[1:].sum()
-    metrics["full_acc_total"] = total_per_pos[1:].sum()
-    for pos in range(1, block_size):
+    metrics["full_acc_sum"] = correct_per_pos[start_pos:].sum()
+    metrics["full_acc_total"] = total_per_pos[start_pos:].sum()
+    for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
 

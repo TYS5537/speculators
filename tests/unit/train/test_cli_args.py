@@ -223,3 +223,48 @@ def test_dspark_correction_head_args(monkeypatch):
     assert args.correction_num_layers == 2
     assert args.correction_num_heads == 4
     assert args.correction_curriculum is False
+
+
+# ---------------------------------------------------------------------------
+# Per-speculator-type defaults for draft_arch, norm_before_fc, norm_output
+# ---------------------------------------------------------------------------
+
+
+def test_eagle3_defaults_to_llama_arch(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.draft_arch == "llama"
+
+
+def test_eagle3_defaults_norm_before_fc_true(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.norm_before_fc is True
+
+
+def test_eagle3_defaults_norm_output_true(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.norm_output is True
+
+
+def test_dflash_defaults_to_qwen3_arch(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dflash"])
+    assert args.draft_arch == "qwen3"
+
+
+def test_dflash_defaults_norm_before_fc_false(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dflash"])
+    assert args.norm_before_fc is False
+
+
+def test_dflash_defaults_norm_output_false(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dflash"])
+    assert args.norm_output is False
+
+
+def test_no_norm_before_fc_flag(monkeypatch):
+    args = _parse(monkeypatch, ["--no-norm-before-fc"])
+    assert args.norm_before_fc is False
+
+
+def test_no_norm_output_flag(monkeypatch):
+    args = _parse(monkeypatch, ["--no-norm-output"])
+    assert args.norm_output is False

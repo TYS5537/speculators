@@ -48,14 +48,6 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
-    max_anchors: int = Field(
-        default=256,
-        description=(
-            "Maximum number of anchor positions to sample during training "
-            "(controls memory usage and training efficiency)"
-        ),
-    )
-
     target_hidden_size: int | None = Field(
         default=None,
         description="Hidden size of the target model (if different from draft model)",
@@ -126,6 +118,17 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
             "Maximum number of previous tokens visible inside each micro block when "
             "token-level layer growth is enabled. Defaults to all previous tokens "
             "inside the micro block."
+        ),
+    )
+
+    sample_from_anchor: bool = Field(
+        default=False,
+        description=(
+            "Whether to sample from the anchor position. "
+            "False: anchor is the bonus token, only mask tokens predict "
+            "(block_size-1 speculative tokens). "
+            "True: sample from anchor and all mask positions "
+            "(block_size speculative tokens). "
         ),
     )
 

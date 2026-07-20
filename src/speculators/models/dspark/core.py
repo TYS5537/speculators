@@ -89,6 +89,8 @@ class DSparkDraftModel(DFlashDraftModel):
         **kwargs,
     ) -> "DSparkDraftModel":
         """Create a DSpark model from training arguments (mirrors DFlash)."""
+        enable_confidence_head_arg = kwargs.get("enable_confidence_head")
+        confidence_head_with_markov_arg = kwargs.get("confidence_head_with_markov")
         config = DSparkSpeculatorConfig(
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
@@ -98,8 +100,16 @@ class DSparkDraftModel(DFlashDraftModel):
             correction_rank=kwargs.get("correction_rank", 256),
             correction_num_layers=kwargs.get("correction_num_layers", 1),
             correction_num_heads=kwargs.get("correction_num_heads", 8),
-            enable_confidence_head=kwargs.get("enable_confidence_head", True),
-            confidence_head_with_markov=kwargs.get("confidence_head_with_markov", True),
+            enable_confidence_head=(
+                True
+                if enable_confidence_head_arg is None
+                else enable_confidence_head_arg
+            ),
+            confidence_head_with_markov=(
+                True
+                if confidence_head_with_markov_arg is None
+                else confidence_head_with_markov_arg
+            ),
         )
 
         model = cls(config=config)
@@ -112,6 +122,7 @@ class DSparkDraftModel(DFlashDraftModel):
         """Resolve DSpark's compound loss from ``--loss-fn``."""
         loss_config = resolve_loss_config(kwargs["loss_fn"])
         gamma = kwargs.get("dflash_decay_gamma", 4.0)
+        max_anchors = kwargs.get("max_anchors", 3072)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
         confidence_length_alpha = kwargs.get("confidence_length_alpha", 0.0)
         confidence_loss_weighting = kwargs.get(
@@ -119,14 +130,21 @@ class DSparkDraftModel(DFlashDraftModel):
         )
         first_error_focal_alpha = kwargs.get("first_error_focal_alpha", 0.0)
         cat_mode = kwargs.get("cat_mode", "none")
+        per_position_loss_weight = kwargs.get(
+            "per_position_loss_weight", "fixed-exp-decay"
+        )
+        dpace_alpha = kwargs.get("dpace_alpha", 0.5)
         shared = {
             "loss_config": loss_config,
             "gamma": gamma,
+            "max_anchors": max_anchors,
             "confidence_head_alpha": confidence_head_alpha,
             "confidence_length_alpha": confidence_length_alpha,
             "confidence_loss_weighting": confidence_loss_weighting,
             "first_error_focal_alpha": first_error_focal_alpha,
             "cat_mode": cat_mode,
+            "per_position_loss_weight": per_position_loss_weight,
+            "dpace_alpha": dpace_alpha,
         }
         return dict(shared), dict(shared)
 
@@ -141,12 +159,15 @@ class DSparkDraftModel(DFlashDraftModel):
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         loss_config: LossConfig | None = None,
         gamma: float = 4.0,
+        max_anchors: int = 3072,
         confidence_head_alpha: float = 1.0,
         confidence_length_alpha: float = 0.0,
         confidence_loss_weighting: str = "uniform",
         first_error_focal_alpha: float = 0.0,
         cat_mode: str = "none",
         curriculum_base_weight: torch.Tensor | float = 0.0,
+        per_position_loss_weight: str = "fixed-exp-decay",
+        dpace_alpha: float = 0.5,
         **kwargs,
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
@@ -157,21 +178,30 @@ class DSparkDraftModel(DFlashDraftModel):
                 verifier_last_hidden_states,
                 document_ids,
                 position_ids,
+                max_anchors=max_anchors,
                 **kwargs,
             )
         )
 
         # DSpark: add the active causal correction and predict confidence.
-        num_blocks = self.config.max_anchors
+        num_blocks = max_anchors
         block = self.block_size
         mask_tokens_size = num_blocks * block
         base_logits = logits
         # Ground-truth block tokens (verifier vocab); position 0 is the anchor.
         block_tokens = input_ids[0, anchored_block_indices].view(num_blocks, block)
-        # prev_token_ids[:, k] is the token preceding draft position k within the block.
-        prev_token_ids = torch.cat(
-            [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
-        )  # [num_blocks, block]
+        if self.config.sample_from_anchor:
+            # With sample_from_anchor=True (DSpark default), slot k predicts
+            # token p+k+1 and the inference Markov chain conditions slot k's
+            # bias on the token at the previous position p+k.
+            prev_token_ids = block_tokens
+        else:
+            # With sample_from_anchor=False (Dflash default), slot k predicts
+            # token p+k, so the previous token within the block is
+            # block_tokens[:, k-1] (shifted).
+            prev_token_ids = torch.cat(
+                [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+            )  # [num_blocks, block]
         hidden_blocks = hidden.view(num_blocks, block, -1)
         base_logits_blocks = base_logits.view(num_blocks, block, -1)
 
@@ -181,28 +211,42 @@ class DSparkDraftModel(DFlashDraftModel):
         if self.correction_head is not None:
             # Teacher forcing: only previous GT tokens shift. DFlash hidden/base
             # logits remain aligned with the current prediction positions.
-            prev_gt_ids = block_tokens[:, :-1]
-            with torch.no_grad():
-                prev_gt_emb = self.embed_tokens(prev_gt_ids)
-            correction, draft_states, _ = self.correction_head(
-                prev_gt_emb,
-                hidden_blocks[:, 1:],
-            )
-            logits_blocks = torch.cat(
-                [
-                    base_logits_blocks[:, :1],
-                    base_logits_blocks[:, 1:] + correction,
-                ],
-                dim=1,
-            )
-            logits = logits_blocks.reshape(1, mask_tokens_size, -1)
-            correction_states = torch.cat(
-                [
-                    draft_states.new_zeros(num_blocks, 1, draft_states.shape[-1]),
-                    draft_states,
-                ],
-                dim=1,
-            )
+            if self.config.sample_from_anchor:
+                # Correct all slots; prev for slot k is block_tokens[:, k]
+                # (mirrors Markov prev_token_ids under sample_from_anchor).
+                with torch.no_grad():
+                    prev_gt_emb = self.embed_tokens(block_tokens)
+                correction, draft_states, _ = self.correction_head(
+                    prev_gt_emb,
+                    hidden_blocks,
+                )
+                logits_blocks = base_logits_blocks + correction
+                logits = logits_blocks.reshape(1, mask_tokens_size, -1)
+                correction_states = draft_states
+            else:
+                # slots-1: correct draft positions only; prev is the prior GT token.
+                prev_gt_ids = block_tokens[:, :-1]
+                with torch.no_grad():
+                    prev_gt_emb = self.embed_tokens(prev_gt_ids)
+                correction, draft_states, _ = self.correction_head(
+                    prev_gt_emb,
+                    hidden_blocks[:, 1:],
+                )
+                logits_blocks = torch.cat(
+                    [
+                        base_logits_blocks[:, :1],
+                        base_logits_blocks[:, 1:] + correction,
+                    ],
+                    dim=1,
+                )
+                logits = logits_blocks.reshape(1, mask_tokens_size, -1)
+                correction_states = torch.cat(
+                    [
+                        draft_states.new_zeros(num_blocks, 1, draft_states.shape[-1]),
+                        draft_states,
+                    ],
+                    dim=1,
+                )
         elif self.markov_head is not None:
             prev_emb = self.markov_head.prev_embeddings(prev_token_ids)
             markov_bias = self.markov_head.block_bias(
@@ -247,6 +291,9 @@ class DSparkDraftModel(DFlashDraftModel):
             cat_mode=cat_mode,  # type: ignore[arg-type]
             base_logits=base_logits if self.correction_head is not None else None,
             curriculum_base_weight=curriculum_base_weight,
+            per_position_loss_weight=per_position_loss_weight,
+            dpace_alpha=dpace_alpha,
+            sample_from_anchor=self.config.sample_from_anchor,
         )
         draft_tokens = torch.argmax(logits, dim=-1)
         return draft_tokens, loss, metrics

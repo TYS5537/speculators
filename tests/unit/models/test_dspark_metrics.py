@@ -433,6 +433,7 @@ class TestComputeMetrics:
             block_size=2,
             loss_config=_DEFAULT_LOSS,
             cat_mode="none",
+            sample_from_anchor=False,
         )
         loss_draft, metrics = compute_metrics(
             logits,
@@ -442,6 +443,7 @@ class TestComputeMetrics:
             block_size=2,
             loss_config=_DEFAULT_LOSS,
             cat_mode="draft",
+            sample_from_anchor=False,
         )
         assert torch.isfinite(loss_draft)
         # Mismatched distributions -> low accept_rate -> later CAT weights < 1,

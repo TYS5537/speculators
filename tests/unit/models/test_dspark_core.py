@@ -60,6 +60,8 @@ def _tiny_model() -> DSparkDraftModel:
         correction_num_heads=4,
         enable_confidence_head=False,
         confidence_head_with_markov=False,
+        # Exercise the classic slots-1 teacher-forcing path.
+        sample_from_anchor=False,
     )
     model = DSparkDraftModel(config)
     with torch.no_grad():
@@ -92,6 +94,7 @@ def test_teacher_forcing_shifts_only_gt_tokens():
         verifier_last_hidden_states=torch.empty(1, 4, 32),
         document_ids=torch.zeros(1, 4, dtype=torch.long),
         loss_config=resolve_loss_config("tv"),
+        max_anchors=1,
     )
 
     seen = recording_head.seen_token_ids[0]
