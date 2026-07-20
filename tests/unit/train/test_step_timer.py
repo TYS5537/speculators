@@ -1,6 +1,7 @@
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from speculators.train.trainer import _StepTimer
 
@@ -16,20 +17,20 @@ def test_disabled_timer_returns_none():
     assert timer.profile(num_tokens=1024) is None
 
 
-@patch("speculators.train.trainer.torch.cuda.synchronize")
-def test_enabled_timer_returns_profile(mock_sync):
+def test_enabled_timer_returns_profile():
     timer = _StepTimer(enabled=True)
+    mock_sync = MagicMock()
 
-    with patch(
-        "speculators.train.trainer.time.perf_counter",
-        side_effect=[
-            0.1,
-            0.3,
-            0.5,
-            0.6,
-            0.6,
-        ],
+    with (
+        patch.object(torch, "npu", create=True) as mock_npu,
+        patch("speculators.train.trainer.torch.cuda.is_available", return_value=True),
+        patch("speculators.train.trainer.torch.cuda.synchronize", mock_sync),
+        patch(
+            "speculators.train.trainer.time.perf_counter",
+            side_effect=[0.1, 0.3, 0.5, 0.6, 0.6],
+        ),
     ):
+        mock_npu.is_available.return_value = False
         timer.mark_value("start", 0.0)
         timer.mark("fetch")
         timer.mark("fwd")
@@ -78,13 +79,17 @@ def test_disabled_to_enabled_transition():
     timer.reset(enabled=True)
     timer.mark_value("start", t_before_fetch)
 
+    mock_sync = MagicMock()
     with (
-        patch("speculators.train.trainer.torch.cuda.synchronize"),
+        patch.object(torch, "npu", create=True) as mock_npu,
+        patch("speculators.train.trainer.torch.cuda.is_available", return_value=True),
+        patch("speculators.train.trainer.torch.cuda.synchronize", mock_sync),
         patch(
             "speculators.train.trainer.time.perf_counter",
             side_effect=[2.1, 2.4, 2.5, 2.6, 2.6],
         ),
     ):
+        mock_npu.is_available.return_value = False
         timer.mark("fetch")
         timer.mark("fwd")
         timer.mark("bwd")
@@ -105,10 +110,14 @@ def test_disabled_to_enabled_transition():
 def test_zero_step_ms_returns_zero_throughput():
     timer = _StepTimer(enabled=True)
     timer.mark_value("start", 1.0)
+    mock_sync = MagicMock()
     with (
-        patch("speculators.train.trainer.torch.cuda.synchronize"),
+        patch.object(torch, "npu", create=True) as mock_npu,
+        patch("speculators.train.trainer.torch.cuda.is_available", return_value=True),
+        patch("speculators.train.trainer.torch.cuda.synchronize", mock_sync),
         patch("speculators.train.trainer.time.perf_counter", return_value=1.0),
     ):
+        mock_npu.is_available.return_value = False
         timer.mark("fetch")
         timer.mark("fwd")
         timer.mark("bwd")
