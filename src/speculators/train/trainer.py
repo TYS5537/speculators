@@ -40,10 +40,19 @@ root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
 
 
+def _synchronize_device() -> None:
+    if hasattr(torch, "npu") and torch.npu.is_available():
+        torch.npu.synchronize()
+    elif torch.cuda.is_available():
+        torch.cuda.synchronize()
+
+
 class _StepTimer:
     # Each mark()/now() forces a device synchronize to capture true accelerator
     # time. This serialises the device pipeline, so profiled steps are slower;
     # keep log_freq > 1 in perf-sensitive runs.
+    _PROFILE_MARKS = ("fetch", "fwd", "bwd", "opt")
+
     def __init__(self, enabled: bool = False):
         self.enabled = enabled
         self._marks: dict[str, float] = {}
@@ -53,11 +62,13 @@ class _StepTimer:
         self._marks.clear()
 
     def mark(self, name: str) -> None:
-        if self.enabled:
-            if hasattr(torch, "npu") and torch.npu.is_available():
-                torch.npu.synchronize()
-            elif torch.cuda.is_available():
-                torch.cuda.synchronize()
+        if not self.enabled:
+            return
+        # Always record the mark even if device sync fails, so logging cannot
+        # KeyError after a partial profiled step.
+        try:
+            _synchronize_device()
+        finally:
             self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
@@ -67,16 +78,15 @@ class _StepTimer:
     def now(self) -> float | None:
         if not self.enabled:
             return None
-        if hasattr(torch, "npu") and torch.npu.is_available():
-            torch.npu.synchronize()
-        elif torch.cuda.is_available():
-            torch.cuda.synchronize()
+        _synchronize_device()
         return time.perf_counter()
 
     def profile(self, num_tokens: int) -> dict[str, float] | None:
         if not self.enabled:
             return None
         m = self._marks
+        if any(name not in m for name in self._PROFILE_MARKS):
+            return None
         has_start = "start" in m
         fwd_ms = (m["fwd"] - m["fetch"]) * 1000
         bwd_ms = (m["bwd"] - m["fwd"]) * 1000
