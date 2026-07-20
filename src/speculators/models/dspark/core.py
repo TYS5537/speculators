@@ -310,7 +310,10 @@ class DSparkDraftModel(DFlashDraftModel):
         """Generate a corrected draft block with sequential token feedback.
 
         DFlash is not rerun here: callers provide its parallel hidden states and
-        base logits. Returned tensors exclude anchor slot 0.
+        base logits. With ``sample_from_anchor=True``, slot 0 predicts the token
+        after the anchor and all ``block_size`` slots are returned. With
+        ``sample_from_anchor=False``, slot 0 is the anchor/bonus slot and is
+        excluded, so ``block_size - 1`` slots are returned.
         """
         if self.correction_head is None:
             raise RuntimeError(
@@ -335,7 +338,11 @@ class DSparkDraftModel(DFlashDraftModel):
         cache = None
         output_tokens = []
         output_logits = []
-        for position in range(1, self.block_size):
+        # Match #806 training alignment:
+        # - True: slot k conditions on token p+k and predicts p+k+1.
+        # - False: slot 0 is not drafted; slot k conditions on token p+k-1.
+        start_position = 0 if self.config.sample_from_anchor else 1
+        for position in range(start_position, self.block_size):
             previous_emb = self.embed_tokens(previous_ids).unsqueeze(1)
             correction, _, cache = self.correction_head(
                 previous_emb,

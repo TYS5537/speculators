@@ -33,7 +33,7 @@ class _RecordingCorrectionHead(nn.Module):
         return correction, states, next_cache
 
 
-def _tiny_model() -> DSparkDraftModel:
+def _tiny_model(*, sample_from_anchor: bool = False) -> DSparkDraftModel:
     transformer_config = Qwen3Config(
         vocab_size=32,
         hidden_size=32,
@@ -60,8 +60,7 @@ def _tiny_model() -> DSparkDraftModel:
         correction_num_heads=4,
         enable_confidence_head=False,
         confidence_head_with_markov=False,
-        # Exercise the classic slots-1 teacher-forcing path.
-        sample_from_anchor=False,
+        sample_from_anchor=sample_from_anchor,
     )
     model = DSparkDraftModel(config)
     with torch.no_grad():
@@ -120,3 +119,26 @@ def test_rollout_feeds_generated_token_to_next_position():
     assert corrected_logits.shape == (1, 3, 32)
     seen = torch.cat(recording_head.seen_token_ids, dim=1)
     assert torch.equal(seen, torch.tensor([[2, 3, 5]]))
+
+
+def test_rollout_sample_from_anchor_matches_806_alignment():
+    model = _tiny_model(sample_from_anchor=True)
+    recording_head = _RecordingCorrectionHead(vocab_size=32)
+    model.correction_head = recording_head
+
+    base_logits = torch.full((1, 4, 32), -100.0)
+    base_logits[0, 0, 3] = 100.0
+    base_logits[0, 1, 5] = 100.0
+    base_logits[0, 2, 9] = 100.0
+    base_logits[0, 3, 11] = 100.0
+    hidden = torch.randn(1, 4, 32)
+
+    tokens, corrected_logits = model.rollout_correction(
+        base_logits, hidden, anchor_token_ids=torch.tensor([2])
+    )
+
+    assert torch.equal(tokens, torch.tensor([[3, 5, 9, 11]]))
+    assert corrected_logits.shape == (1, 4, 32)
+    seen = torch.cat(recording_head.seen_token_ids, dim=1)
+    # Slot 0 consumes the anchor; each later slot consumes the preceding draft.
+    assert torch.equal(seen, torch.tensor([[2, 3, 5, 9]]))
