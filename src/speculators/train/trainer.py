@@ -41,10 +41,18 @@ metric_logger = logging.getLogger("speculators.metrics")
 
 
 def _synchronize_device() -> None:
-    if hasattr(torch, "npu") and torch.npu.is_available():
-        torch.npu.synchronize()
-    elif torch.cuda.is_available():
-        torch.cuda.synchronize()
+    """Best-effort device sync for step profiling (CUDA or NPU).
+
+    Never raises: profiling must not abort training if the device sync path is
+    missing or broken on a given accelerator backend.
+    """
+    try:
+        if hasattr(torch, "npu") and torch.npu.is_available():
+            torch.npu.synchronize()
+        elif torch.cuda.is_available():
+            torch.cuda.synchronize()
+    except Exception:  # noqa: BLE001
+        return
 
 
 class _StepTimer:
@@ -64,12 +72,8 @@ class _StepTimer:
     def mark(self, name: str) -> None:
         if not self.enabled:
             return
-        # Always record the mark even if device sync fails, so logging cannot
-        # KeyError after a partial profiled step.
-        try:
-            _synchronize_device()
-        finally:
-            self._marks[name] = time.perf_counter()
+        _synchronize_device()
+        self._marks[name] = time.perf_counter()
 
     def mark_value(self, name: str, value: float) -> None:
         if self.enabled:

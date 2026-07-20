@@ -55,18 +55,21 @@ def test_profile_returns_none_when_marks_incomplete():
     assert timer.profile(num_tokens=1024) is None
 
 
-def test_mark_records_even_if_synchronize_fails():
+def test_synchronize_failure_does_not_abort_mark_or_now():
     timer = _StepTimer(enabled=True)
     with (
         patch(
-            "speculators.train.trainer._synchronize_device",
-            side_effect=RuntimeError("sync failed"),
-        ),
-        patch("speculators.train.trainer.time.perf_counter", return_value=1.5),
-        pytest.raises(RuntimeError, match="sync failed"),
+            "speculators.train.trainer.torch.npu",
+            create=True,
+        ) as mock_npu,
+        patch("speculators.train.trainer.torch.cuda.is_available", return_value=False),
+        patch("speculators.train.trainer.time.perf_counter", return_value=2.0),
     ):
+        mock_npu.is_available.return_value = True
+        mock_npu.synchronize.side_effect = RuntimeError("npu sync failed")
         timer.mark("fetch")
-    assert timer._marks["fetch"] == 1.5
+        assert timer.now() == 2.0
+    assert timer._marks["fetch"] == 2.0
 
 
 def test_disabled_to_enabled_transition():
