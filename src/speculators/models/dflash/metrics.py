@@ -27,6 +27,8 @@ def compute_metrics(
     per_position_loss_weight: str = "fixed-exp-decay",
     dpace_alpha: float = 0.5,
     sample_from_anchor: bool = False,
+    proposal_candidate_ids: torch.Tensor | None = None,
+    proposal_candidate_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -74,7 +76,21 @@ def compute_metrics(
         decay_fn=decay_fn,
     )
 
-    pred_ids = torch.argmax(logits, dim=-1)
+    if (proposal_candidate_ids is None) != (proposal_candidate_logits is None):
+        raise ValueError(
+            "proposal_candidate_ids and proposal_candidate_logits must be set together"
+        )
+    if proposal_candidate_ids is not None:
+        if proposal_candidate_logits is None:
+            raise RuntimeError("Proposal candidate logits are missing")
+        if proposal_candidate_ids.shape != proposal_candidate_logits.shape:
+            raise ValueError("Proposal candidate IDs and logits must align")
+        if proposal_candidate_ids.shape[:-1] != logits.shape[:-1]:
+            raise ValueError("Proposal candidates must align with draft positions")
+        selected = proposal_candidate_logits.argmax(dim=-1, keepdim=True)
+        pred_ids = proposal_candidate_ids.gather(-1, selected).squeeze(-1)
+    else:
+        pred_ids = torch.argmax(logits, dim=-1)
     target_ids = torch.argmax(targets, dim=-1)
 
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(

@@ -6,6 +6,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import torch
 
 
 def _load_module():
@@ -15,6 +16,7 @@ def _load_module():
     assert spec.loader is not None
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
+    module.torch = torch
     return module
 
 
@@ -265,9 +267,42 @@ def test_preprojection_rollout_forwards_cross_block_memory():
     )
 
     assert calls[0][1]["block_memory"] is block_memory
-    assert (
-        calls[0][1]["initial_previous_logits"] is initial_previous_logits
+    assert calls[0][1]["initial_previous_logits"] is initial_previous_logits
+
+
+def test_correction_selector_positive_temperature_returns_sparse_q():
+    module = _load_module()
+
+    class Draft:
+        correction_head = SimpleNamespace(position_embedding=object())
+        use_draft_vocab = False
+        d2t = None
+
+        @staticmethod
+        def rollout_correction(*args, **kwargs):
+            del args, kwargs
+            tokens = module.torch.tensor([[2]])
+            logits = module.torch.tensor(
+                [[[-module.torch.inf, 0.0, math.log(3.0), -module.torch.inf]]]
+            )
+            return tokens, logits
+
+    runner = module.DSparkOfflineRunner.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = Draft()
+    runner.args = SimpleNamespace(temperature=1.0)
+    runner.first_draft_slot = 0
+    runner.max_proposal_tokens = 1
+
+    proposed, probabilities = runner._sample_correction_tokens(
+        None,
+        module.torch.zeros(1, 1, 3),
+        module.torch.tensor([5]),
+        None,
+        None,
     )
+
+    assert proposed == [2]
+    assert probabilities[0, 0].tolist() == pytest.approx([0.0, 0.25, 0.75, 0.0])
 
 
 def test_target_logits_are_selected_in_draft_vocab_order():
@@ -305,15 +340,13 @@ def test_offline_dfly_uses_draft_layer_specific_target_context():
             return "normalized-shared"
 
         @staticmethod
-        def _add_dfly_layer_residual(
-            shared_projection, target_layer_states, layer_idx
-        ):
+        def _add_dfly_layer_residual(shared_projection, target_layer_states, layer_idx):
             calls.append((shared_projection, target_layer_states, layer_idx))
             return f"dfly-{layer_idx}"
 
     module = _load_module()
-    shared, layer_states, shared_context = (
-        module._prepare_dflash_target_context(Draft(), "hidden")
+    shared, layer_states, shared_context = module._prepare_dflash_target_context(
+        Draft(), "hidden"
     )
     contexts = [
         module._target_context_for_draft_layer(
@@ -329,6 +362,103 @@ def test_offline_dfly_uses_draft_layer_specific_target_context():
     assert shared_context == "normalized-shared"
     assert contexts == ["dfly-0", "dfly-1"]
     assert calls == [("shared", "layers", 0), ("shared", "layers", 1)]
+
+
+def test_offline_selector_returns_realized_topk_q_and_feedback_token():
+    module = _load_module()
+    seen_previous = []
+
+    class Draft:
+        correction_head = None
+        markov_head = None
+        candidate_selector = object()
+        use_draft_vocab = False
+        d2t = None
+
+        @staticmethod
+        def dflash2_select_candidates(logits, hidden_states, previous_token_ids):
+            del hidden_states
+            seen_previous.append(int(previous_token_ids.item()))
+            if len(seen_previous) == 1:
+                ids = module.torch.tensor([[[1, 2]]], device=logits.device)
+            else:
+                ids = module.torch.tensor([[[0, 3]]], device=logits.device)
+            scores = module.torch.tensor(
+                [[[0.0, 10.0]]], device=logits.device, dtype=logits.dtype
+            )
+            return ids, scores
+
+    runner = module.DSparkOfflineRunner.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = Draft()
+    runner.args = SimpleNamespace(temperature=0.0)
+    runner.device = module.torch.device("cpu")
+    runner.first_draft_slot = 0
+    runner.max_proposal_tokens = 2
+    base_logits = module.torch.zeros(1, 2, 4)
+    hidden_states = module.torch.zeros(1, 2, 3)
+
+    proposed, probabilities = runner._sample_dspark_tokens(
+        base_logits,
+        hidden_states,
+        module.torch.tensor([5]),
+        None,
+    )
+
+    assert proposed == [2, 3]
+    assert seen_previous == [5, 2]
+    assert module.torch.equal(
+        probabilities,
+        module.torch.tensor([[[0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]]]),
+    )
+
+
+def test_offline_selector_positive_temperature_q_and_vocab_mapping():
+    module = _load_module()
+    module.sample_from_probs = lambda probs: probs.argmax(dim=-1)
+
+    class Draft:
+        correction_head = None
+        markov_head = None
+        candidate_selector = object()
+        use_draft_vocab = True
+        draft_vocab_size = 4
+        verifier_vocab_size = 7
+        d2t = module.torch.tensor([0, 1, 2, 3])
+        t2d = module.torch.zeros(7, dtype=module.torch.long)
+
+        @staticmethod
+        def dflash2_select_candidates(logits, hidden_states, previous_token_ids):
+            del hidden_states, previous_token_ids
+            ids = module.torch.tensor([[[1, 3]]], device=logits.device)
+            scores = module.torch.tensor(
+                [[[0.0, math.log(3.0)]]],
+                device=logits.device,
+                dtype=logits.dtype,
+            )
+            return ids, scores
+
+    runner = module.DSparkOfflineRunner.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = Draft()
+    runner.args = SimpleNamespace(temperature=1.0)
+    runner.device = module.torch.device("cpu")
+    runner.first_draft_slot = 0
+    runner.max_proposal_tokens = 1
+
+    proposed, draft_q = runner._sample_dspark_tokens(
+        module.torch.zeros(1, 1, 4),
+        module.torch.zeros(1, 1, 3),
+        module.torch.tensor([5]),
+        None,
+    )
+    target_q = runner._expand_draft_probs_to_target_vocab(draft_q)
+
+    assert proposed == [6]
+    assert draft_q.sum().item() == pytest.approx(1.0)
+    assert draft_q[0, 0].tolist() == pytest.approx([0.0, 0.25, 0.0, 0.75])
+    assert target_q[0, 0].tolist() == pytest.approx(
+        [0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.75]
+    )
+    assert target_q[0, 0, proposed[0]].item() > 0.0
 
 
 def test_shard_records_round_robin():

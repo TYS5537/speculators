@@ -47,9 +47,7 @@ class DSparkDraftModel(DFlashDraftModel):
             config.correction_generated_token_ratio > 0.0
             and not config.enable_correction_head
         ):
-            raise ValueError(
-                "correction_generated_token_ratio > 0 requires Correction"
-            )
+            raise ValueError("correction_generated_token_ratio > 0 requires Correction")
         if (
             config.correction_output_mode != "hidden"
             and not config.enable_correction_head
@@ -57,9 +55,7 @@ class DSparkDraftModel(DFlashDraftModel):
             raise ValueError("correction_output_mode='logits' requires Correction")
         if config.correction_lm_head_fusion:
             if not config.enable_correction_head:
-                raise ValueError(
-                    "correction_lm_head_fusion=True requires Correction"
-                )
+                raise ValueError("correction_lm_head_fusion=True requires Correction")
             if config.correction_output_mode != "hidden":
                 raise ValueError(
                     "correction_lm_head_fusion=True requires hidden output mode"
@@ -81,17 +77,13 @@ class DSparkDraftModel(DFlashDraftModel):
             config.correction_project_corrected_hidden
             and config.correction_output_mode != "logits"
         ):
-            raise ValueError(
-                "correction_project_corrected_hidden requires logits mode"
-            )
+            raise ValueError("correction_project_corrected_hidden requires logits mode")
         if (
             config.correction_generated_token_warmup
             + config.correction_generated_token_ramp
             > 1.0
         ):
-            raise ValueError(
-                "Correction generated-token warmup + ramp must be <= 1"
-            )
+            raise ValueError("Correction generated-token warmup + ramp must be <= 1")
 
         self.markov_head: MarkovHead | None = None
         self.correction_head: CausalCorrectionHead | None = None
@@ -219,50 +211,34 @@ class DSparkDraftModel(DFlashDraftModel):
             correction_output_mode=kwargs.get("correction_output_mode", "hidden"),
             correction_hidden_size=kwargs.get("correction_hidden_size", 512),
             correction_rank=kwargs.get("correction_rank", 256),
-            correction_lm_head_fusion=kwargs.get(
-                "correction_lm_head_fusion", False
-            ),
+            correction_lm_head_fusion=kwargs.get("correction_lm_head_fusion", False),
             correction_num_layers=kwargs.get("correction_num_layers", 1),
             correction_num_heads=kwargs.get("correction_num_heads", 8),
             correction_gate_bias=kwargs.get("correction_gate_bias", 0.0),
             correction_moe=kwargs.get("correction_moe", False),
-            correction_moe_shared_rank=kwargs.get(
-                "correction_moe_shared_rank", 128
-            ),
-            correction_moe_expert_rank=kwargs.get(
-                "correction_moe_expert_rank", 64
-            ),
-            correction_moe_num_experts=kwargs.get(
-                "correction_moe_num_experts", 4
-            ),
+            correction_moe_shared_rank=kwargs.get("correction_moe_shared_rank", 128),
+            correction_moe_expert_rank=kwargs.get("correction_moe_expert_rank", 64),
+            correction_moe_num_experts=kwargs.get("correction_moe_num_experts", 4),
             correction_moe_load_balance_weight=kwargs.get(
                 "correction_moe_load_balance_weight", 0.01
             ),
             correction_moe_logit_routing=kwargs.get(
                 "correction_moe_logit_routing", False
             ),
-            correction_hidden_aux_loss=kwargs.get(
-                "correction_hidden_aux_loss", False
-            ),
+            correction_hidden_aux_loss=kwargs.get("correction_hidden_aux_loss", False),
             correction_hidden_aux_weight=kwargs.get(
                 "correction_hidden_aux_weight", 0.1
             ),
-            correction_hidden_feedback=kwargs.get(
-                "correction_hidden_feedback", False
-            ),
+            correction_hidden_feedback=kwargs.get("correction_hidden_feedback", False),
             correction_cross_block_memory=kwargs.get(
                 "correction_cross_block_memory", False
             ),
-            correction_memory_gate_bias=kwargs.get(
-                "correction_memory_gate_bias", -2.0
-            ),
+            correction_memory_gate_bias=kwargs.get("correction_memory_gate_bias", -2.0),
             correction_project_corrected_hidden=kwargs.get(
                 "correction_project_corrected_hidden", False
             ),
             correction_with_markov=kwargs.get("correction_with_markov", False),
-            correction_markov_gate_bias=kwargs.get(
-                "correction_markov_gate_bias", -2.0
-            ),
+            correction_markov_gate_bias=kwargs.get("correction_markov_gate_bias", -2.0),
             correction_generated_token_ratio=kwargs.get(
                 "correction_generated_token_ratio", 0.0
             ),
@@ -272,9 +248,7 @@ class DSparkDraftModel(DFlashDraftModel):
             correction_generated_token_ramp=kwargs.get(
                 "correction_generated_token_ramp", 0.4
             ),
-            correction_rollout_metrics=kwargs.get(
-                "correction_rollout_metrics", False
-            ),
+            correction_rollout_metrics=kwargs.get("correction_rollout_metrics", False),
             correction_base_diagnostics=kwargs.get(
                 "correction_base_diagnostics", False
             ),
@@ -288,9 +262,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 if confidence_head_with_markov_arg is None
                 else confidence_head_with_markov_arg
             ),
-            confidence_detach_features=kwargs.get(
-                "confidence_detach_features", False
-            ),
+            confidence_detach_features=kwargs.get("confidence_detach_features", False),
         )
 
         model = cls(config=config)
@@ -301,12 +273,8 @@ class DSparkDraftModel(DFlashDraftModel):
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
         """Resolve DSpark's compound loss from ``--loss-fn``."""
-        loss_config = resolve_loss_config(
-            kwargs.get("loss_fn", _DSPARK_PAPER_LOSS_FN)
-        )
-        gamma = kwargs.get(
-            "dflash_decay_gamma", float(kwargs.get("block_size", 7))
-        )
+        loss_config = resolve_loss_config(kwargs.get("loss_fn", _DSPARK_PAPER_LOSS_FN))
+        gamma = kwargs.get("dflash_decay_gamma", float(kwargs.get("block_size", 7)))
         max_anchors = kwargs.get("max_anchors", 3072)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
         confidence_length_alpha = kwargs.get("confidence_length_alpha", 0.0)
@@ -328,9 +296,7 @@ class DSparkDraftModel(DFlashDraftModel):
         generated_token_warmup = float(
             kwargs.get("correction_generated_token_warmup", 0.2)
         )
-        generated_token_ramp = float(
-            kwargs.get("correction_generated_token_ramp", 0.4)
-        )
+        generated_token_ramp = float(kwargs.get("correction_generated_token_ramp", 0.4))
         if not 0.0 <= generated_token_ratio <= 1.0:
             raise ValueError("Generated-token ratio must be in [0, 1]")
         if not 0.0 <= generated_token_warmup <= 1.0:
@@ -359,9 +325,7 @@ class DSparkDraftModel(DFlashDraftModel):
             train_kw["ssal_curriculum_end"] = ssal_curriculum_end
         if generated_token_ratio > 0.0:
             train_kw["correction_generated_token_curriculum"] = True
-            train_kw["correction_generated_token_target_ratio"] = (
-                generated_token_ratio
-            )
+            train_kw["correction_generated_token_target_ratio"] = generated_token_ratio
             train_kw["correction_generated_token_warmup"] = generated_token_warmup
             train_kw["correction_generated_token_ramp"] = generated_token_ramp
         return train_kw, dict(shared)
@@ -448,9 +412,7 @@ class DSparkDraftModel(DFlashDraftModel):
         if verifier_pre_lm_hidden.ndim != 2:
             raise ValueError("verifier_pre_lm_hidden must be rank-2")
         if anchor_token_ids.shape != verifier_pre_lm_hidden.shape[:1]:
-            raise ValueError(
-                "anchor token IDs and verifier pre-LM hidden must align"
-            )
+            raise ValueError("anchor token IDs and verifier pre-LM hidden must align")
 
         dtype = self.cross_block_memory_verifier_proj.weight.dtype
         with torch.no_grad():
@@ -574,9 +536,7 @@ class DSparkDraftModel(DFlashDraftModel):
         output_states: list[torch.Tensor] = []
         output_corrected_hidden: list[torch.Tensor] = []
         output_delta_logits: list[torch.Tensor] = []
-        previous_corrected_hidden = dflash_hidden.new_zeros(
-            num_blocks, 1, hidden_size
-        )
+        previous_corrected_hidden = dflash_hidden.new_zeros(num_blocks, 1, hidden_size)
         previous_corrected_hidden_mask = torch.zeros(
             num_blocks,
             1,
@@ -601,9 +561,7 @@ class DSparkDraftModel(DFlashDraftModel):
             else:
                 head_kwargs = {
                     "previous_corrected_hidden": previous_corrected_hidden,
-                    "previous_corrected_hidden_mask": (
-                        previous_corrected_hidden_mask
-                    ),
+                    "previous_corrected_hidden_mask": (previous_corrected_hidden_mask),
                     "cache": cache,
                     "use_cache": True,
                 }
@@ -624,11 +582,9 @@ class DSparkDraftModel(DFlashDraftModel):
                     head_kwargs["previous_logits"] = previous_target_logits[
                         :, position : position + 1
                     ]
-                    head_kwargs["previous_logits_mask"] = (
-                        previous_target_logits_mask[
-                            :, position : position + 1
-                        ]
-                    )
+                    head_kwargs["previous_logits_mask"] = previous_target_logits_mask[
+                        :, position : position + 1
+                    ]
                 if self.correction_head.output_mode == "logits":
                     delta_logits_step, causal_step, cache = self.correction_head(
                         previous_token_embeddings[:, position : position + 1],
@@ -637,14 +593,10 @@ class DSparkDraftModel(DFlashDraftModel):
                         **head_kwargs,
                     )
                     delta_logits = delta_logits_step[:, 0]
-                    delta_hidden = (
-                        self.correction_head.auxiliary_hidden_residual(
-                            causal_step,
-                            previous_logits=head_kwargs.get("previous_logits"),
-                            previous_logits_mask=head_kwargs.get(
-                                "previous_logits_mask"
-                            ),
-                        )
+                    delta_hidden = self.correction_head.auxiliary_hidden_residual(
+                        causal_step,
+                        previous_logits=head_kwargs.get("previous_logits"),
+                        previous_logits_mask=head_kwargs.get("previous_logits_mask"),
                     )
                 else:
                     delta_hidden, causal_step, cache = self.correction_head(
@@ -683,9 +635,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 logits = projected_logits + delta_logits.to(projected_logits.dtype)
             else:
                 if base_logits is None:
-                    raise RuntimeError(
-                        "Logit-residual Correction requires base logits"
-                    )
+                    raise RuntimeError("Logit-residual Correction requires base logits")
                 logits = base_logits + delta_logits.to(base_logits.dtype)
         else:
             logits = self.lm_head(
@@ -704,6 +654,7 @@ class DSparkDraftModel(DFlashDraftModel):
         temperature: float = 0.0,
         block_memory: torch.Tensor | None = None,
         initial_previous_logits: torch.Tensor | None = None,
+        return_selector_logits: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Run a differentiable Correction pass with greedy token self-feedback.
 
@@ -736,9 +687,7 @@ class DSparkDraftModel(DFlashDraftModel):
         output_states: list[torch.Tensor] = []
         output_corrected_hidden: list[torch.Tensor] = []
         start_position = 0 if self.config.sample_from_anchor else 1
-        correction_output_mode = getattr(
-            self.correction_head, "output_mode", "hidden"
-        )
+        correction_output_mode = getattr(self.correction_head, "output_mode", "hidden")
         hidden_auxiliary_enabled = getattr(
             self.config, "correction_hidden_aux_loss", False
         )
@@ -754,9 +703,11 @@ class DSparkDraftModel(DFlashDraftModel):
         logit_feedback_enabled = (
             correction_output_mode == "logits" or logit_routing_enabled
         )
-        fused_lm_head_enabled = bool(
-            getattr(self.config, "correction_lm_head_fusion", False)
-        ) and correction_output_mode == "hidden" and not torch.is_grad_enabled()
+        fused_lm_head_enabled = (
+            bool(getattr(self.config, "correction_lm_head_fusion", False))
+            and correction_output_mode == "hidden"
+            and not torch.is_grad_enabled()
+        )
         fused_base_logits = None
         if fused_lm_head_enabled:
             # Project the full parallel DFlash block once. Each sequential
@@ -768,9 +719,12 @@ class DSparkDraftModel(DFlashDraftModel):
         previous_feedback_logits = None
         previous_feedback_mask = None
         if logit_feedback_enabled:
+            draft_vocab_size = getattr(
+                self, "draft_vocab_size", self.lm_head.out_features
+            )
             expected_initial_shape = (
                 dflash_hidden.shape[0],
-                self.draft_vocab_size,
+                draft_vocab_size,
             )
             if self.config.sample_from_anchor:
                 if initial_previous_logits is not None:
@@ -781,7 +735,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 previous_feedback_logits = dflash_hidden.new_zeros(
                     dflash_hidden.shape[0],
                     1,
-                    self.draft_vocab_size,
+                    draft_vocab_size,
                     dtype=self.lm_head.weight.dtype,
                 )
                 previous_feedback_mask = torch.zeros(
@@ -802,10 +756,14 @@ class DSparkDraftModel(DFlashDraftModel):
                         f"{expected_initial_shape}, got "
                         f"{tuple(initial_previous_logits.shape)}"
                     )
-                previous_feedback_logits = initial_previous_logits.detach().to(
-                    device=dflash_hidden.device,
-                    dtype=self.lm_head.weight.dtype,
-                ).unsqueeze(1)
+                previous_feedback_logits = (
+                    initial_previous_logits.detach()
+                    .to(
+                        device=dflash_hidden.device,
+                        dtype=self.lm_head.weight.dtype,
+                    )
+                    .unsqueeze(1)
+                )
                 previous_feedback_mask = torch.ones(
                     dflash_hidden.shape[0],
                     1,
@@ -886,12 +844,10 @@ class DSparkDraftModel(DFlashDraftModel):
                         or hidden_feedback_enabled
                         or (hidden_auxiliary_enabled and self.training)
                     ):
-                        delta_hidden = (
-                            self.correction_head.auxiliary_hidden_residual(
-                                causal_states,
-                                previous_logits=previous_feedback_logits,
-                                previous_logits_mask=previous_feedback_mask,
-                            )
+                        delta_hidden = self.correction_head.auxiliary_hidden_residual(
+                            causal_states,
+                            previous_logits=previous_feedback_logits,
+                            previous_logits_mask=previous_feedback_mask,
                         )
                         corrected_current_hidden = current_hidden + delta_hidden[
                             :, 0
@@ -920,17 +876,15 @@ class DSparkDraftModel(DFlashDraftModel):
                         **hidden_feedback_kwargs,
                         **logit_feedback_kwargs,
                     )
-                    corrected_current_hidden = current_hidden + delta_hidden[
-                        :, 0
-                    ].to(current_hidden.dtype)
+                    corrected_current_hidden = current_hidden + delta_hidden[:, 0].to(
+                        current_hidden.dtype
+                    )
                     if fused_base_logits is not None:
-                        delta_logits = (
-                            self.correction_head.fused_lm_head_residual(
-                                causal_states,
-                                self.lm_head.weight,
-                                previous_logits=previous_feedback_logits,
-                                previous_logits_mask=previous_feedback_mask,
-                            )
+                        delta_logits = self.correction_head.fused_lm_head_residual(
+                            causal_states,
+                            self.lm_head.weight,
+                            previous_logits=previous_feedback_logits,
+                            previous_logits_mask=previous_feedback_mask,
                         )
                         final_logits = fused_base_logits[:, position] + (
                             delta_logits[:, 0].to(fused_base_logits.dtype)
@@ -949,18 +903,40 @@ class DSparkDraftModel(DFlashDraftModel):
                     )
                     final_logits = final_logits[:, 0]
 
+            proposal_logits = final_logits
+            candidate_ids = None
+            if (
+                getattr(self, "candidate_selector", None) is not None
+                and position >= start_position
+            ):
+                candidate_ids, candidate_logits = self.dflash2_select_candidates(
+                    final_logits,
+                    corrected_current_hidden,
+                    previous_ids,
+                )
+                if return_selector_logits:
+                    proposal_logits = torch.full_like(final_logits, -torch.inf)
+                    proposal_logits.scatter_(-1, candidate_ids, candidate_logits)
+                sampling_logits = candidate_logits
+            else:
+                sampling_logits = final_logits
             with torch.no_grad():
                 if temperature > 0:
                     probabilities = torch.softmax(
-                        final_logits.float() / temperature, dim=-1
+                        sampling_logits.float() / temperature, dim=-1
                     )
-                    draft_ids = torch.multinomial(
+                    sampled_indices = torch.multinomial(
                         probabilities, num_samples=1
                     ).squeeze(-1)
                 else:
-                    draft_ids = torch.argmax(final_logits, dim=-1)
+                    sampled_indices = torch.argmax(sampling_logits, dim=-1)
+                draft_ids = sampled_indices
+                if candidate_ids is not None:
+                    draft_ids = candidate_ids.gather(
+                        -1, sampled_indices.unsqueeze(-1)
+                    ).squeeze(-1)
             output_tokens.append(draft_ids)
-            output_logits.append(final_logits)
+            output_logits.append(proposal_logits)
             output_states.append(causal_states)
             output_corrected_hidden.append(corrected_current_hidden)
 
@@ -1073,9 +1049,7 @@ class DSparkDraftModel(DFlashDraftModel):
             num_blocks, -1
         )
         base_logits_blocks = (
-            None
-            if base_logits is None
-            else base_logits.view(num_blocks, block, -1)
+            None if base_logits is None else base_logits.view(num_blocks, block, -1)
         )
         block_memory = None
         if self.config.correction_cross_block_memory:
@@ -1096,6 +1070,7 @@ class DSparkDraftModel(DFlashDraftModel):
         collaboration_base_logits = None
         collaboration_gate = None
         corrected_hidden = None
+        generated_correction_tokens = None
         moe_previous_logits = None
         moe_previous_logits_mask = None
         if self.config.correction_moe_logit_routing:
@@ -1111,17 +1086,17 @@ class DSparkDraftModel(DFlashDraftModel):
         if self.correction_head is not None:
             if generated_correction_training:
                 initial_previous_logits = None
-                if (
-                    not self.config.sample_from_anchor
-                    and (
-                        correction_output_mode == "logits"
-                        or self.config.correction_moe_logit_routing
-                    )
+                if not self.config.sample_from_anchor and (
+                    correction_output_mode == "logits"
+                    or self.config.correction_moe_logit_routing
                 ):
-                    initial_previous_logits = targets.view(
-                        num_blocks, block, -1
-                    )[:, 0]
-                _, logits_blocks, correction_states, corrected_hidden = (
+                    initial_previous_logits = targets.view(num_blocks, block, -1)[:, 0]
+                (
+                    generated_correction_tokens,
+                    logits_blocks,
+                    correction_states,
+                    corrected_hidden,
+                ) = (
                     self._generated_feedback_correction(
                         hidden_blocks,
                         anchor_token_ids=block_tokens[:, 0],
@@ -1213,9 +1188,9 @@ class DSparkDraftModel(DFlashDraftModel):
                             )
                         if self.config.correction_project_corrected_hidden:
                             projected_logits = self.lm_head(
-                                corrected_hidden.reshape(
-                                    1, mask_tokens_size, -1
-                                ).to(self.lm_head.weight.dtype)
+                                corrected_hidden.reshape(1, mask_tokens_size, -1).to(
+                                    self.lm_head.weight.dtype
+                                )
                             )
                             logits = projected_logits + delta_logits.reshape(
                                 1, mask_tokens_size, -1
@@ -1231,9 +1206,7 @@ class DSparkDraftModel(DFlashDraftModel):
                         if self.config.correction_moe_logit_routing:
                             logit_routing_kwargs = {
                                 "previous_logits": moe_previous_logits,
-                                "previous_logits_mask": (
-                                    moe_previous_logits_mask
-                                ),
+                                "previous_logits_mask": (moe_previous_logits_mask),
                             }
                         delta_hidden, correction_states, _ = self.correction_head(
                             prev_gt_emb,
@@ -1293,9 +1266,9 @@ class DSparkDraftModel(DFlashDraftModel):
                             )
                         if self.config.correction_project_corrected_hidden:
                             projected_logits = self.lm_head(
-                                corrected_hidden.reshape(
-                                    1, mask_tokens_size, -1
-                                ).to(self.lm_head.weight.dtype)
+                                corrected_hidden.reshape(1, mask_tokens_size, -1).to(
+                                    self.lm_head.weight.dtype
+                                )
                             )
                             full_delta_logits = torch.cat(
                                 [
@@ -1319,9 +1292,7 @@ class DSparkDraftModel(DFlashDraftModel):
                                 ],
                                 dim=1,
                             )
-                            logits = logits_blocks.reshape(
-                                1, mask_tokens_size, -1
-                            )
+                            logits = logits_blocks.reshape(1, mask_tokens_size, -1)
                     else:
                         logit_routing_kwargs = {}
                         if self.config.correction_moe_logit_routing:
@@ -1379,9 +1350,7 @@ class DSparkDraftModel(DFlashDraftModel):
                             hidden_blocks,
                         )
                     )
-                    logits = collaborative_blocks.reshape(
-                        1, mask_tokens_size, -1
-                    )
+                    logits = collaborative_blocks.reshape(1, mask_tokens_size, -1)
 
             # Optional validation-only base projection for change/gain diagnostics.
             # It is never part of the training or inference correction path.
@@ -1396,16 +1365,11 @@ class DSparkDraftModel(DFlashDraftModel):
             # measures the actual generated-token feedback chain.
             if not self.training and self.config.correction_rollout_metrics:
                 rollout_initial_logits = None
-                if (
-                    not self.config.sample_from_anchor
-                    and (
-                        correction_output_mode == "logits"
-                        or self.config.correction_moe_logit_routing
-                    )
+                if not self.config.sample_from_anchor and (
+                    correction_output_mode == "logits"
+                    or self.config.correction_moe_logit_routing
                 ):
-                    rollout_initial_logits = targets.view(
-                        num_blocks, block, -1
-                    )[:, 0]
+                    rollout_initial_logits = targets.view(num_blocks, block, -1)[:, 0]
                 _, rollout_blocks = self.rollout_correction(
                     hidden_blocks.detach(),
                     anchor_token_ids=block_tokens[:, 0],
@@ -1428,6 +1392,47 @@ class DSparkDraftModel(DFlashDraftModel):
 
         if logits is None:
             raise RuntimeError("DSpark forward did not produce draft logits")
+
+        proposal_candidate_ids = None
+        proposal_candidate_logits = None
+        selector_loss = None
+        if self.candidate_selector is not None:
+            selector_hidden = (
+                corrected_hidden if corrected_hidden is not None else hidden_blocks
+            )
+            realized_previous_token_ids = None
+            if generated_correction_tokens is not None:
+                start_position = 0 if self.config.sample_from_anchor else 1
+                realized_previous_token_ids = prev_token_ids.clone()
+                realized_previous_token_ids[:, start_position] = block_tokens[:, 0]
+                if start_position + 1 < block:
+                    realized_previous_token_ids[:, start_position + 1 :] = (
+                        self._draft_ids_to_verifier(
+                            generated_correction_tokens[:, start_position:-1]
+                        )
+                    )
+            elif self.correction_head is not None or self.markov_head is not None:
+                # These sequential heads were teacher-forced above. Their
+                # downstream hidden/logits are only valid for the GT predecessor.
+                realized_previous_token_ids = prev_token_ids
+            teacher_previous_token_ids = (
+                realized_previous_token_ids
+                if realized_previous_token_ids is not None
+                else prev_token_ids
+            )
+            candidate_ids, candidate_logits, selector_loss = (
+                self._dflash2_block_outputs(
+                    logits,
+                    targets,
+                    selector_hidden,
+                    block_tokens[:, 0],
+                    aligned_loss_mask,
+                    teacher_previous_token_ids=teacher_previous_token_ids,
+                    realized_previous_token_ids=realized_previous_token_ids,
+                )
+            )
+            proposal_candidate_ids = candidate_ids.view(1, mask_tokens_size, -1)
+            proposal_candidate_logits = candidate_logits.view_as(proposal_candidate_ids)
 
         if self.confidence_head is not None:
             sequential_states = None
@@ -1470,7 +1475,16 @@ class DSparkDraftModel(DFlashDraftModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            proposal_candidate_ids=proposal_candidate_ids,
+            proposal_candidate_logits=proposal_candidate_logits,
         )
+        if selector_loss is not None:
+            loss = loss + self.config.dflash2_selector_loss_weight * selector_loss
+            metrics["loss_sum"] = loss.detach().clone()
+            metrics["dflash2_selector_loss_sum"] = selector_loss.detach().clone()
+            metrics["dflash2_selector_loss_total"] = torch.ones(
+                (), device=loss.device, dtype=torch.float32
+            )
         if self.config.correction_hidden_aux_loss:
             if corrected_hidden is None:
                 raise RuntimeError(
@@ -1492,13 +1506,9 @@ class DSparkDraftModel(DFlashDraftModel):
                 verifier_hidden_targets,
                 aligned_loss_mask.view(num_blocks, block),
             )
-            loss = loss + (
-                self.config.correction_hidden_aux_weight * hidden_aux_loss
-            )
+            loss = loss + (self.config.correction_hidden_aux_weight * hidden_aux_loss)
             metrics["loss_sum"] = loss.detach().clone()
-            metrics["correction_hidden_aux_loss_sum"] = (
-                hidden_aux_loss.detach().clone()
-            )
+            metrics["correction_hidden_aux_loss_sum"] = hidden_aux_loss.detach().clone()
             metrics["correction_hidden_aux_loss_total"] = torch.ones(
                 (),
                 device=loss.device,
@@ -1568,5 +1578,6 @@ class DSparkDraftModel(DFlashDraftModel):
             temperature=temperature,
             block_memory=block_memory,
             initial_previous_logits=initial_previous_logits,
+            return_selector_logits=True,
         )
         return tokens, logits

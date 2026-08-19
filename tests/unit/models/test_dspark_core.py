@@ -35,13 +35,14 @@ class _RecordingCorrectionHead(nn.Module):
         if previous_logits is not None:
             assert previous_logits_mask is not None
             self.previous_logits.append(previous_logits.detach().clone())
-            self.previous_logits_masks.append(
-                previous_logits_mask.detach().clone()
-            )
+            self.previous_logits_masks.append(previous_logits_mask.detach().clone())
         states = dflash_hidden.new_zeros(*dflash_hidden.shape[:-1], 4)
-        delta_hidden = torch.nn.functional.one_hot(
-            block_positions, num_classes=dflash_hidden.shape[-1]
-        ).to(dflash_hidden.dtype) * self.scale
+        delta_hidden = (
+            torch.nn.functional.one_hot(
+                block_positions, num_classes=dflash_hidden.shape[-1]
+            ).to(dflash_hidden.dtype)
+            * self.scale
+        )
         next_cache = [] if use_cache else None
         return delta_hidden, states, next_cache
 
@@ -144,16 +145,12 @@ class _RecordingHiddenFeedbackCorrectionHead(nn.Module):
 
 
 class _RolloutHarness:
-    _generated_feedback_correction = (
-        DSparkDraftModel._generated_feedback_correction
-    )
+    _generated_feedback_correction = DSparkDraftModel._generated_feedback_correction
     rollout_correction = DSparkDraftModel.rollout_correction
 
 
 class _GeneratedFeedbackHarness:
-    _generated_feedback_correction = (
-        DSparkDraftModel._generated_feedback_correction
-    )
+    _generated_feedback_correction = DSparkDraftModel._generated_feedback_correction
 
 
 class _CollaborationHarness:
@@ -162,9 +159,7 @@ class _CollaborationHarness:
 
 class _CollaborativeRolloutHarness:
     _apply_collaborative_markov = DSparkDraftModel._apply_collaborative_markov
-    _generated_feedback_correction = (
-        DSparkDraftModel._generated_feedback_correction
-    )
+    _generated_feedback_correction = DSparkDraftModel._generated_feedback_correction
     rollout_correction = DSparkDraftModel.rollout_correction
 
 
@@ -333,6 +328,47 @@ def test_logit_residual_rollout_feeds_back_previous_final_logits():
     feedback = torch.cat(harness.correction_head.previous_logits, dim=1)
     assert torch.count_nonzero(feedback[:, 0]) == 0
     assert torch.equal(feedback[:, 1:], logits[:, :-1].detach())
+
+
+def test_correction_rollout_selector_feedback_and_sparse_logits():
+    harness = _RolloutHarness()
+    harness.block_size = 3
+    harness.config = SimpleNamespace(
+        sample_from_anchor=True,
+        correction_hidden_size=4,
+    )
+    harness.correction_head = _RecordingCorrectionHead()
+    harness.embed_tokens = nn.Embedding(8, 4)
+    harness.lm_head = _CountingLinear(4, 8)
+    harness.d2t = None
+    harness.candidate_selector = object()
+    seen_previous = []
+
+    def select_candidates(_self, logits, hidden_states, previous_token_ids):
+        del hidden_states
+        seen_previous.append(int(previous_token_ids.item()))
+        first = previous_token_ids.remainder(logits.shape[-1])
+        candidate_ids = torch.stack(
+            [first, (first + 1).remainder(logits.shape[-1])], dim=-1
+        )
+        candidate_logits = logits.new_tensor([[0.0, 10.0]])
+        return candidate_ids, candidate_logits
+
+    harness.dflash2_select_candidates = select_candidates.__get__(harness)
+    with torch.no_grad():
+        harness.lm_head.weight.zero_()
+
+    tokens, logits = harness.rollout_correction(
+        torch.zeros(1, 3, 4),
+        anchor_token_ids=torch.tensor([7]),
+    )
+
+    assert torch.equal(tokens, torch.tensor([[0, 1, 2]]))
+    assert seen_previous == [7, 0, 1]
+    assert torch.equal(
+        logits.gather(-1, tokens.unsqueeze(-1)).squeeze(-1), torch.full((1, 3), 10.0)
+    )
+    assert torch.isneginf(logits).sum() == 18
     assert harness.lm_head.calls == harness.block_size
 
 
@@ -344,9 +380,7 @@ def test_no_anchor_sampling_starts_logit_feedback_from_verifier_logits():
         sample_from_anchor=False,
         correction_hidden_size=4,
     )
-    harness.correction_head = _RecordingLogitCorrectionHead(
-        harness.draft_vocab_size
-    )
+    harness.correction_head = _RecordingLogitCorrectionHead(harness.draft_vocab_size)
     harness.embed_tokens = nn.Embedding(8, 4)
     harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
     harness.d2t = None
@@ -378,9 +412,7 @@ def test_logit_mode_can_project_corrected_hidden_before_adding_delta_logits():
         correction_hidden_feedback=False,
         correction_project_corrected_hidden=True,
     )
-    harness.correction_head = _RecordingLogitCorrectionHead(
-        harness.draft_vocab_size
-    )
+    harness.correction_head = _RecordingLogitCorrectionHead(harness.draft_vocab_size)
     harness.embed_tokens = nn.Embedding(8, 4)
     harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
     harness.d2t = None
@@ -417,13 +449,9 @@ def test_corrected_hidden_is_fed_to_the_next_slot_when_enabled():
         anchor_token_ids=torch.tensor([7]),
     )
 
-    masks = torch.cat(
-        harness.correction_head.previous_corrected_hidden_masks, dim=1
-    )
+    masks = torch.cat(harness.correction_head.previous_corrected_hidden_masks, dim=1)
     assert torch.equal(masks, torch.tensor([[False, True, True]]))
-    feedback = torch.cat(
-        harness.correction_head.previous_corrected_hidden, dim=1
-    )
+    feedback = torch.cat(harness.correction_head.previous_corrected_hidden, dim=1)
     assert torch.count_nonzero(feedback[:, 0]) == 0
     assert torch.equal(feedback[:, 1:], corrected_hidden[:, :-1].detach())
 
@@ -432,9 +460,7 @@ def test_confidence_feature_detach_switch_controls_both_inputs():
     hidden = torch.randn(2, 3, 4, requires_grad=True)
     sequential = torch.randn(2, 3, 2, requires_grad=True)
 
-    coupled = DSparkDraftModel._confidence_features(
-        hidden, sequential, detach=False
-    )
+    coupled = DSparkDraftModel._confidence_features(hidden, sequential, detach=False)
     coupled.sum().backward()
     assert hidden.grad is not None
     assert sequential.grad is not None
@@ -450,9 +476,7 @@ def test_hidden_alignment_loss_is_masked_and_zero_for_matching_states():
     verifier = torch.tensor([[[1.0, 2.0], [0.0, 0.0]]])
     mask = torch.tensor([[1.0, 0.0]])
 
-    loss = DSparkDraftModel._hidden_alignment_loss(
-        corrected, verifier, mask
-    )
+    loss = DSparkDraftModel._hidden_alignment_loss(corrected, verifier, mask)
 
     assert torch.equal(loss, torch.zeros_like(loss))
 

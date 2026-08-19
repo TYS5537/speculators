@@ -20,6 +20,8 @@ class TestSampleFromAnchorDFlash:
         assert not config.dflash_gated_layer_fusion
         assert not config.dflash_dfly_layer_residual
         assert not config.dflash_heterogeneous_kv_projections
+        assert not config.dflash2_dynamic_conv
+        assert not config.dflash2_candidate_selector
 
     def test_can_set_to_true(self):
         """DFlash can be configured with sample_from_anchor=True."""
@@ -43,6 +45,8 @@ class TestSampleFromAnchorDSpark:
         assert not config.correction_cross_block_memory
         assert not config.dflash_dfly_layer_residual
         assert not config.dflash_heterogeneous_kv_projections
+        assert not config.dflash2_dynamic_conv
+        assert not config.dflash2_candidate_selector
 
     def test_can_override_to_false(self):
         """DSpark can be configured with sample_from_anchor=False."""

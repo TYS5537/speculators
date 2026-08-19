@@ -736,9 +736,14 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "dflash_block_position_embedding": "--dflash-block-position-embedding",
     "dflash_gated_layer_fusion": "--dflash-gated-layer-fusion",
     "dflash_dfly_layer_residual": "--dflash-dfly-layer-residual",
-    "dflash_heterogeneous_kv_projections": (
-        "--dflash-heterogeneous-kv-projections"
-    ),
+    "dflash_heterogeneous_kv_projections": ("--dflash-heterogeneous-kv-projections"),
+    "dflash2_dynamic_conv": "--dflash2-dynamic-conv",
+    "dflash2_conv_kernel_size": "--dflash2-conv-kernel-size",
+    "dflash2_conv_group_size": "--dflash2-conv-group-size",
+    "dflash2_candidate_selector": "--dflash2-candidate-selector",
+    "dflash2_selector_rank": "--dflash2-selector-rank",
+    "dflash2_selector_top_k": "--dflash2-selector-top-k",
+    "dflash2_selector_loss_weight": "--dflash2-selector-loss-weight",
     "markov_rank": "--markov-rank",
     "markov_head_type": "--markov-head-type",
     "enable_correction_head": "--enable-correction-head",
@@ -753,18 +758,14 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "correction_moe_shared_rank": "--correction-moe-shared-rank",
     "correction_moe_expert_rank": "--correction-moe-expert-rank",
     "correction_moe_num_experts": "--correction-moe-num-experts",
-    "correction_moe_load_balance_weight": (
-        "--correction-moe-load-balance-weight"
-    ),
+    "correction_moe_load_balance_weight": ("--correction-moe-load-balance-weight"),
     "correction_moe_logit_routing": "--correction-moe-logit-routing",
     "correction_hidden_aux_loss": "--correction-hidden-aux-loss",
     "correction_hidden_aux_weight": "--correction-hidden-aux-weight",
     "correction_hidden_feedback": "--correction-hidden-feedback",
     "correction_cross_block_memory": "--correction-cross-block-memory",
     "correction_memory_gate_bias": "--correction-memory-gate-bias",
-    "correction_project_corrected_hidden": (
-        "--correction-project-corrected-hidden"
-    ),
+    "correction_project_corrected_hidden": ("--correction-project-corrected-hidden"),
     "correction_with_markov": "--correction-with-markov",
     "correction_markov_gate_bias": "--correction-markov-gate-bias",
     "correction_generated_token_ratio": "--correction-generated-token-ratio",
@@ -787,6 +788,7 @@ PRETRAINED_RUNTIME_CONFIG_FIELDS = {
     "correction_rollout_metrics",
     "correction_base_diagnostics",
     "confidence_detach_features",
+    "dflash2_selector_loss_weight",
 }
 
 
@@ -1303,6 +1305,54 @@ def parse_args():
             "projections (default: disabled)."
         ),
     )
+    parser.add_argument(
+        "--dflash2-dynamic-conv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash2: wrap every draft Attention and MLP with grouped causal "
+            "dynamic convolutions (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash2-conv-kernel-size",
+        type=int,
+        default=2,
+        help="DFlash2 dynamic-convolution causal tap count (default: 2).",
+    )
+    parser.add_argument(
+        "--dflash2-conv-group-size",
+        type=int,
+        default=16,
+        help="DFlash2 hidden channels per dynamic-convolution group (default: 16).",
+    )
+    parser.add_argument(
+        "--dflash2-candidate-selector",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help=(
+            "DFlash2: sequentially re-rank the existing LM-head Top-K candidate "
+            "chain (default: disabled)."
+        ),
+    )
+    parser.add_argument(
+        "--dflash2-selector-rank",
+        type=int,
+        default=256,
+        help="DFlash2 candidate-selector transition rank (default: 256).",
+    )
+    parser.add_argument(
+        "--dflash2-selector-top-k",
+        type=int,
+        default=16,
+        help="DFlash2 candidate-selector Top-K width (default: 16).",
+    )
+    parser.add_argument(
+        "--dflash2-selector-loss-weight",
+        type=float,
+        default=1.0,
+        help="Weight of the DFlash2 restricted-Top-K selector loss (default: 1.0).",
+    )
     # DSpark-specific arguments (sequential correction + confidence head).
     parser.add_argument(
         "--markov-rank",
@@ -1789,19 +1839,19 @@ def parse_args():
     if args.enable_correction_head:
         if args.speculator_type != "dspark":
             parser.error("--enable-correction-head is only valid for DSpark")
-        if min(
-            args.correction_hidden_size,
-            args.correction_rank,
-            args.correction_num_layers,
-            args.correction_num_heads,
-        ) <= 0:
-            parser.error(
-                "DSpark correction sizes, layers, and heads must be > 0"
+        if (
+            min(
+                args.correction_hidden_size,
+                args.correction_rank,
+                args.correction_num_layers,
+                args.correction_num_heads,
             )
+            <= 0
+        ):
+            parser.error("DSpark correction sizes, layers, and heads must be > 0")
         if args.correction_hidden_size % args.correction_num_heads != 0:
             parser.error(
-                "--correction-hidden-size must be divisible by "
-                "--correction-num-heads"
+                "--correction-hidden-size must be divisible by --correction-num-heads"
             )
     elif args.correction_output_mode != "hidden" and not args.from_pretrained:
         parser.error(
@@ -1814,28 +1864,34 @@ def parse_args():
             )
         if args.correction_output_mode != "hidden":
             parser.error(
-                "--correction-lm-head-fusion requires "
-                "--correction-output-mode=hidden"
+                "--correction-lm-head-fusion requires --correction-output-mode=hidden"
             )
     if args.correction_moe:
         if not args.enable_correction_head and not args.from_pretrained:
             parser.error("--correction-moe requires --enable-correction-head")
-        if min(
-            args.correction_moe_shared_rank,
-            args.correction_moe_expert_rank,
-            args.correction_moe_num_experts,
-        ) <= 0:
+        if (
+            min(
+                args.correction_moe_shared_rank,
+                args.correction_moe_expert_rank,
+                args.correction_moe_num_experts,
+            )
+            <= 0
+        ):
             parser.error("Correction MoE ranks and expert count must be > 0")
         if args.correction_moe_load_balance_weight < 0.0:
             parser.error("--correction-moe-load-balance-weight must be >= 0")
     elif args.correction_moe_logit_routing and not args.from_pretrained:
         parser.error("--correction-moe-logit-routing requires --correction-moe")
     if (
-        args.correction_hidden_aux_loss
-        or args.correction_hidden_feedback
-        or args.correction_cross_block_memory
-        or args.correction_project_corrected_hidden
-    ) and not args.enable_correction_head and not args.from_pretrained:
+        (
+            args.correction_hidden_aux_loss
+            or args.correction_hidden_feedback
+            or args.correction_cross_block_memory
+            or args.correction_project_corrected_hidden
+        )
+        and not args.enable_correction_head
+        and not args.from_pretrained
+    ):
         parser.error(
             "Correction auxiliary/feedback features require --enable-correction-head"
         )
@@ -1865,8 +1921,7 @@ def parse_args():
     if not 0.0 <= args.correction_generated_token_ramp <= 1.0:
         parser.error("--correction-generated-token-ramp must be in [0, 1]")
     if (
-        args.correction_generated_token_warmup
-        + args.correction_generated_token_ramp
+        args.correction_generated_token_warmup + args.correction_generated_token_ramp
         > 1.0
         and not args.from_pretrained
     ):
@@ -1876,9 +1931,7 @@ def parse_args():
         )
     if args.correction_with_markov:
         if not args.enable_correction_head and not args.from_pretrained:
-            parser.error(
-                "--correction-with-markov requires --enable-correction-head"
-            )
+            parser.error("--correction-with-markov requires --enable-correction-head")
         if args.markov_rank <= 0:
             parser.error("--correction-with-markov requires --markov-rank > 0")
         if args.markov_head_type == "rnn":
@@ -1892,6 +1945,8 @@ def parse_args():
         or args.dflash_gated_layer_fusion
         or args.dflash_dfly_layer_residual
         or args.dflash_heterogeneous_kv_projections
+        or args.dflash2_dynamic_conv
+        or args.dflash2_candidate_selector
     ) and args.speculator_type not in ("dflash", "dspark"):
         parser.error(
             "DFlash backbone feature flags are only valid for DFlash or DSpark"
@@ -1902,9 +1957,18 @@ def parse_args():
         and not args.from_pretrained
     ):
         parser.error(
-            "--dflash-dfly-layer-residual requires "
-            "--dflash-gated-layer-fusion"
+            "--dflash-dfly-layer-residual requires --dflash-gated-layer-fusion"
         )
+    if args.dflash2_conv_kernel_size <= 0:
+        parser.error("--dflash2-conv-kernel-size must be > 0")
+    if args.dflash2_conv_group_size <= 0:
+        parser.error("--dflash2-conv-group-size must be > 0")
+    if args.dflash2_selector_rank <= 0:
+        parser.error("--dflash2-selector-rank must be > 0")
+    if args.dflash2_selector_top_k <= 0:
+        parser.error("--dflash2-selector-top-k must be > 0")
+    if args.dflash2_selector_loss_weight < 0.0:
+        parser.error("--dflash2-selector-loss-weight must be >= 0")
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":
             parser.error("--per-position-loss-weight=dpace requires --loss-fn=ce")

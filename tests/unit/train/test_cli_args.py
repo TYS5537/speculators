@@ -114,6 +114,13 @@ def test_dspark_defaults_match_paper_weighting(monkeypatch):
     assert args.dflash_gated_layer_fusion is False
     assert args.dflash_dfly_layer_residual is False
     assert args.dflash_heterogeneous_kv_projections is False
+    assert args.dflash2_dynamic_conv is False
+    assert args.dflash2_candidate_selector is False
+    assert args.dflash2_conv_kernel_size == 2
+    assert args.dflash2_conv_group_size == 16
+    assert args.dflash2_selector_rank == 256
+    assert args.dflash2_selector_top_k == 16
+    assert args.dflash2_selector_loss_weight == 1.0
     assert args.enable_confidence_head is True
     assert args.confidence_head_with_markov is True
     assert args.confidence_detach_features is False
@@ -408,6 +415,18 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
             "--dflash-gated-layer-fusion",
             "--dflash-dfly-layer-residual",
             "--dflash-heterogeneous-kv-projections",
+            "--dflash2-dynamic-conv",
+            "--dflash2-conv-kernel-size",
+            "3",
+            "--dflash2-conv-group-size",
+            "8",
+            "--dflash2-candidate-selector",
+            "--dflash2-selector-rank",
+            "64",
+            "--dflash2-selector-top-k",
+            "4",
+            "--dflash2-selector-loss-weight",
+            "0.5",
         ],
     )
     assert args.correction_with_markov is True
@@ -420,6 +439,13 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
     assert args.dflash_gated_layer_fusion is True
     assert args.dflash_dfly_layer_residual is True
     assert args.dflash_heterogeneous_kv_projections is True
+    assert args.dflash2_dynamic_conv is True
+    assert args.dflash2_conv_kernel_size == 3
+    assert args.dflash2_conv_group_size == 8
+    assert args.dflash2_candidate_selector is True
+    assert args.dflash2_selector_rank == 64
+    assert args.dflash2_selector_top_k == 4
+    assert args.dflash2_selector_loss_weight == 0.5
 
 
 # ---------------------------------------------------------------------------

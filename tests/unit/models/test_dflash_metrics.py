@@ -337,3 +337,24 @@ class TestComputeMetrics:
         for i in range(1, 4):
             assert torch.isclose(metrics[f"position_{i}_acc_sum"], expected_correct[i])
             assert torch.isclose(metrics[f"position_{i}_acc_total"], expected_total[i])
+
+    def test_selector_candidates_drive_reported_accuracy_not_unary_argmax(self):
+        logits = _ids_to_logits(torch.tensor([[0, 0, 0, 0]]), 4)
+        targets = _ids_to_logits(torch.tensor([[1, 1, 1, 1]]), 4)
+        loss_mask = torch.ones(1, 4)
+        candidate_ids = torch.tensor([[[[0, 1], [0, 1], [0, 1], [0, 1]]]]).view(1, 4, 2)
+        candidate_logits = torch.tensor(
+            [[[[0.0, 1.0], [0.0, 1.0], [0.0, 1.0], [0.0, 1.0]]]]
+        ).view(1, 4, 2)
+
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            loss_mask,
+            block_size=4,
+            proposal_candidate_ids=candidate_ids,
+            proposal_candidate_logits=candidate_logits,
+        )
+
+        assert metrics["full_acc_sum"] == 3
+        assert metrics["full_acc_total"] == 3

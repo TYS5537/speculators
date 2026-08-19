@@ -24,6 +24,7 @@ class TestComputeMetrics:
             "position_0_acc_sum": torch.tensor(1.0),
             "confidence_loss_sum": torch.tensor(1.0),
             "correction_hidden_aux_loss_sum": torch.tensor(1.0),
+            "dflash2_selector_loss_sum": torch.tensor(1.0),
             "collaboration_accept_len_gain_sum": torch.tensor(1.0),
             "collaboration_markov_gate_mean_sum": torch.tensor(1.0),
             "collaboration_markov_change_accuracy_sum": torch.tensor(1.0),
@@ -46,6 +47,7 @@ class TestComputeMetrics:
             "position_0_acc_sum",
             "confidence_loss_sum",
             "correction_hidden_aux_loss_sum",
+            "dflash2_selector_loss_sum",
             "collaboration_accept_len_gain_sum",
             "collaboration_markov_gate_mean_sum",
             "collaboration_markov_change_accuracy_sum",
@@ -53,9 +55,7 @@ class TestComputeMetrics:
             "rollout_full_acc_sum",
             "rollout_accept_len_sum",
         }
-        assert select_logged_metrics(
-            metrics, include_diagnostics=True
-        ) is metrics
+        assert select_logged_metrics(metrics, include_diagnostics=True) is metrics
 
     def test_perfect_draft_low_loss_high_accept(self):
         # block_size=2; with sample_from_anchor=False, position 0 is the anchor
@@ -106,6 +106,29 @@ class TestComputeMetrics:
         # Two draft slots per block accepted w.p. ~1, plus the anchor token -> ~3.
         accept_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
         assert abs(float(accept_len) - 3.0) < 1e-2
+
+    def test_selector_distribution_drives_acceptance_and_accuracy_metrics(self):
+        target_ids = torch.tensor([[1, 1]])
+        logits = _ids_to_logits(target_ids, 4)
+        targets = logits.clone()
+        loss_mask = torch.ones(1, 2)
+        candidate_ids = torch.tensor([[[0, 1], [0, 1]]])
+        candidate_logits = torch.tensor([[[100.0, 0.0], [100.0, 0.0]]])
+
+        _, metrics = compute_metrics(
+            logits,
+            targets,
+            None,
+            loss_mask,
+            block_size=2,
+            loss_config=_DEFAULT_LOSS,
+            proposal_candidate_ids=candidate_ids,
+            proposal_candidate_logits=candidate_logits,
+        )
+
+        accept = metrics["accept_rate_sum"] / metrics["accept_rate_total"]
+        assert float(accept) < 1e-4
+        assert metrics["full_acc_sum"] == 0
 
     def test_confidence_target_is_overlap(self):
         # When draft == target, accept rate == 1, so a confidence logit that is
@@ -332,9 +355,7 @@ class TestComputeMetrics:
             / corrected_metrics["correction_argmax_change_rate_total"]
         )
         assert float(argmax_change) == 1.0
-        assert (
-            float(corrected_metrics["dspark_head_change_correct_count_sum"]) == 4.0
-        )
+        assert float(corrected_metrics["dspark_head_change_correct_count_sum"]) == 4.0
         assert float(corrected_metrics["dspark_head_change_wrong_count_sum"]) == 0.0
         assert float(corrected_metrics["dspark_head_harmed_count_sum"]) == 0.0
 
@@ -383,8 +404,7 @@ class TestComputeMetrics:
 
         teacher_len = metrics["accept_len_sum"] / metrics["accept_len_total"]
         rollout_len = (
-            metrics["rollout_accept_len_sum"]
-            / metrics["rollout_accept_len_total"]
+            metrics["rollout_accept_len_sum"] / metrics["rollout_accept_len_total"]
         )
         assert float(teacher_len) > float(rollout_len)
         assert float(teacher_len) > 2.9
@@ -443,9 +463,7 @@ class TestComputeMetrics:
         )
         assert float(accept_gain) > 1.0
         assert abs(float(gate_mean) - 0.25) < 1e-6
-        assert (
-            float(metrics["collaboration_markov_change_correct_count_sum"]) == 2.0
-        )
+        assert float(metrics["collaboration_markov_change_correct_count_sum"]) == 2.0
         assert float(metrics["collaboration_markov_change_wrong_count_sum"]) == 0.0
 
     def test_confidence_length_and_uniform_vs_match_draft(self):

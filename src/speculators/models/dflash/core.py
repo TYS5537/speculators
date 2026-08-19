@@ -15,7 +15,11 @@ from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.attention import create_anchor_block_mask_mod
 from speculators.models.dflash.metrics import compute_metrics
-from speculators.models.dflash.model_definitions import Qwen3DFlashDecoderLayer
+from speculators.models.dflash.model_definitions import (
+    DFlash2CandidateSelector,
+    DFlash2GroupedConv,
+    Qwen3DFlashDecoderLayer,
+)
 from speculators.models.dflash.utils import (
     get_base_indices_for_anchored_blocks,
     select_anchors,
@@ -28,6 +32,31 @@ logger = logging.getLogger(__name__)
 # Compile so the mask builds block-sparse instead of materializing DFlash's huge
 # dense [Q, KV] grid every step. (No benefit for EAGLE3's small autoregressive mask.)
 _compiled_create_block_mask = torch.compile(create_block_mask)
+_MISSING_KEY_PREVIEW = 8
+
+
+def _reject_missing_optional_weights(
+    *,
+    enabled: bool,
+    missing_keys: tuple[str, ...],
+    fragments: tuple[str, ...],
+    feature_name: str,
+) -> None:
+    """Reject a config-edited checkpoint that lacks trained optional weights."""
+    if not enabled:
+        return
+    missing = [
+        key for key in missing_keys if any(fragment in key for fragment in fragments)
+    ]
+    if not missing:
+        return
+    preview = ", ".join(missing[:_MISSING_KEY_PREVIEW])
+    suffix = " ..." if len(missing) > _MISSING_KEY_PREVIEW else ""
+    raise RuntimeError(
+        f"The checkpoint enables {feature_name} but does not contain its "
+        f"trained weights: {preview}{suffix}. Do not enable this feature by "
+        "editing an older checkpoint config."
+    )
 
 
 @SpeculatorModel.register("dflash")
@@ -86,6 +115,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     heterogeneous_kv_projections=(
                         config.dflash_heterogeneous_kv_projections
                     ),
+                    dflash2_dynamic_conv=config.dflash2_dynamic_conv,
+                    dflash2_conv_kernel_size=config.dflash2_conv_kernel_size,
+                    dflash2_conv_group_size=config.dflash2_conv_group_size,
+                    block_size=config.block_size,
                 )
                 for layer_idx in range(num_draft_layers)
             ]
@@ -171,6 +204,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         if config.dflash_block_position_embedding:
             self.block_position_embedding = nn.Embedding(self.block_size, hidden_size)
 
+        self.candidate_selector: DFlash2CandidateSelector | None = None
+        if config.dflash2_candidate_selector:
+            self.candidate_selector = DFlash2CandidateSelector(
+                hidden_size=hidden_size,
+                verifier_vocab_size=self.verifier_vocab_size,
+                draft_vocab_size=self.draft_vocab_size,
+                rank=config.dflash2_selector_rank,
+                top_k=config.dflash2_selector_top_k,
+            )
+
         # Warn if using DFlash with sample_from_anchor=True (may not be supported)
         if type(self).__name__ == "DFlashDraftModel" and config.sample_from_anchor:
             logger.warning(
@@ -188,6 +231,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             nn.init.zeros_(self.dfly_layer_residual_gate)
         if self.block_position_embedding is not None:
             nn.init.zeros_(self.block_position_embedding.weight)
+        for module in self.modules():
+            if isinstance(module, DFlash2GroupedConv):
+                module.reset_identity()
+        if self.candidate_selector is not None:
+            self.candidate_selector.reset_unary(tl_config.initializer_range)
 
     @property
     def target_layer_ids(self) -> list[int]:
@@ -277,23 +325,30 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "aux_hidden_state_layer_ids": target_layer_ids,
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
-            "dflash_context_residual": kwargs.get(
-                "dflash_context_residual", False
-            ),
+            "dflash_context_residual": kwargs.get("dflash_context_residual", False),
             "dflash_verifier_final_residual": kwargs.get(
                 "dflash_verifier_final_residual", False
             ),
             "dflash_block_position_embedding": kwargs.get(
                 "dflash_block_position_embedding", False
             ),
-            "dflash_gated_layer_fusion": kwargs.get(
-                "dflash_gated_layer_fusion", False
-            ),
+            "dflash_gated_layer_fusion": kwargs.get("dflash_gated_layer_fusion", False),
             "dflash_dfly_layer_residual": kwargs.get(
                 "dflash_dfly_layer_residual", False
             ),
             "dflash_heterogeneous_kv_projections": kwargs.get(
                 "dflash_heterogeneous_kv_projections", False
+            ),
+            "dflash2_dynamic_conv": kwargs.get("dflash2_dynamic_conv", False),
+            "dflash2_conv_kernel_size": kwargs.get("dflash2_conv_kernel_size", 2),
+            "dflash2_conv_group_size": kwargs.get("dflash2_conv_group_size", 16),
+            "dflash2_candidate_selector": kwargs.get(
+                "dflash2_candidate_selector", False
+            ),
+            "dflash2_selector_rank": kwargs.get("dflash2_selector_rank", 256),
+            "dflash2_selector_top_k": kwargs.get("dflash2_selector_top_k", 16),
+            "dflash2_selector_loss_weight": kwargs.get(
+                "dflash2_selector_loss_weight", 1.0
             ),
             "sample_from_anchor": sample_from_anchor,
             "speculators_config": SpeculatorsConfig(
@@ -479,6 +534,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     def _prepare_missing_checkpoint_weights(self, loading_info: dict) -> None:
         """Safely initialize optional DFlash modules absent from a checkpoint."""
         missing_keys = tuple(loading_info.get("missing_keys", ()))
+        _reject_missing_optional_weights(
+            enabled=self.config.dflash2_dynamic_conv,
+            missing_keys=missing_keys,
+            fragments=(".attention_conv.", ".mlp_conv."),
+            feature_name="DFlash2 dynamic convolution",
+        )
+        _reject_missing_optional_weights(
+            enabled=self.config.dflash2_candidate_selector,
+            missing_keys=missing_keys,
+            fragments=("candidate_selector.",),
+            feature_name="the DFlash2 candidate selector",
+        )
+
         if self.dflash_dfly_layer_residual:
             trained_dfly_fragments = (
                 "dfly_layer_fusion_logits",
@@ -493,8 +561,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 if any(fragment in key for fragment in trained_dfly_fragments)
             ]
             if missing_trained_dfly:
-                preview = ", ".join(missing_trained_dfly[:8])
-                suffix = " ..." if len(missing_trained_dfly) > 8 else ""
+                preview = ", ".join(missing_trained_dfly[:_MISSING_KEY_PREVIEW])
+                suffix = (
+                    " ..." if len(missing_trained_dfly) > _MISSING_KEY_PREVIEW else ""
+                )
                 raise RuntimeError(
                     "The checkpoint enables DFly layer residuals but does not "
                     f"contain their trained weights: {preview}{suffix}. Do not "
@@ -558,6 +628,177 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     "initialization: %s",
                     ", ".join(copied),
                 )
+
+    def _draft_ids_to_verifier(self, draft_ids: torch.Tensor) -> torch.Tensor:
+        """Map draft-vocabulary IDs to the verifier vocabulary."""
+        if self.d2t is None:
+            return draft_ids.long()
+        draft_ids = draft_ids.long()
+        return draft_ids + self.d2t[draft_ids]
+
+    def dflash2_select_candidates(
+        self,
+        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Score one position's Top-K candidates for DFlash2 rollout.
+
+        ``previous_token_ids`` are verifier-vocabulary IDs. Returned candidate
+        IDs remain in the draft vocabulary, matching ``logits``.
+        """
+        if self.candidate_selector is None:
+            raise RuntimeError("DFlash2 candidate selector is not enabled")
+        if logits.shape[:-1] != hidden_states.shape[:-1]:
+            raise ValueError("DFlash2 logits and hidden states must align")
+        if previous_token_ids.shape != hidden_states.shape[:-1]:
+            raise ValueError("DFlash2 previous-token IDs and hidden states must align")
+        unary_logits, candidate_ids = torch.topk(
+            logits,
+            k=self.candidate_selector.top_k,
+            dim=-1,
+        )
+        candidate_logits = self.candidate_selector(
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            previous_token_ids,
+        )
+        return candidate_ids, candidate_logits
+
+    def dflash2_sparse_logits(
+        self,
+        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return the selector's realized sparse logits and Top-K draft IDs."""
+        candidate_ids, candidate_logits = self.dflash2_select_candidates(
+            logits,
+            hidden_states,
+            previous_token_ids,
+        )
+        sparse_logits = torch.full_like(logits, -torch.inf)
+        sparse_logits.scatter_(-1, candidate_ids, candidate_logits)
+        return sparse_logits, candidate_ids
+
+    def _dflash2_block_outputs(
+        self,
+        logits: torch.Tensor,
+        targets: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        loss_mask: torch.Tensor,
+        teacher_previous_token_ids: torch.Tensor,
+        realized_previous_token_ids: torch.Tensor | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Build selector rollout scores and its restricted-Top-K train loss.
+
+        The public DFlash2 inference implementation exposes a K-by-K transition
+        lattice but not its training objective. This repository directly scores
+        the teacher/realized predecessor row and distils the verifier distribution
+        restricted to the current Top-K. This avoids materializing an
+        ``anchors x positions x K x K`` autograd graph. The existing
+        full-vocabulary draft loss is untouched.
+        """
+        if self.candidate_selector is None:
+            raise RuntimeError("DFlash2 candidate selector is not enabled")
+        num_blocks, block_size, _ = hidden_blocks.shape
+        if block_size != self.block_size:
+            raise ValueError("DFlash2 hidden blocks use the wrong block size")
+        expected_logits_shape = (1, num_blocks * block_size, self.draft_vocab_size)
+        if logits.shape != expected_logits_shape or targets.shape != logits.shape:
+            raise ValueError("DFlash2 logits/targets have an unexpected shape")
+        if loss_mask.shape != logits.shape[:-1]:
+            raise ValueError("DFlash2 loss mask must align with logits")
+        if anchor_token_ids.shape != (num_blocks,):
+            raise ValueError("DFlash2 requires one verifier anchor ID per block")
+        if teacher_previous_token_ids.shape != (num_blocks, block_size):
+            raise ValueError(
+                "DFlash2 teacher predecessor IDs must align with hidden blocks"
+            )
+        if realized_previous_token_ids is not None and (
+            realized_previous_token_ids.shape != (num_blocks, block_size)
+        ):
+            raise ValueError(
+                "DFlash2 realized predecessor IDs must align with hidden blocks"
+            )
+
+        logits_blocks = logits.view(num_blocks, block_size, -1)
+        target_blocks = targets.view_as(logits_blocks)
+        mask_blocks = loss_mask.view(num_blocks, block_size)
+        unary_logits, candidate_ids = torch.topk(
+            logits_blocks,
+            k=self.candidate_selector.top_k,
+            dim=-1,
+        )
+        start_position = 0 if self.config.sample_from_anchor else 1
+        active_candidates = candidate_ids[:, start_position:]
+        active_unary = unary_logits[:, start_position:]
+        active_hidden = hidden_blocks[:, start_position:]
+        active_targets = target_blocks[:, start_position:]
+        active_mask = mask_blocks[:, start_position:]
+        teacher_rows = self.candidate_selector(
+            active_candidates,
+            active_unary,
+            active_hidden,
+            teacher_previous_token_ids[:, start_position:],
+        )
+
+        if realized_previous_token_ids is not None:
+            # Markov/Correction logits and hidden states depend on their actual
+            # predecessor. Score that realized row directly instead of walking
+            # a counterfactual lattice whose downstream features were not
+            # recomputed for the alternate predecessor.
+            if realized_previous_token_ids is teacher_previous_token_ids:
+                active_realized = teacher_rows.detach()
+            else:
+                with torch.no_grad():
+                    active_realized = self.candidate_selector(
+                        active_candidates,
+                        active_unary,
+                        active_hidden,
+                        realized_previous_token_ids[:, start_position:],
+                    )
+        elif active_candidates.shape[1] == 0:
+            # A reserved-only block has no proposal row to walk.
+            active_realized = active_unary.detach()
+        else:
+            # Pure DFlash features are predecessor-independent, so an exact
+            # greedy walk only needs one K-wide row at a time. It is reporting
+            # only and therefore must not retain another training graph.
+            with torch.no_grad():
+                previous_ids = anchor_token_ids
+                realized_rows: list[torch.Tensor] = []
+                for position in range(active_candidates.shape[1]):
+                    row = self.candidate_selector(
+                        active_candidates[:, position],
+                        active_unary[:, position],
+                        active_hidden[:, position],
+                        previous_ids,
+                    )
+                    realized_rows.append(row)
+                    selected_indices = row.argmax(dim=-1, keepdim=True)
+                    selected_draft_ids = active_candidates[:, position].gather(
+                        -1, selected_indices
+                    ).squeeze(-1)
+                    previous_ids = self._draft_ids_to_verifier(selected_draft_ids)
+                active_realized = torch.stack(realized_rows, dim=1)
+
+        # For reporting only, inactive anchor slots retain the unary Top-K row.
+        realized_logits = unary_logits.detach().clone()
+        realized_logits[:, start_position:] = active_realized
+
+        target_topk_logits = active_targets.gather(-1, active_candidates)
+        target_topk_probs = torch.softmax(target_topk_logits.float(), dim=-1).detach()
+        selector_loss_per_position = -(
+            target_topk_probs * torch.log_softmax(teacher_rows.float(), dim=-1)
+        ).sum(dim=-1)
+        selector_mask = active_mask.to(selector_loss_per_position.dtype)
+        selector_loss = (selector_loss_per_position * selector_mask).sum() / (
+            selector_mask.sum().clamp_min(1.0)
+        )
+        return candidate_ids, realized_logits, selector_loss
 
     def _condition_noise_embedding(
         self,
@@ -777,18 +1018,49 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
-        _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
-            hidden_states,
-            input_ids,
-            loss_mask,
-            verifier_last_hidden_states,
-            document_ids,
-            position_ids,
-            max_anchors=max_anchors,
-            **kwargs,
+        hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
+            self._backbone_forward(
+                hidden_states,
+                input_ids,
+                loss_mask,
+                verifier_last_hidden_states,
+                document_ids,
+                position_ids,
+                max_anchors=max_anchors,
+                **kwargs,
+            )
         )
         if logits is None:
             raise RuntimeError("DFlash forward requires projected draft logits")
+        proposal_candidate_ids = None
+        proposal_candidate_logits = None
+        selector_loss = None
+        if self.candidate_selector is not None:
+            num_blocks = hidden.shape[1] // self.block_size
+            hidden_blocks = hidden.view(num_blocks, self.block_size, -1)
+            block_tokens = input_ids[0, anchored_block_indices].view(
+                num_blocks, self.block_size
+            )
+            candidate_ids, candidate_logits, selector_loss = (
+                self._dflash2_block_outputs(
+                    logits,
+                    targets,
+                    hidden_blocks,
+                    block_tokens[:, 0],
+                    aligned_loss_mask,
+                    teacher_previous_token_ids=(
+                        block_tokens
+                        if self.config.sample_from_anchor
+                        else torch.cat(
+                            [block_tokens[:, :1], block_tokens[:, :-1]], dim=1
+                        )
+                    ),
+                )
+            )
+            proposal_candidate_ids = candidate_ids.view(
+                1, num_blocks * self.block_size, -1
+            )
+            proposal_candidate_logits = candidate_logits.view_as(proposal_candidate_ids)
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -799,5 +1071,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            proposal_candidate_ids=proposal_candidate_ids,
+            proposal_candidate_logits=proposal_candidate_logits,
         )
+        if selector_loss is not None:
+            loss = loss + self.config.dflash2_selector_loss_weight * selector_loss
+            metrics["loss_sum"] = loss.detach().clone()
+            metrics["dflash2_selector_loss_sum"] = selector_loss.detach().clone()
+            metrics["dflash2_selector_loss_total"] = torch.ones((), device=loss.device)
         return None, loss, metrics

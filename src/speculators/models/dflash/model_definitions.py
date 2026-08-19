@@ -2,6 +2,7 @@ from typing import TYPE_CHECKING
 
 import torch
 from torch import nn
+from torch.nn.functional import embedding
 from transformers.cache_utils import Cache
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
@@ -16,6 +17,219 @@ from typing_extensions import Unpack
 
 if TYPE_CHECKING:
     from collections.abc import Callable
+
+
+def grouped_dynamic_conv(
+    hidden_states: torch.Tensor,
+    delta: torch.Tensor,
+    base: torch.Tensor,
+    *,
+    block_size: int,
+    num_groups: int,
+    group_size: int,
+    taps: int,
+) -> torch.Tensor:
+    """Apply a causal grouped convolution without crossing draft blocks."""
+    if hidden_states.shape[-1] != num_groups * group_size:
+        raise ValueError("Grouped-conv hidden size does not match its groups")
+    if hidden_states.shape[-2] % block_size != 0:
+        raise ValueError("Grouped-conv sequence length must be divisible by block_size")
+    expected_delta_shape = (*hidden_states.shape[:-1], taps, num_groups)
+    if delta.shape != expected_delta_shape:
+        raise ValueError(
+            f"Expected dynamic coefficients {expected_delta_shape}, "
+            f"got {tuple(delta.shape)}"
+        )
+
+    blocks = hidden_states.reshape(-1, block_size, num_groups, group_size)
+    dynamic = delta.reshape(-1, block_size, taps, num_groups)
+    coefficients = base.reshape(1, 1, taps, num_groups, group_size) + (
+        dynamic.unsqueeze(-1)
+    )
+    output = coefficients[:, :, 0] * blocks
+    for tap in range(1, taps):
+        if tap >= block_size:
+            continue
+        shifted = torch.cat(
+            [
+                torch.zeros_like(blocks[:, :tap]),
+                coefficients[:, tap:, tap] * blocks[:, :-tap],
+            ],
+            dim=1,
+        )
+        output = output + shifted
+    return output.reshape_as(hidden_states)
+
+
+class DFlash2GroupedConv(nn.Module):
+    """DFlash2 content-conditioned causal convolution around one sublayer."""
+
+    def __init__(
+        self,
+        hidden_size: int,
+        *,
+        taps: int,
+        group_size: int,
+        block_size: int,
+    ) -> None:
+        super().__init__()
+        if taps <= 0:
+            raise ValueError(f"conv_kernel_size must be > 0, got {taps}")
+        if group_size <= 0 or hidden_size % group_size:
+            raise ValueError(
+                f"conv_group_size={group_size} must divide hidden_size={hidden_size}"
+            )
+        self.block_size = block_size
+        self.taps = taps
+        self.group_size = group_size
+        self.num_groups = hidden_size // group_size
+        self.base_kernel = nn.Parameter(torch.empty(2, taps, hidden_size))
+        self.kernel_projection = nn.Linear(
+            hidden_size,
+            2 * taps * self.num_groups,
+            bias=False,
+        )
+
+    def reset_identity(self) -> None:
+        """Start as an exact identity while leaving both paths trainable."""
+        with torch.no_grad():
+            self.base_kernel.zero_()
+            self.base_kernel[:, 0].fill_(1.0)
+            self.kernel_projection.weight.zero_()
+
+    def _convolve(
+        self,
+        hidden_states: torch.Tensor,
+        delta: torch.Tensor,
+        side: int,
+    ) -> torch.Tensor:
+        return grouped_dynamic_conv(
+            hidden_states,
+            delta,
+            self.base_kernel[side],
+            block_size=self.block_size,
+            num_groups=self.num_groups,
+            group_size=self.group_size,
+            taps=self.taps,
+        )
+
+    def prepare(self, hidden_states: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        coefficients = self.kernel_projection(hidden_states).reshape(
+            *hidden_states.shape[:-1],
+            2,
+            self.taps,
+            self.num_groups,
+        )
+        return (
+            self._convolve(hidden_states, coefficients[..., 0, :, :], 0),
+            coefficients[..., 1, :, :],
+        )
+
+    def finish(
+        self,
+        hidden_states: torch.Tensor,
+        coefficients: torch.Tensor,
+    ) -> torch.Tensor:
+        return self._convolve(hidden_states, coefficients, 1)
+
+
+class DFlash2CandidateSelector(nn.Module):
+    """Score a Top-K token using its predecessor and DFlash hidden state."""
+
+    def __init__(
+        self,
+        *,
+        hidden_size: int,
+        verifier_vocab_size: int,
+        draft_vocab_size: int,
+        rank: int,
+        top_k: int,
+    ) -> None:
+        super().__init__()
+        if rank <= 0:
+            raise ValueError(f"selector_rank must be > 0, got {rank}")
+        if top_k <= 0 or top_k > draft_vocab_size:
+            raise ValueError(
+                "selector_top_k must be in [1, draft_vocab_size], "
+                f"got {top_k} for vocab {draft_vocab_size}"
+            )
+        self.top_k = top_k
+        self.predecessor_codebook = nn.Parameter(torch.empty(verifier_vocab_size, rank))
+        self.successor_codebook = nn.Parameter(torch.empty(draft_vocab_size, rank))
+        self.hidden_projection = nn.Linear(hidden_size, rank, bias=False)
+
+    def reset_unary(self, initializer_range: float) -> None:
+        """Initialize the selector to reproduce its unary Top-K logits."""
+        with torch.no_grad():
+            nn.init.normal_(
+                self.predecessor_codebook,
+                mean=0.0,
+                std=initializer_range,
+            )
+            nn.init.normal_(
+                self.successor_codebook,
+                mean=0.0,
+                std=initializer_range,
+            )
+            self.hidden_projection.weight.zero_()
+
+    def forward(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        if candidate_ids.shape != unary_logits.shape:
+            raise ValueError("Candidate IDs and unary logits must align")
+        if candidate_ids.shape[:-1] != hidden_states.shape[:-1]:
+            raise ValueError("Candidates and hidden states must align")
+        if previous_token_ids.shape != hidden_states.shape[:-1]:
+            raise ValueError("Previous-token IDs and hidden states must align")
+        if candidate_ids.shape[-1] != self.top_k:
+            raise ValueError(
+                f"Expected selector_top_k={self.top_k}, got {candidate_ids.shape[-1]}"
+            )
+
+        predecessor = embedding(previous_token_ids.long(), self.predecessor_codebook)
+        successor = embedding(candidate_ids.long(), self.successor_codebook)
+        hidden = self.hidden_projection(hidden_states)
+        transition = torch.einsum(
+            "...r,...kr->...k",
+            predecessor.to(hidden.dtype) * hidden,
+            successor.to(hidden.dtype),
+        )
+        return unary_logits + transition.to(unary_logits.dtype)
+
+    def score_lattice(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        predecessor_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return DFlash2's ``K_previous x K_current`` edge lattice."""
+        if candidate_ids.shape != unary_logits.shape:
+            raise ValueError("Candidate IDs and unary logits must align")
+        if candidate_ids.shape[:-1] != hidden_states.shape[:-1]:
+            raise ValueError("Candidates and hidden states must align")
+        if predecessor_ids.shape != candidate_ids.shape:
+            raise ValueError("Predecessor and current candidate lattices must align")
+        if candidate_ids.shape[-1] != self.top_k:
+            raise ValueError(
+                f"Expected selector_top_k={self.top_k}, got {candidate_ids.shape[-1]}"
+            )
+
+        predecessor = embedding(predecessor_ids.long(), self.predecessor_codebook)
+        successor = embedding(candidate_ids.long(), self.successor_codebook)
+        hidden = self.hidden_projection(hidden_states)
+        transitions = torch.einsum(
+            "...pr,...r,...cr->...pc",
+            predecessor.to(hidden.dtype),
+            hidden,
+            successor.to(hidden.dtype),
+        )
+        return unary_logits.unsqueeze(-2) + transitions.to(unary_logits.dtype)
 
 
 # Local copy of rotate_half to avoid dependency on internal transformers functions
@@ -188,6 +402,10 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         layer_idx: int,
         *,
         heterogeneous_kv_projections: bool = False,
+        dflash2_dynamic_conv: bool = False,
+        dflash2_conv_kernel_size: int = 2,
+        dflash2_conv_group_size: int = 16,
+        block_size: int = 8,
     ):
         super().__init__()
         self.hidden_size = config.hidden_size
@@ -202,6 +420,17 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             config.hidden_size,
             eps=config.rms_norm_eps,  # type: ignore[arg-type]
         )
+        self.attention_conv: DFlash2GroupedConv | None = None
+        self.mlp_conv: DFlash2GroupedConv | None = None
+        if dflash2_dynamic_conv:
+            conv_kwargs = {
+                "hidden_size": config.hidden_size,
+                "taps": dflash2_conv_kernel_size,
+                "group_size": dflash2_conv_group_size,
+                "block_size": block_size,
+            }
+            self.attention_conv = DFlash2GroupedConv(**conv_kwargs)
+            self.mlp_conv = DFlash2GroupedConv(**conv_kwargs)
 
     def forward(
         self,
@@ -224,6 +453,11 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         assert hidden_states is not None  # noqa: S101
         residual = hidden_states
         hidden_states = self.input_layernorm(hidden_states)
+        attention_coefficients = None
+        if self.attention_conv is not None:
+            hidden_states, attention_coefficients = self.attention_conv.prepare(
+                hidden_states
+            )
         hidden_states = self.self_attn(
             hidden_states=hidden_states,
             target_hidden=target_hidden,
@@ -236,8 +470,19 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
             position_embeddings=position_embeddings,
             **kwargs,
         )[0]
+        if self.attention_conv is not None:
+            assert attention_coefficients is not None  # noqa: S101
+            hidden_states = self.attention_conv.finish(
+                hidden_states, attention_coefficients
+            )
         hidden_states = residual + hidden_states  # type: ignore[operator]
         residual = hidden_states
         hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_coefficients = None
+        if self.mlp_conv is not None:
+            hidden_states, mlp_coefficients = self.mlp_conv.prepare(hidden_states)
         hidden_states = self.mlp(hidden_states)
+        if self.mlp_conv is not None:
+            assert mlp_coefficients is not None  # noqa: S101
+            hidden_states = self.mlp_conv.finish(hidden_states, mlp_coefficients)
         return residual + hidden_states  # type: ignore[operator,return-value]

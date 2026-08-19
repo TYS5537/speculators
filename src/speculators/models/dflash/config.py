@@ -119,6 +119,55 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         ),
     )
 
+    dflash2_dynamic_conv: bool = Field(
+        default=False,
+        description=(
+            "Wrap every draft Attention and MLP sublayer with DFlash2 grouped "
+            "content-conditioned causal convolutions."
+        ),
+    )
+
+    dflash2_conv_kernel_size: int = Field(
+        default=2,
+        gt=0,
+        description="Number of causal taps in each DFlash2 grouped convolution.",
+    )
+
+    dflash2_conv_group_size: int = Field(
+        default=16,
+        gt=0,
+        description="Hidden channels sharing each DFlash2 dynamic coefficient.",
+    )
+
+    dflash2_candidate_selector: bool = Field(
+        default=False,
+        description=(
+            "Re-rank each position's Top-K draft candidates using the previous "
+            "token and the DFlash hidden state."
+        ),
+    )
+
+    dflash2_selector_rank: int = Field(
+        default=256,
+        gt=0,
+        description="Low-rank transition width of the DFlash2 candidate selector.",
+    )
+
+    dflash2_selector_top_k: int = Field(
+        default=16,
+        gt=0,
+        description="Number of unary LM-head candidates retained per draft slot.",
+    )
+
+    dflash2_selector_loss_weight: float = Field(
+        default=1.0,
+        ge=0.0,
+        description=(
+            "Weight of the restricted-Top-K verifier-distillation loss used to "
+            "train the DFlash2 selector."
+        ),
+    )
+
     sample_from_anchor: bool = Field(
         default=False,
         description=(

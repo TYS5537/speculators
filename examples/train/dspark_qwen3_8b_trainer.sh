@@ -129,6 +129,15 @@ DFLASH_GATED_LAYER_FUSION_ARGS=(--no-dflash-gated-layer-fusion)
 # Requires DFLASH_GATED_LAYER_FUSION_ARGS=(--dflash-gated-layer-fusion).
 DFLASH_DFLY_LAYER_RESIDUAL_ARGS=(--no-dflash-dfly-layer-residual)
 DFLASH_HETEROGENEOUS_KV_ARGS=(--no-dflash-heterogeneous-kv-projections)
+# DFlash2 modules can be enabled independently or together. They remain off in
+# this baseline recipe and stack after the existing DFlash/DSpark components.
+DFLASH2_DYNAMIC_CONV_ARGS=(--no-dflash2-dynamic-conv)
+DFLASH2_CONV_KERNEL_SIZE=2
+DFLASH2_CONV_GROUP_SIZE=16
+DFLASH2_CANDIDATE_SELECTOR_ARGS=(--no-dflash2-candidate-selector)
+DFLASH2_SELECTOR_RANK=256
+DFLASH2_SELECTOR_TOP_K=16
+DFLASH2_SELECTOR_LOSS_WEIGHT=1.0
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -212,6 +221,13 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     "${DFLASH_GATED_LAYER_FUSION_ARGS[@]}" \
     "${DFLASH_DFLY_LAYER_RESIDUAL_ARGS[@]}" \
     "${DFLASH_HETEROGENEOUS_KV_ARGS[@]}" \
+    "${DFLASH2_DYNAMIC_CONV_ARGS[@]}" \
+    --dflash2-conv-kernel-size "$DFLASH2_CONV_KERNEL_SIZE" \
+    --dflash2-conv-group-size "$DFLASH2_CONV_GROUP_SIZE" \
+    "${DFLASH2_CANDIDATE_SELECTOR_ARGS[@]}" \
+    --dflash2-selector-rank "$DFLASH2_SELECTOR_RANK" \
+    --dflash2-selector-top-k "$DFLASH2_SELECTOR_TOP_K" \
+    --dflash2-selector-loss-weight "$DFLASH2_SELECTOR_LOSS_WEIGHT" \
     "${CONFIDENCE_HEAD_ARGS[@]}" \
     "${CONFIDENCE_SEQUENTIAL_FEATURE_ARGS[@]}" \
     --loss-fn "$LOSS_FN" \

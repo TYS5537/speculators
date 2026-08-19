@@ -353,9 +353,7 @@ def _select_eval_records(
     limit = (
         int(max_samples)
         if max_samples is not None
-        else DEEPSPEC_EVAL_SAMPLE_LIMITS.get(
-            _canonical_dataset_name(dataset_name)
-        )
+        else DEEPSPEC_EVAL_SAMPLE_LIMITS.get(_canonical_dataset_name(dataset_name))
     )
     if limit is None or len(records) <= limit:
         return records
@@ -536,9 +534,7 @@ def _run_preprojection_correction_rollout(
 ):
     """Run native Correction rollout, including optional previous-logit feedback."""
     if not _is_preprojection_correction(draft):
-        raise RuntimeError(
-            "This evaluator expects the native causal CorrectionHead"
-        )
+        raise RuntimeError("This evaluator expects the native causal CorrectionHead")
     rollout_kwargs = {
         "anchor_token_ids": anchor_token_ids,
         "temperature": temperature,
@@ -552,9 +548,7 @@ def _run_preprojection_correction_rollout(
 
 def _prepare_dflash_target_context(draft, hidden_states):
     """Mirror the training/validation target-layer preparation exactly."""
-    shared_projection, target_layer_states = draft._prepare_target_hidden(
-        hidden_states
-    )
+    shared_projection, target_layer_states = draft._prepare_target_hidden(hidden_states)
     shared_context = draft.hidden_norm(shared_projection)
     return shared_projection, target_layer_states, shared_context
 
@@ -630,11 +624,9 @@ def _load_vocab_mapping_tensors(
 def _ensure_loaded_vocab_mappings(draft_model, args: argparse.Namespace) -> None:
     if not draft_model.use_draft_vocab:
         return
-    if (
-        draft_model.t2d is not None
-        and int(draft_model.t2d.sum(dtype=torch.long).item())
-        == int(draft_model.draft_vocab_size)
-    ):
+    if draft_model.t2d is not None and int(
+        draft_model.t2d.sum(dtype=torch.long).item()
+    ) == int(draft_model.draft_vocab_size):
         return
     d2t, t2d = _load_vocab_mapping_tensors(
         draft_model_path=args.draft_model,
@@ -851,9 +843,9 @@ def generate_decoding_sample(
             if verification.support_accept_rates is None
             else verification.support_accept_rates.detach().float()[0].tolist()
         )
-        output_ids[:, start : start + accepted + 1] = (
-            proposal.verify_input_ids[:, : accepted + 1]
-        )
+        output_ids[:, start : start + accepted + 1] = proposal.verify_input_ids[
+            :, : accepted + 1
+        ]
         if verification.terminated_by_stop_token:
             start += accepted
             past_key_values_target.crop(start)
@@ -979,17 +971,13 @@ class DSparkOfflineRunner:
         self._draft_target_logit_indices = None
         if self.uses_initial_correction_logits and draft_model.use_draft_vocab:
             if draft_model.d2t is None:
-                raise RuntimeError(
-                    "Draft-to-target vocabulary mapping is not loaded"
-                )
+                raise RuntimeError("Draft-to-target vocabulary mapping is not loaded")
             draft_ids = torch.arange(
                 draft_model.draft_vocab_size,
                 device=draft_model.d2t.device,
                 dtype=draft_model.d2t.dtype,
             )
-            self._draft_target_logit_indices = (
-                draft_ids + draft_model.d2t
-            ).long()
+            self._draft_target_logit_indices = (draft_ids + draft_model.d2t).long()
         self._latest_verifier_pre_lm_hidden = None
         self._verifier_pre_lm_hook = None
         if self.uses_verifier_pre_lm_context:
@@ -1056,9 +1044,7 @@ class DSparkOfflineRunner:
         verifier_pre_lm_hidden = None
         correction_memory = None
         if self.uses_verifier_pre_lm_context:
-            verifier_pre_lm_hidden = (
-                self._require_latest_verifier_pre_lm_hidden()
-            )
+            verifier_pre_lm_hidden = self._require_latest_verifier_pre_lm_hidden()
         if self.draft_model.config.correction_cross_block_memory:
             if verifier_pre_lm_hidden is None:
                 raise RuntimeError(
@@ -1093,16 +1079,10 @@ class DSparkOfflineRunner:
         draft = self.draft_model
         block = int(draft.block_size)
         pre_lm_length = (
-            None
-            if verifier_pre_lm_hidden is None
-            else verifier_pre_lm_hidden.shape[1]
+            None if verifier_pre_lm_hidden is None else verifier_pre_lm_hidden.shape[1]
         )
-        if (
-            hidden_states.shape[1] != start
-            or (
-                verifier_pre_lm_hidden is not None
-                and pre_lm_length != start
-            )
+        if hidden_states.shape[1] != start or (
+            verifier_pre_lm_hidden is not None and pre_lm_length != start
         ):
             raise ValueError(
                 "DSpark context states must contain exactly the prefix before the "
@@ -1282,8 +1262,24 @@ class DSparkOfflineRunner:
                     prev_token_ids=prev_token,
                     hidden_states=hidden_states[:, slot : slot + 1, :],
                 )
-            probs = logits_to_probs(logits, float(self.args.temperature))
-            draft_id = int(sample_from_probs(probs)[0, 0].item())
+            if draft.candidate_selector is not None:
+                candidate_ids, candidate_logits = draft.dflash2_select_candidates(
+                    logits,
+                    hidden_states[:, slot : slot + 1, :],
+                    prev_token,
+                )
+                candidate_probs = logits_to_probs(
+                    candidate_logits, float(self.args.temperature)
+                )
+                selected = sample_from_probs(candidate_probs)
+                draft_id = int(
+                    candidate_ids.gather(-1, selected.unsqueeze(-1))[0, 0, 0].item()
+                )
+                probs = torch.zeros_like(logits, dtype=candidate_probs.dtype)
+                probs.scatter_(-1, candidate_ids, candidate_probs)
+            else:
+                probs = logits_to_probs(logits, float(self.args.temperature))
+                draft_id = int(sample_from_probs(probs)[0, 0].item())
             target_id = _draft_ids_to_target_ids(draft, [draft_id])[0]
             proposed_target_ids.append(target_id)
             draft_probs.append(probs)
@@ -1365,9 +1361,7 @@ class DSparkOfflineRunner:
             dim=1,
         )
         if self.uses_verifier_pre_lm_context:
-            verifier_pre_lm_hidden = (
-                self._require_latest_verifier_pre_lm_hidden()
-            )
+            verifier_pre_lm_hidden = self._require_latest_verifier_pre_lm_hidden()
             committed_pre_lm_hidden = verifier_pre_lm_hidden[
                 :, : verification.accepted_draft_tokens + 1, :
             ]
@@ -1376,22 +1370,16 @@ class DSparkOfflineRunner:
                 dim=1,
             )
             if self.draft_model.config.correction_cross_block_memory:
-                context.correction_memory = (
-                    self.draft_model.update_cross_block_memory(
-                        context.correction_memory,
-                        verifier_pre_lm_hidden[
-                            :, verification.accepted_draft_tokens, :
-                        ],
-                        verification.next_token.reshape(-1),
-                    )
+                context.correction_memory = self.draft_model.update_cross_block_memory(
+                    context.correction_memory,
+                    verifier_pre_lm_hidden[:, verification.accepted_draft_tokens, :],
+                    verification.next_token.reshape(-1),
                 )
         if self.uses_initial_correction_logits:
-            context.correction_previous_logits = (
-                self._target_logits_to_draft_vocab(
-                    verification.target_output.logits[
-                        :, verification.accepted_draft_tokens, :
-                    ]
-                )
+            context.correction_previous_logits = self._target_logits_to_draft_vocab(
+                verification.target_output.logits[
+                    :, verification.accepted_draft_tokens, :
+                ]
             )
 
     def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
@@ -1515,9 +1503,7 @@ def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
                 "base_output_tokens_per_second": base_tps,
                 "base_total_output_tokens": base_total_output_tokens,
                 "speedup_vs_base": (
-                    summary["output_tokens_per_second"] / base_tps
-                    if base_tps
-                    else 0.0
+                    summary["output_tokens_per_second"] / base_tps if base_tps else 0.0
                 ),
             }
         )
@@ -1672,8 +1658,7 @@ def _evaluate_dataset(
             out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
             if base_runner is None:
                 logger.info(
-                    "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | "
-                    "acc_len=%.3f",
+                    "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | acc_len=%.3f",
                     path.stem,
                     processed,
                     len(indexed_records),
@@ -1683,9 +1668,7 @@ def _evaluate_dataset(
                 )
             else:
                 base_tps = (
-                    base_total_output_tokens / base_elapsed_s
-                    if base_elapsed_s
-                    else 0.0
+                    base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
                 )
                 speedup = out_tps / base_tps if base_tps else 0.0
                 logger.info(
@@ -1704,18 +1687,14 @@ def _evaluate_dataset(
         stats.elapsed_s = time.perf_counter() - start_time
     row = _summary_row(path.stem, len(indexed_records), stats)
     if base_runner is not None:
-        base_tps = (
-            base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
-        )
+        base_tps = base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
         row.update(
             {
                 "base_elapsed_s": base_elapsed_s,
                 "base_output_tokens_per_second": base_tps,
                 "base_total_output_tokens": base_total_output_tokens,
                 "speedup_vs_base": (
-                    row["output_tokens_per_second"] / base_tps
-                    if base_tps
-                    else 0.0
+                    row["output_tokens_per_second"] / base_tps if base_tps else 0.0
                 ),
             }
         )
@@ -1870,9 +1849,7 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
                 row["num_requests"] / row["elapsed_s"] if row["elapsed_s"] else 0
             )
             row["output_tokens_per_second"] = (
-                row["total_output_tokens"] / row["elapsed_s"]
-                if row["elapsed_s"]
-                else 0
+                row["total_output_tokens"] / row["elapsed_s"] if row["elapsed_s"] else 0
             )
         rows.append(row)
         if not args.skip_artifacts:
@@ -1930,11 +1907,15 @@ def run(args: argparse.Namespace) -> None:
         args.verifier_model,
         trust_remote_code=args.trust_remote_code,
     )
-    target_model = AutoModelForCausalLM.from_pretrained(
-        args.verifier_model,
-        torch_dtype=dtype,
-        trust_remote_code=args.trust_remote_code,
-    ).to(device).eval()
+    target_model = (
+        AutoModelForCausalLM.from_pretrained(
+            args.verifier_model,
+            torch_dtype=dtype,
+            trust_remote_code=args.trust_remote_code,
+        )
+        .to(device)
+        .eval()
+    )
 
     draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
     sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
@@ -1974,7 +1955,8 @@ def run(args: argparse.Namespace) -> None:
     logger.info(
         "Loaded DSpark | block_size=%d sample_from_anchor=%s "
         "max_proposal_tokens=%d sequential_head=%s lm_head_fusion=%s "
-        "dfly_layer_residual=%s heterogeneous_kv=%s",
+        "dfly_layer_residual=%s heterogeneous_kv=%s dflash2_conv=%s "
+        "dflash2_selector=%s",
         int(draft_model.block_size),
         bool(draft_config.sample_from_anchor),
         speculative_slots_for_draft(draft_model),
@@ -1988,6 +1970,8 @@ def run(args: argparse.Namespace) -> None:
                 False,
             )
         ),
+        bool(getattr(draft_config, "dflash2_dynamic_conv", False)),
+        bool(getattr(draft_config, "dflash2_candidate_selector", False)),
     )
     logger.info(
         "DSpark implementation: %s",

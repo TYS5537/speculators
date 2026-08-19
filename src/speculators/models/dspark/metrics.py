@@ -44,6 +44,7 @@ _CORE_LOGGED_METRICS = frozenset(
         "correction_hidden_aux_loss",
         "correction_moe_balance_loss",
         "correction_moe_router_entropy",
+        "dflash2_selector_loss",
         "collaboration_accept_len_gain",
         "collaboration_markov_gate_mean",
         "collaboration_markov_change_accuracy",
@@ -189,6 +190,8 @@ def compute_metrics(  # noqa: C901
     sample_from_anchor: bool = True,
     collaboration_base_logits: torch.Tensor | None = None,
     collaboration_gate: torch.Tensor | None = None,
+    proposal_candidate_ids: torch.Tensor | None = None,
+    proposal_candidate_logits: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -196,13 +199,34 @@ def compute_metrics(  # noqa: C901
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
     start_pos = 0 if sample_from_anchor else 1
+    if (proposal_candidate_ids is None) != (proposal_candidate_logits is None):
+        raise ValueError(
+            "proposal_candidate_ids and proposal_candidate_logits must be set together"
+        )
+    if proposal_candidate_ids is not None:
+        if proposal_candidate_logits is None:
+            raise RuntimeError("Proposal candidate logits are missing")
+        if proposal_candidate_ids.shape != proposal_candidate_logits.shape:
+            raise ValueError("Proposal candidate IDs and logits must align")
+        if proposal_candidate_ids.shape[:-1] != logits.shape[:-1]:
+            raise ValueError("Proposal candidates must align with draft positions")
 
     # Analytical overlap (also SSAL score); needed for confidence / accept metrics.
     with torch.no_grad():
-        draft_p = softmax(logits.float(), dim=-1)
         target_p = softmax(targets.float(), dim=-1)
         target_ids = torch.argmax(targets, dim=-1)
-        accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)  # [1, T]
+        if proposal_candidate_ids is not None:
+            if proposal_candidate_logits is None:
+                raise RuntimeError("Proposal candidate logits are missing")
+            draft_p = softmax(proposal_candidate_logits.float(), dim=-1)
+            candidate_target_p = target_p.gather(-1, proposal_candidate_ids)
+            accept_rate = torch.minimum(draft_p, candidate_target_p).sum(dim=-1)
+            selected = proposal_candidate_logits.argmax(dim=-1, keepdim=True)
+            pred_ids = proposal_candidate_ids.gather(-1, selected).squeeze(-1)
+        else:
+            draft_p = softmax(logits.float(), dim=-1)
+            accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)
+            pred_ids = torch.argmax(logits, dim=-1)
         rollout_accept_rate = None
         if rollout_logits is not None:
             if rollout_logits.shape != logits.shape:
@@ -215,9 +239,7 @@ def compute_metrics(  # noqa: C901
                 raise ValueError(
                     "collaboration_base_logits and logits must have the same shape"
                 )
-            collaboration_base_p = softmax(
-                collaboration_base_logits.float(), dim=-1
-            )
+            collaboration_base_p = softmax(collaboration_base_logits.float(), dim=-1)
             collaboration_base_accept_rate = torch.minimum(
                 collaboration_base_p, target_p
             ).sum(dim=-1)
@@ -236,9 +258,9 @@ def compute_metrics(  # noqa: C901
             adaptive_scores = accept_rate
         elif adaptive_loss == "cat":
             with torch.no_grad():
-                adaptive_scores = target_p.gather(
-                    -1, target_ids.unsqueeze(-1)
-                ).squeeze(-1)
+                adaptive_scores = target_p.gather(-1, target_ids.unsqueeze(-1)).squeeze(
+                    -1
+                )
         draft_weights = position_weights(
             pos_idx.to(logits.dtype),
             block_size=block_size,
@@ -347,16 +369,16 @@ def compute_metrics(  # noqa: C901
             target_len = _accept_length(accept_blocks[:, start_pos:], draft_mask)
             block_valid = (draft_mask.sum(dim=-1) > 0).to(pred_len.dtype)
             length_loss = smooth_l1_loss(pred_len, target_len, reduction="none")
-            length_loss = (length_loss * block_valid).sum() / (
-                block_valid.sum() + _EPS
-            )
+            length_loss = (length_loss * block_valid).sum() / (block_valid.sum() + _EPS)
             loss = loss + confidence_length_alpha * length_loss
             with torch.no_grad():
                 metrics["confidence_length_loss_sum"] = length_loss.detach().clone()
                 metrics["confidence_length_loss_total"] = torch.ones((), device=device)
-                metrics["confidence_accept_len_pred_sum"] = (pred_len * block_valid).sum()
-                metrics["confidence_accept_len_pred_total"] = block_valid.sum().clamp_min(
-                    1.0
+                metrics["confidence_accept_len_pred_sum"] = (
+                    pred_len * block_valid
+                ).sum()
+                metrics["confidence_accept_len_pred_total"] = (
+                    block_valid.sum().clamp_min(1.0)
                 )
 
     ones = torch.ones((), device=device)
@@ -379,21 +401,17 @@ def compute_metrics(  # noqa: C901
             base_p = softmax(base_logits.float(), dim=-1)
             base_accept_rate = torch.minimum(base_p, target_p).sum(dim=-1)
             base_accept_blocks = base_accept_rate.view(num_blocks, block_size)
-            base_prefix = (
-                base_accept_blocks[:, start_pos:] * draft_mask
-            ).cumprod(dim=-1)
+            base_prefix = (base_accept_blocks[:, start_pos:] * draft_mask).cumprod(
+                dim=-1
+            )
             base_per_block_len = base_prefix.sum(dim=-1) + 1.0
             metrics["base_accept_rate_sum"] = (base_accept_rate * mask_f).sum()
             metrics["base_accept_rate_total"] = mask_f.sum().clamp_min(1.0)
             metrics["correction_accept_rate_gain_sum"] = (
                 (accept_rate - base_accept_rate) * mask_f
             ).sum()
-            metrics["correction_accept_rate_gain_total"] = mask_f.sum().clamp_min(
-                1.0
-            )
-            metrics["base_accept_len_sum"] = (
-                base_per_block_len * block_valid
-            ).sum()
+            metrics["correction_accept_rate_gain_total"] = mask_f.sum().clamp_min(1.0)
+            metrics["base_accept_len_sum"] = (base_per_block_len * block_valid).sum()
             metrics["base_accept_len_total"] = block_valid.sum().clamp_min(1.0)
             metrics["correction_accept_len_gain_sum"] = (
                 (per_block_len - base_per_block_len) * block_valid
@@ -406,15 +424,13 @@ def compute_metrics(  # noqa: C901
             delta_rms = delta_logits.square().mean(dim=-1).sqrt()
             metrics["correction_logit_rms_sum"] = (delta_rms * mask_f).sum()
             metrics["correction_logit_rms_total"] = mask_f.sum().clamp_min(1.0)
-            argmax_changed = (
-                logits.argmax(dim=-1) != base_logits.argmax(dim=-1)
-            ).to(mask_f.dtype)
+            argmax_changed = (logits.argmax(dim=-1) != base_logits.argmax(dim=-1)).to(
+                mask_f.dtype
+            )
             metrics["correction_argmax_change_rate_sum"] = (
                 argmax_changed * mask_f
             ).sum()
-            metrics["correction_argmax_change_rate_total"] = mask_f.sum().clamp_min(
-                1.0
-            )
+            metrics["correction_argmax_change_rate_total"] = mask_f.sum().clamp_min(1.0)
             base_ids = base_logits.argmax(dim=-1)
             metrics.update(
                 _change_outcome_metrics(
@@ -432,9 +448,7 @@ def compute_metrics(  # noqa: C901
                 rollout_accept_blocks[:, start_pos:] * draft_mask
             ).cumprod(dim=-1)
             rollout_per_block_len = rollout_prefix.sum(dim=-1) + 1.0
-            metrics["rollout_accept_rate_sum"] = (
-                rollout_accept_rate * mask_f
-            ).sum()
+            metrics["rollout_accept_rate_sum"] = (rollout_accept_rate * mask_f).sum()
             metrics["rollout_accept_rate_total"] = mask_f.sum().clamp_min(1.0)
             metrics["rollout_accept_len_sum"] = (
                 rollout_per_block_len * block_valid
@@ -468,9 +482,7 @@ def compute_metrics(  # noqa: C901
             metrics["correction_only_accept_rate_sum"] = (
                 collaboration_base_accept_rate * mask_f
             ).sum()
-            metrics["correction_only_accept_rate_total"] = mask_f.sum().clamp_min(
-                1.0
-            )
+            metrics["correction_only_accept_rate_total"] = mask_f.sum().clamp_min(1.0)
             metrics["correction_only_accept_len_sum"] = (
                 collaboration_base_len * block_valid
             ).sum()
@@ -505,14 +517,11 @@ def compute_metrics(  # noqa: C901
                 raise ValueError(
                     "collaboration_gate must contain one value per draft position"
                 )
-            metrics["collaboration_markov_gate_mean_sum"] = (
-                gate_values * mask_f
-            ).sum()
+            metrics["collaboration_markov_gate_mean_sum"] = (gate_values * mask_f).sum()
             metrics["collaboration_markov_gate_mean_total"] = mask_f.sum().clamp_min(
                 1.0
             )
 
-    pred_ids = torch.argmax(logits, dim=-1)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
