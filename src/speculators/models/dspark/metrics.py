@@ -6,8 +6,7 @@ loss = compound_loss(logits, targets)
      + focal_alpha * CE(first greedy error)
 
 Optional adaptive position weights (CAT / SSAL) replace fixed decay.
-For the correction head, an optional short curriculum mixes the unchanged base
-objective into the corrected objective and reports both acceptance lengths.
+Correction can additionally report teacher-forced and rollout acceptance metrics.
 """
 
 from functools import partial
@@ -42,8 +41,6 @@ _CORE_LOGGED_METRICS = frozenset(
         "accept_len",
         "confidence_loss",
         "correction_hidden_aux_loss",
-        "correction_moe_balance_loss",
-        "correction_moe_router_entropy",
         "dflash2_selector_loss",
         "collaboration_accept_len_gain",
         "collaboration_markov_gate_mean",

@@ -105,21 +105,19 @@ def test_dspark_defaults_match_paper_weighting(monkeypatch):
     assert args.num_layers == 5
     assert args.epochs == 10
     assert args.enable_correction_head is False
-    assert args.correction_moe is False
     assert args.correction_lm_head_fusion is False
     assert args.correction_rollout_metrics is False
     assert args.dflash_context_residual is False
-    assert args.dflash_verifier_final_residual is False
     assert args.dflash_block_position_embedding is False
     assert args.dflash_gated_layer_fusion is False
-    assert args.dflash_dfly_layer_residual is False
-    assert args.dflash_heterogeneous_kv_projections is False
     assert args.dflash2_dynamic_conv is False
     assert args.dflash2_candidate_selector is False
     assert args.dflash2_conv_kernel_size == 2
     assert args.dflash2_conv_group_size == 16
     assert args.dflash2_selector_rank == 256
     assert args.dflash2_selector_top_k == 16
+    assert args.dflash2_selector_search_mode == "greedy"
+    assert args.selector_correction_feedback == "static"
     assert args.dflash2_selector_loss_weight == 1.0
     assert args.enable_confidence_head is True
     assert args.confidence_head_with_markov is True
@@ -241,7 +239,6 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
     assert args.correction_num_heads == 6
     assert args.correction_gate_bias == -1.0
     assert args.correction_lm_head_fusion is True
-    assert args.correction_generated_token_ratio == 0.0
     assert args.correction_rollout_metrics is False
     assert args.correction_base_diagnostics is True
     assert args.confidence_detach_features is True
@@ -265,7 +262,7 @@ def test_dspark_logit_residual_correction_head_cli(monkeypatch):
     assert args.correction_output_mode == "logits"
 
 
-def test_dspark_lm_head_fusion_rejects_logit_mode(monkeypatch):
+def test_dspark_lm_head_fusion_rejects_logit_mode_without_dual_projection(monkeypatch):
     with pytest.raises(SystemExit):
         _parse(
             monkeypatch,
@@ -280,7 +277,7 @@ def test_dspark_lm_head_fusion_rejects_logit_mode(monkeypatch):
         )
 
 
-def test_dspark_logit_correction_moe_cli(monkeypatch):
+def test_dspark_lm_head_fusion_accepts_logit_mode_with_dual_projection(monkeypatch):
     args = _parse(
         monkeypatch,
         [
@@ -289,40 +286,13 @@ def test_dspark_logit_correction_moe_cli(monkeypatch):
             "--enable-correction-head",
             "--correction-output-mode",
             "logits",
-            "--correction-moe",
-            "--correction-moe-logit-routing",
+            "--correction-project-corrected-hidden",
+            "--correction-lm-head-fusion",
         ],
     )
-    assert args.correction_output_mode == "logits"
-    assert args.correction_moe is True
-    assert args.correction_moe_logit_routing is True
 
-
-def test_dspark_hidden_correction_moe_cli(monkeypatch):
-    args = _parse(
-        monkeypatch,
-        [
-            "--speculator-type",
-            "dspark",
-            "--enable-correction-head",
-            "--correction-moe",
-            "--correction-moe-shared-rank",
-            "128",
-            "--correction-moe-expert-rank",
-            "64",
-            "--correction-moe-num-experts",
-            "4",
-            "--correction-moe-load-balance-weight",
-            "0.005",
-            "--correction-moe-logit-routing",
-        ],
-    )
-    assert args.correction_moe is True
-    assert args.correction_moe_shared_rank == 128
-    assert args.correction_moe_expert_rank == 64
-    assert args.correction_moe_num_experts == 4
-    assert args.correction_moe_load_balance_weight == 0.005
-    assert args.correction_moe_logit_routing is True
+    assert args.correction_project_corrected_hidden is True
+    assert args.correction_lm_head_fusion is True
 
 
 def test_dspark_correction_hidden_auxiliary_features_cli(monkeypatch):
@@ -347,53 +317,43 @@ def test_dspark_correction_hidden_auxiliary_features_cli(monkeypatch):
     assert args.correction_project_corrected_hidden is True
 
 
-def test_dspark_correction_generated_token_curriculum_cli(monkeypatch):
-    teacher_forced = _parse(
+def test_corrected_selector_feedback_cli(monkeypatch):
+    args = _parse(
         monkeypatch,
         [
             "--speculator-type",
             "dspark",
             "--enable-correction-head",
+            "--dflash2-candidate-selector",
+            "--selector-correction-feedback",
+            "corrected",
         ],
     )
-    assert teacher_forced.correction_generated_token_ratio == 0.0
-
-    generated = _parse(
-        monkeypatch,
-        [
-            "--speculator-type",
-            "dspark",
-            "--enable-correction-head",
-            "--correction-generated-token-ratio",
-            "0.25",
-            "--correction-generated-token-warmup",
-            "0.2",
-            "--correction-generated-token-ramp",
-            "0.4",
-        ],
-    )
-    assert generated.correction_generated_token_ratio == 0.25
-    assert generated.correction_generated_token_warmup == 0.2
-    assert generated.correction_generated_token_ramp == 0.4
-
-    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(generated))
-    assert train_kw["correction_generated_token_curriculum"] is True
-    assert train_kw["correction_generated_token_target_ratio"] == 0.25
-    assert train_kw["correction_generated_token_warmup"] == 0.2
-    assert train_kw["correction_generated_token_ramp"] == 0.4
-    assert "correction_generated_token_curriculum" not in val_kw
+    assert args.selector_correction_feedback == "corrected"
 
 
-def test_new_dflash_and_collaboration_features_default_off(monkeypatch):
+def test_corrected_selector_feedback_rejects_global_search(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            [
+                "--speculator-type",
+                "dspark",
+                "--enable-correction-head",
+                "--dflash2-candidate-selector",
+                "--dflash2-selector-global",
+                "--selector-correction-feedback",
+                "corrected",
+            ],
+        )
+
+
+def test_retained_dflash_and_collaboration_features_default_off(monkeypatch):
     args = _parse(monkeypatch, ["--speculator-type", "dspark"])
     assert args.correction_with_markov is False
     assert args.dflash_context_residual is False
-    assert args.dflash_verifier_final_residual is False
     assert args.dflash_block_position_embedding is False
     assert args.dflash_gated_layer_fusion is False
-    assert args.dflash_dfly_layer_residual is False
-    assert args.dflash_heterogeneous_kv_projections is False
-    assert args.correction_cross_block_memory is False
 
 
 def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
@@ -406,15 +366,9 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
             "--correction-with-markov",
             "--correction-markov-gate-bias",
             "-1.5",
-            "--correction-cross-block-memory",
-            "--correction-memory-gate-bias",
-            "-1.0",
             "--dflash-context-residual",
-            "--dflash-verifier-final-residual",
             "--dflash-block-position-embedding",
             "--dflash-gated-layer-fusion",
-            "--dflash-dfly-layer-residual",
-            "--dflash-heterogeneous-kv-projections",
             "--dflash2-dynamic-conv",
             "--dflash2-conv-kernel-size",
             "3",
@@ -425,26 +379,23 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
             "64",
             "--dflash2-selector-top-k",
             "4",
+            "--dflash2-selector-global",
             "--dflash2-selector-loss-weight",
             "0.5",
         ],
     )
     assert args.correction_with_markov is True
     assert args.correction_markov_gate_bias == -1.5
-    assert args.correction_cross_block_memory is True
-    assert args.correction_memory_gate_bias == -1.0
     assert args.dflash_context_residual is True
-    assert args.dflash_verifier_final_residual is True
     assert args.dflash_block_position_embedding is True
     assert args.dflash_gated_layer_fusion is True
-    assert args.dflash_dfly_layer_residual is True
-    assert args.dflash_heterogeneous_kv_projections is True
     assert args.dflash2_dynamic_conv is True
     assert args.dflash2_conv_kernel_size == 3
     assert args.dflash2_conv_group_size == 8
     assert args.dflash2_candidate_selector is True
     assert args.dflash2_selector_rank == 64
     assert args.dflash2_selector_top_k == 4
+    assert args.dflash2_selector_search_mode == "global"
     assert args.dflash2_selector_loss_weight == 0.5
 
 

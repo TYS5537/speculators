@@ -62,20 +62,14 @@ def test_optional_features_default_off_preserves_original_helpers():
     assert conditioned is noise
     assert model.layer_fusion_norms is None
     assert model.layer_fusion_score is None
-    assert model.dfly_layer_fusion_logits is None
-    assert model.layers[0].self_attn.target_k_proj is None
-    assert model.layers[0].self_attn.target_v_proj is None
     assert model.context_hidden_proj is None
-    assert model.verifier_final_hidden_proj is None
     assert model.block_position_embedding is None
     assert model.candidate_selector is None
     assert model.layers[0].attention_conv is None
     assert model.layers[0].mlp_conv is None
     optional_prefixes = (
         "layer_fusion_",
-        "dfly_layer_fusion_",
         "context_hidden_",
-        "verifier_final_hidden_",
         "block_position_embedding",
         "candidate_selector",
     )
@@ -118,122 +112,6 @@ def test_gated_layer_fusion_returns_draft_hidden_shape():
     with torch.no_grad():
         model.layer_fusion_gate.fill_(1.0)
     assert not torch.equal(model._fuse_target_hidden(hidden), baseline)
-
-
-def test_dfly_layer_residual_requires_current_gated_fusion():
-    with pytest.raises(ValueError, match="requires dflash_gated_layer_fusion"):
-        _make_model(dflash_dfly_layer_residual=True)
-
-
-def test_dfly_layer_residual_adds_distinct_per_draft_layer_views():
-    torch.manual_seed(2)
-    model = _make_model(
-        num_draft_layers=2,
-        dflash_gated_layer_fusion=True,
-        dflash_dfly_layer_residual=True,
-    )
-    hidden = torch.randn(1, 5, 32)
-    shared_projection, target_layer_states = model._prepare_target_hidden(hidden)
-    assert target_layer_states is not None
-    assert model.dfly_layer_fusion_logits is not None
-    assert model.dfly_layer_residual_gate is not None
-
-    initial_0 = model._add_dfly_layer_residual(
-        shared_projection, target_layer_states, 0
-    )
-    initial_1 = model._add_dfly_layer_residual(
-        shared_projection, target_layer_states, 1
-    )
-    baseline = model.hidden_norm(shared_projection)
-    assert torch.equal(initial_0, baseline)
-    assert torch.equal(initial_0, initial_1)
-
-    with torch.no_grad():
-        model.dfly_layer_residual_gate.fill_(1.0)
-        model.dfly_layer_fusion_logits[0].copy_(torch.tensor([8.0, -8.0]))
-        model.dfly_layer_fusion_logits[1].copy_(torch.tensor([-8.0, 8.0]))
-
-    fused_0 = model._add_dfly_layer_residual(shared_projection, target_layer_states, 0)
-    fused_1 = model._add_dfly_layer_residual(shared_projection, target_layer_states, 1)
-    assert fused_0.shape == (1, 5, 16)
-    assert fused_1.shape == (1, 5, 16)
-    assert torch.isfinite(fused_0).all()
-    assert torch.isfinite(fused_1).all()
-    assert not torch.equal(fused_0, fused_1)
-
-
-def test_heterogeneous_kv_projections_are_separate_and_used_for_context():
-    torch.manual_seed(3)
-    model = _make_model(dflash_heterogeneous_kv_projections=True)
-    attention = model.layers[0].self_attn
-    assert attention.target_k_proj is not None
-    assert attention.target_v_proj is not None
-    assert attention.target_k_proj is not attention.k_proj
-    assert attention.target_v_proj is not attention.v_proj
-
-    attention.config._attn_implementation = "eager"  # noqa: SLF001
-    draft_hidden = torch.randn(1, 3, 16)
-    target_hidden = torch.randn(1, 5, 16)
-    cos = torch.ones(1, 8, 4)
-    sin = torch.zeros(1, 8, 4)
-    output_before = attention(draft_hidden, target_hidden, (cos, sin), None)[0]
-    with torch.no_grad():
-        attention.target_v_proj.weight.zero_()
-    output_after = attention(draft_hidden, target_hidden, (cos, sin), None)[0]
-    assert output_before.shape == draft_hidden.shape
-    assert torch.isfinite(output_before).all()
-    assert not torch.equal(output_before, output_after)
-
-
-def test_missing_heterogeneous_kv_copies_shared_projections():
-    model = _make_model(dflash_heterogeneous_kv_projections=True)
-    attention = model.layers[0].self_attn
-    assert attention.target_k_proj is not None
-    assert attention.target_v_proj is not None
-    with torch.no_grad():
-        attention.k_proj.weight.fill_(1.0)
-        attention.v_proj.weight.fill_(2.0)
-        attention.target_k_proj.weight.zero_()
-        attention.target_v_proj.weight.zero_()
-
-    model._prepare_missing_checkpoint_weights(
-        {
-            "missing_keys": [
-                "layers.0.self_attn.target_k_proj.weight",
-                "layers.0.self_attn.target_v_proj.weight",
-            ]
-        }
-    )
-
-    assert torch.equal(attention.target_k_proj.weight, attention.k_proj.weight)
-    assert torch.equal(attention.target_v_proj.weight, attention.v_proj.weight)
-
-
-def test_legacy_dfly_checkpoint_preserves_ungated_residual():
-    model = _make_model(
-        dflash_gated_layer_fusion=True,
-        dflash_dfly_layer_residual=True,
-    )
-    assert model.dfly_layer_residual_gate is not None
-    assert model.dfly_layer_residual_gate.item() == 0.0
-
-    model._prepare_missing_checkpoint_weights(
-        {"missing_keys": ["dfly_layer_residual_gate"]}
-    )
-
-    assert model.dfly_layer_residual_gate.item() == 1.0
-
-
-def test_dfly_rejects_checkpoint_without_trained_feature_weights():
-    model = _make_model(
-        dflash_gated_layer_fusion=True,
-        dflash_dfly_layer_residual=True,
-    )
-
-    with pytest.raises(RuntimeError, match="does not contain their trained weights"):
-        model._prepare_missing_checkpoint_weights(
-            {"missing_keys": ["dfly_layer_fusion_logits"]}
-        )
 
 
 def test_context_and_slot_residuals_start_at_exact_zero():
@@ -354,22 +232,133 @@ def test_dflash2_selector_block_loss_is_finite_and_backward_safe():
     teacher_previous_ids[:, 0] = anchors
     loss_mask = torch.ones(1, 6)
 
-    candidate_ids, candidate_logits, selector_loss = model._dflash2_block_outputs(
-        logits,
-        targets,
-        hidden,
-        anchors,
-        loss_mask,
-        teacher_previous_ids,
+    candidate_ids, candidate_logits, selector_loss, selected_ids, teacher_rows = (
+        model._dflash2_block_outputs(
+            logits,
+            targets,
+            hidden,
+            anchors,
+            loss_mask,
+            teacher_previous_ids,
+        )
     )
 
     assert candidate_ids.shape == (2, 3, 4)
     assert candidate_logits.shape == candidate_ids.shape
+    assert selected_ids.shape == candidate_ids.shape[:-1]
+    assert teacher_rows.shape == candidate_ids.shape
     assert torch.isfinite(selector_loss)
     selector_loss.backward()
     assert logits.grad is not None
     assert model.candidate_selector is not None
     assert model.candidate_selector.hidden_projection.weight.grad is not None
+
+
+def test_dflash2_global_search_can_outperform_local_greedy_path():
+    model = _make_model(
+        sample_from_anchor=True,
+        dflash2_candidate_selector=True,
+        dflash2_selector_rank=1,
+        dflash2_selector_top_k=2,
+    )
+    selector = model.candidate_selector
+    assert selector is not None
+    with torch.no_grad():
+        selector.hidden_projection.weight.zero_()
+        selector.hidden_projection.weight[0, 0] = 1.0
+        selector.predecessor_codebook.zero_()
+        selector.predecessor_codebook[2, 0] = 1.0
+        selector.successor_codebook.zero_()
+        selector.successor_codebook[3, 0] = 8.0
+
+    candidate_ids = torch.tensor([[[1, 2], [3, 4]]])
+    unary_logits = torch.tensor([[[10.0, 9.5], [0.0, 0.0]]])
+    hidden = torch.zeros(1, 2, 16)
+    hidden[..., 0] = 1.0
+    anchors = torch.tensor([0])
+
+    model.config.dflash2_selector_search_mode = "greedy"
+    greedy_ids, greedy_rows = model._dflash2_select_topk_path(
+        candidate_ids, unary_logits, hidden, anchors
+    )
+    model.config.dflash2_selector_search_mode = "global"
+    global_ids, global_rows = model._dflash2_select_topk_path(
+        candidate_ids, unary_logits, hidden, anchors
+    )
+
+    assert torch.equal(greedy_ids, torch.tensor([[1, 3]]))
+    assert torch.equal(global_ids, torch.tensor([[2, 3]]))
+    assert torch.equal(greedy_rows[:, 1], torch.tensor([[0.0, 0.0]]))
+    assert torch.equal(global_rows[:, 1], torch.tensor([[8.0, 0.0]]))
+    global_proposal_rows = model._dflash2_proposal_logits(
+        candidate_ids,
+        global_rows,
+        global_ids,
+    )
+    proposed_ids = candidate_ids.gather(
+        -1, global_proposal_rows.argmax(dim=-1, keepdim=True)
+    ).squeeze(-1)
+    assert torch.equal(proposed_ids, global_ids)
+
+
+def test_dflash2_global_search_is_invariant_to_predecessor_row_offsets():
+    model = _make_model(
+        sample_from_anchor=True,
+        dflash2_candidate_selector=True,
+        dflash2_selector_rank=1,
+        dflash2_selector_top_k=2,
+    )
+
+    class OffsetSelector(torch.nn.Module):
+        @staticmethod
+        def forward(candidate_ids, unary_logits, hidden_states, previous_token_ids):
+            del candidate_ids, hidden_states
+            neutral = unary_logits.new_tensor([0.0, 0.0])
+            offset = unary_logits.new_tensor([100.0, 90.0])
+            return torch.where(
+                (previous_token_ids == 2).unsqueeze(-1),
+                offset.expand(*previous_token_ids.shape, 2),
+                neutral.expand(*previous_token_ids.shape, 2),
+            )
+
+        @staticmethod
+        def score_lattice(
+            candidate_ids,
+            unary_logits,
+            hidden_states,
+            predecessor_ids,
+        ):
+            del candidate_ids, unary_logits, hidden_states, predecessor_ids
+            return torch.tensor([[[[0.0, 0.0], [100.0, 90.0]]]])
+
+    model.candidate_selector = OffsetSelector()
+    candidate_ids = torch.tensor([[[1, 2], [3, 4]]])
+    unary_logits = torch.zeros(1, 2, 2)
+    hidden = torch.zeros(1, 2, 16)
+    anchors = torch.tensor([0])
+
+    # Override the first selector row: token 1 is more likely than token 2.
+    original_forward = model.candidate_selector.forward
+
+    def forward(candidate_ids, unary_logits, hidden_states, previous_token_ids):
+        if torch.equal(previous_token_ids, anchors):
+            return unary_logits.new_tensor([[0.0, -1.0]])
+        return original_forward(
+            candidate_ids, unary_logits, hidden_states, previous_token_ids
+        )
+
+    model.candidate_selector.forward = forward
+    model.config.dflash2_selector_search_mode = "global"
+    selected_ids, _ = model._dflash2_select_topk_path(
+        candidate_ids,
+        unary_logits,
+        hidden,
+        anchors,
+    )
+
+    # Raw-energy Viterbi would choose predecessor 2 because of its +100 row
+    # offset. Conditional log-probability Viterbi correctly ignores that offset.
+    assert selected_ids[0, 0].item() == 1
 
 
 @pytest.mark.parametrize(
@@ -395,56 +384,3 @@ def test_dflash2_rejects_checkpoint_with_missing_trained_weights(
     model = _make_model(**feature_flags)
     with pytest.raises(RuntimeError, match="does not contain its trained weights"):
         model._prepare_missing_checkpoint_weights({"missing_keys": [missing_key]})
-
-
-def test_verifier_final_residual_uses_pre_lm_context_and_starts_at_zero():
-    model = _make_model(dflash_verifier_final_residual=True)
-    assert model.verifier_final_hidden_proj is not None
-    assert model.verifier_final_hidden_gate is not None
-
-    noise = torch.randn(1, 3, 16)
-    fused = torch.randn(1, 4, 16)
-    pre_lm = torch.ones(1, 4, 16)
-    document_ids = torch.zeros(1, 4, dtype=torch.long)
-    initial = model._condition_noise_embedding(
-        noise,
-        fused,
-        torch.tensor([2]),
-        document_ids,
-        verifier_pre_lm_hidden=pre_lm,
-    )
-    assert torch.equal(initial, noise)
-
-    with torch.no_grad():
-        model.verifier_final_hidden_proj.weight.copy_(torch.eye(16))
-        model.verifier_final_hidden_gate.fill_(1.0)
-    conditioned = model._condition_noise_embedding(
-        noise,
-        fused,
-        torch.tensor([2]),
-        document_ids,
-        verifier_pre_lm_hidden=pre_lm,
-    )
-    assert not torch.equal(conditioned, noise)
-
-
-def test_verifier_final_residual_does_not_cross_document_boundary():
-    model = _make_model(dflash_verifier_final_residual=True)
-    assert model.verifier_final_hidden_proj is not None
-    assert model.verifier_final_hidden_gate is not None
-    with torch.no_grad():
-        model.verifier_final_hidden_proj.weight.copy_(torch.eye(16))
-        model.verifier_final_hidden_gate.fill_(1.0)
-
-    noise = torch.zeros(1, 3, 16)
-    fused = torch.zeros(1, 4, 16)
-    pre_lm = torch.ones(1, 4, 16)
-    document_ids = torch.tensor([[0, 0, 1, 1]])
-    conditioned = model._condition_noise_embedding(
-        noise,
-        fused,
-        torch.tensor([2]),
-        document_ids,
-        verifier_pre_lm_hidden=pre_lm,
-    )
-    assert torch.equal(conditioned, noise)

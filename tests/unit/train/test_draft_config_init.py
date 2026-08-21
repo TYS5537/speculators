@@ -248,25 +248,6 @@ def test_from_pretrained_alone_parses(monkeypatch):
     assert args.draft_config == ""
 
 
-def test_from_pretrained_runtime_override_defers_to_checkpoint_config(monkeypatch):
-    args = _parse(
-        monkeypatch,
-        [
-            "--speculator-type",
-            "dspark",
-            "--from-pretrained",
-            "some/checkpoint",
-            "--correction-generated-token-ratio",
-            "0.25",
-        ],
-    )
-
-    assert args.correction_generated_token_ratio == 0.25
-    assert "correction_generated_token_ratio" in (
-        args._provided_model_config_dests
-    )
-
-
 @pytest.mark.parametrize(
     "extra",
     [
@@ -485,15 +466,15 @@ def test_build_from_config_only_reapplies_draft_attn_impl(tmp_path):
 
 def test_pretrained_config_unspecified_runtime_value_inherits_checkpoint():
     args = SimpleNamespace(
-        correction_generated_token_ratio=0.0,
+        correction_rollout_metrics=False,
         _provided_model_config_dests=set(),
     )
-    config = SimpleNamespace(correction_generated_token_ratio=0.25)
+    config = SimpleNamespace(correction_rollout_metrics=True)
 
     _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
 
-    assert args.correction_generated_token_ratio == 0.25
-    assert config.correction_generated_token_ratio == 0.25
+    assert args.correction_rollout_metrics is True
+    assert config.correction_rollout_metrics is True
 
 
 def test_pretrained_config_allows_explicit_runtime_override():
@@ -510,10 +491,10 @@ def test_pretrained_config_allows_explicit_runtime_override():
 
 def test_pretrained_config_rejects_structural_override():
     args = SimpleNamespace(
-        dflash_heterogeneous_kv_projections=True,
-        _provided_model_config_dests={"dflash_heterogeneous_kv_projections"},
+        dflash2_dynamic_conv=True,
+        _provided_model_config_dests={"dflash2_dynamic_conv"},
     )
-    config = SimpleNamespace(dflash_heterogeneous_kv_projections=False)
+    config = SimpleNamespace(dflash2_dynamic_conv=False)
 
     with pytest.raises(ValueError, match="checkpoint architecture"):
         _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]

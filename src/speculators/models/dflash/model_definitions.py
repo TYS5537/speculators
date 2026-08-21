@@ -267,13 +267,10 @@ class Qwen3DFlashAttention(nn.Module):
         self,
         config: Qwen3Config,
         layer_idx: int,
-        *,
-        heterogeneous_kv_projections: bool = False,
     ):
         super().__init__()
         self.config = config
         self.layer_idx = layer_idx
-        self.heterogeneous_kv_projections = heterogeneous_kv_projections
         self.head_dim = getattr(
             config,
             "head_dim",
@@ -300,19 +297,6 @@ class Qwen3DFlashAttention(nn.Module):
             config.num_key_value_heads * self.head_dim,  # type: ignore[operator]
             bias=config.attention_bias,  # type: ignore[arg-type]
         )
-        self.target_k_proj: nn.Linear | None = None
-        self.target_v_proj: nn.Linear | None = None
-        if self.heterogeneous_kv_projections:
-            self.target_k_proj = nn.Linear(
-                config.hidden_size,  # type: ignore[arg-type]
-                config.num_key_value_heads * self.head_dim,  # type: ignore[operator]
-                bias=config.attention_bias,  # type: ignore[arg-type]
-            )
-            self.target_v_proj = nn.Linear(
-                config.hidden_size,  # type: ignore[arg-type]
-                config.num_key_value_heads * self.head_dim,  # type: ignore[operator]
-                bias=config.attention_bias,  # type: ignore[arg-type]
-            )
         self.o_proj = nn.Linear(
             config.num_attention_heads * self.head_dim,  # type: ignore[operator]
             config.hidden_size,  # type: ignore[arg-type]
@@ -347,15 +331,9 @@ class Qwen3DFlashAttention(nn.Module):
         q = q.view(bsz, q_len, -1, self.head_dim)
         q = self.q_norm(q).transpose(1, 2)
         # This is the main difference from the usual attention mechanism.
-        target_k_proj = (
-            self.target_k_proj if self.target_k_proj is not None else self.k_proj
-        )
-        target_v_proj = (
-            self.target_v_proj if self.target_v_proj is not None else self.v_proj
-        )
-        k_ctx = target_k_proj(target_hidden)
+        k_ctx = self.k_proj(target_hidden)
         k_noise = self.k_proj(hidden_states)
-        v_ctx = target_v_proj(target_hidden)
+        v_ctx = self.v_proj(target_hidden)
         v_noise = self.v_proj(hidden_states)
         k = torch.cat([k_ctx, k_noise], dim=1).view(
             bsz, ctx_len + q_len, -1, self.head_dim
@@ -401,7 +379,6 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         config: Qwen3Config,
         layer_idx: int,
         *,
-        heterogeneous_kv_projections: bool = False,
         dflash2_dynamic_conv: bool = False,
         dflash2_conv_kernel_size: int = 2,
         dflash2_conv_group_size: int = 16,
@@ -412,7 +389,6 @@ class Qwen3DFlashDecoderLayer(GradientCheckpointingLayer):
         self.self_attn = Qwen3DFlashAttention(
             config=config,
             layer_idx=layer_idx,
-            heterogeneous_kv_projections=heterogeneous_kv_projections,
         )
         self.mlp = Qwen3MLP(config)
         self.input_layernorm = Qwen3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)  # type: ignore[arg-type]

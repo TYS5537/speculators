@@ -180,7 +180,7 @@ torchrun --standalone --nproc_per_node=4 scripts/train.py \
 
 ### DSpark-Specific Defaults
 
-With `--speculator-type dspark`, the paper baseline uses a vanilla rank-256 Markov head, enables the confidence head with the Markov feature, and applies the same fixed exponential position weights to draft and confidence losses (`match-draft`). Correction, Correction MoE, generated-token feedback, collaboration, adaptive losses, and optional DFlash residual/fusion features are disabled unless explicitly enabled.
+With `--speculator-type dspark`, the paper baseline uses a vanilla rank-256 Markov head, enables the confidence head with the Markov feature, and applies the same fixed exponential position weights to draft and confidence losses (`match-draft`). Correction, collaboration, adaptive losses, and optional DFlash residual/fusion features are disabled unless explicitly enabled.
 
 ### Sliding Window Attention Arguments
 

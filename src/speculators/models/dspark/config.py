@@ -88,10 +88,10 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     correction_lm_head_fusion: bool = Field(
         default=False,
         description=(
-            "During no-grad hidden-mode rollout, fuse Correction's low-rank "
-            "output projection with the LM head. This computes the block base "
-            "logits once and applies only rank-to-vocabulary residual projections "
-            "at sequential positions. Training is unchanged."
+            "During no-grad rollout, compute the block base logits once and fuse "
+            "Correction's low-rank hidden residual with the LM head. This supports "
+            "hidden output and logit output with corrected-hidden projection. "
+            "Training and the default disabled path are unchanged."
         ),
     )
     correction_num_layers: int = Field(
@@ -107,41 +107,6 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
     correction_gate_bias: float = Field(
         default=0.0,
         description="Initial bias of the sigmoid correction-residual gate.",
-    )
-    correction_moe: bool = Field(
-        default=False,
-        description=(
-            "Replace Correction's final low-rank path with one always-on shared "
-            "expert plus a Top-1 selected expert. Logits mode fuses both experts "
-            "before one shared vocabulary projection."
-        ),
-    )
-    correction_moe_shared_rank: int = Field(
-        default=128,
-        gt=0,
-        description="Low-rank width of the always-on Correction shared expert.",
-    )
-    correction_moe_expert_rank: int = Field(
-        default=64,
-        gt=0,
-        description="Low-rank width of each routed Correction expert.",
-    )
-    correction_moe_num_experts: int = Field(
-        default=4,
-        gt=0,
-        description="Number of Top-1 routed Correction experts.",
-    )
-    correction_moe_load_balance_weight: float = Field(
-        default=0.01,
-        ge=0.0,
-        description="Weight of the Switch-style Correction router balance loss.",
-    )
-    correction_moe_logit_routing: bool = Field(
-        default=False,
-        description=(
-            "Condition only the MoE router and residual gate on detached previous-"
-            "logit entropy, top-1 probability, and top-1/top-2 margin."
-        ),
     )
     correction_hidden_aux_loss: bool = Field(
         default=False,
@@ -163,19 +128,12 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
             "default for baseline parity."
         ),
     )
-    correction_cross_block_memory: bool = Field(
-        default=False,
+    selector_correction_feedback: Literal["static", "corrected"] = Field(
+        default="static",
         description=(
-            "Carry a gated residual memory between draft blocks. Training builds "
-            "the memory from verifier-confirmed pre-LM context and the current "
-            "anchor token; speculative decoding updates it only after verification."
-        ),
-    )
-    correction_memory_gate_bias: float = Field(
-        default=-2.0,
-        description=(
-            "Initial bias of the gated residual memory update. The default starts "
-            "with a conservative update rate."
+            "How an upstream DFlash2 Selector conditions sequential Correction. "
+            "'static' keeps the preselected path fixed; 'corrected' feeds each "
+            "Correction output token into the next greedy Selector/Correction slot."
         ),
     )
     correction_project_corrected_hidden: bool = Field(
@@ -200,32 +158,6 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         description=(
             "Initial bias of the Correction-state gate controlling the collaborative "
             "Markov logit bias."
-        ),
-    )
-    correction_generated_token_ratio: float = Field(
-        default=0.0,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Target fraction of training steps that use greedy generated-token "
-            "feedback instead of teacher forcing. Zero preserves the baseline."
-        ),
-    )
-    correction_generated_token_warmup: float = Field(
-        default=0.2,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Fraction of training held at zero generated-token ratio before ramping."
-        ),
-    )
-    correction_generated_token_ramp: float = Field(
-        default=0.4,
-        ge=0.0,
-        le=1.0,
-        description=(
-            "Fraction of training used to linearly ramp from zero to the target "
-            "generated-token ratio."
         ),
     )
     correction_rollout_metrics: bool = Field(

@@ -195,6 +195,17 @@ def test_no_sample_from_anchor_slot_target_positions():
     ]
 
 
+def test_no_sample_from_anchor_rejects_zero_proposal_block():
+    module = _load_module()
+    draft = SimpleNamespace(
+        block_size=1,
+        config=SimpleNamespace(sample_from_anchor=False),
+    )
+
+    with pytest.raises(ValueError, match="block_size >= 2"):
+        module.speculative_slots_for_draft(draft)
+
+
 def test_detects_preprojection_correction():
     module = _load_module()
 
@@ -241,33 +252,41 @@ def test_preprojection_rollout_receives_hidden_states_without_base_logits():
     ]
 
 
-def test_preprojection_rollout_forwards_cross_block_memory():
+def test_preprojection_rollout_builds_one_base_block_for_lm_head_fusion():
     module = _load_module()
     calls = []
 
+    class LMHead:
+        def __init__(self):
+            self.weight = module.torch.zeros(8, 4)
+            self.calls = 0
+
+        def __call__(self, hidden):
+            self.calls += 1
+            return hidden.new_zeros(*hidden.shape[:-1], 8)
+
     class Draft:
         correction_head = SimpleNamespace(position_embedding=object())
+        candidate_selector = None
+        config = SimpleNamespace(correction_lm_head_fusion=True)
+        lm_head = LMHead()
 
         @staticmethod
         def rollout_correction(*args, **kwargs):
             calls.append((args, kwargs))
             return "tokens", "logits"
 
-    hidden_states = object()
-    anchor_token_ids = object()
-    block_memory = object()
-    initial_previous_logits = object()
-    module._run_preprojection_correction_rollout(
+    hidden_states = module.torch.zeros(1, 3, 4)
+    result = module._run_preprojection_correction_rollout(
         Draft(),
         hidden_states=hidden_states,
-        anchor_token_ids=anchor_token_ids,
+        anchor_token_ids=module.torch.tensor([1]),
         temperature=0.0,
-        block_memory=block_memory,
-        initial_previous_logits=initial_previous_logits,
     )
 
-    assert calls[0][1]["block_memory"] is block_memory
-    assert calls[0][1]["initial_previous_logits"] is initial_previous_logits
+    assert result == ("tokens", "logits")
+    assert Draft.lm_head.calls == 1
+    assert calls[0][1]["base_logits"].shape == (1, 3, 8)
 
 
 def test_correction_selector_positive_temperature_returns_sparse_q():
@@ -298,7 +317,6 @@ def test_correction_selector_positive_temperature_returns_sparse_q():
         module.torch.zeros(1, 1, 3),
         module.torch.tensor([5]),
         None,
-        None,
     )
 
     assert proposed == [2]
@@ -321,47 +339,6 @@ def test_target_logits_are_selected_in_draft_vocab_order():
         selected,
         module.torch.tensor([[0.0, 2.0, 4.0]]),
     )
-
-
-def test_offline_dfly_uses_draft_layer_specific_target_context():
-    calls = []
-
-    class Draft:
-        dflash_dfly_layer_residual = True
-
-        @staticmethod
-        def _prepare_target_hidden(hidden_states):
-            assert hidden_states == "hidden"
-            return "shared", "layers"
-
-        @staticmethod
-        def hidden_norm(shared_projection):
-            assert shared_projection == "shared"
-            return "normalized-shared"
-
-        @staticmethod
-        def _add_dfly_layer_residual(shared_projection, target_layer_states, layer_idx):
-            calls.append((shared_projection, target_layer_states, layer_idx))
-            return f"dfly-{layer_idx}"
-
-    module = _load_module()
-    shared, layer_states, shared_context = module._prepare_dflash_target_context(
-        Draft(), "hidden"
-    )
-    contexts = [
-        module._target_context_for_draft_layer(
-            Draft(),
-            shared_projection=shared,
-            target_layer_states=layer_states,
-            shared_context=shared_context,
-            layer_idx=layer_idx,
-        )
-        for layer_idx in range(2)
-    ]
-
-    assert shared_context == "normalized-shared"
-    assert contexts == ["dfly-0", "dfly-1"]
-    assert calls == [("shared", "layers", 0), ("shared", "layers", 1)]
 
 
 def test_offline_selector_returns_realized_topk_q_and_feedback_token():
@@ -459,6 +436,47 @@ def test_offline_selector_positive_temperature_q_and_vocab_mapping():
         [0.0, 0.0, 0.25, 0.0, 0.0, 0.0, 0.75]
     )
     assert target_q[0, 0, proposed[0]].item() > 0.0
+
+
+def test_offline_global_selector_returns_viterbi_path_as_exact_q():
+    module = _load_module()
+
+    class Draft:
+        correction_head = None
+        markov_head = None
+        candidate_selector = object()
+        config = SimpleNamespace(dflash2_selector_search_mode="global")
+        use_draft_vocab = False
+        d2t = None
+
+        @staticmethod
+        def dflash2_select_path(logits, hidden_states, anchor_token_ids):
+            del logits, hidden_states, anchor_token_ids
+            candidate_ids = module.torch.tensor([[[1, 2], [3, 4]]])
+            realized_rows = module.torch.tensor([[[10.0, 9.0], [8.0, 0.0]]])
+            # The first Viterbi choice is intentionally not its realized-row argmax.
+            selected_ids = module.torch.tensor([[2, 3]])
+            return candidate_ids, realized_rows, selected_ids
+
+    runner = module.DSparkOfflineRunner.__new__(module.DSparkOfflineRunner)
+    runner.draft_model = Draft()
+    runner.args = SimpleNamespace(temperature=1.0)
+    runner.device = module.torch.device("cpu")
+    runner.first_draft_slot = 0
+    runner.max_proposal_tokens = 2
+
+    proposed, draft_q = runner._sample_dspark_tokens(
+        module.torch.zeros(1, 2, 5),
+        module.torch.zeros(1, 2, 3),
+        module.torch.tensor([7]),
+        None,
+    )
+
+    assert proposed == [2, 3]
+    assert module.torch.equal(
+        draft_q,
+        module.torch.tensor([[[0.0, 0.0, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 1.0, 0.0]]]),
+    )
 
 
 def test_shard_records_round_robin():

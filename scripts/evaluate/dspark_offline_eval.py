@@ -529,8 +529,8 @@ def _run_preprojection_correction_rollout(
     hidden_states,
     anchor_token_ids,
     temperature: float,
-    block_memory=None,
     initial_previous_logits=None,
+    base_logits=None,
 ):
     """Run native Correction rollout, including optional previous-logit feedback."""
     if not _is_preprojection_correction(draft):
@@ -539,41 +539,39 @@ def _run_preprojection_correction_rollout(
         "anchor_token_ids": anchor_token_ids,
         "temperature": temperature,
     }
-    if block_memory is not None:
-        rollout_kwargs["block_memory"] = block_memory
     if initial_previous_logits is not None:
         rollout_kwargs["initial_previous_logits"] = initial_previous_logits
+    reuse_base_logits = bool(
+        getattr(getattr(draft, "config", None), "correction_lm_head_fusion", False)
+    )
+    if (
+        base_logits is not None
+        or getattr(draft, "candidate_selector", None) is not None
+        or reuse_base_logits
+    ):
+        rollout_kwargs["base_logits"] = (
+            base_logits
+            if base_logits is not None
+            else draft.lm_head(hidden_states.to(draft.lm_head.weight.dtype))
+        )
     return draft.rollout_correction(hidden_states, **rollout_kwargs)
 
 
 def _prepare_dflash_target_context(draft, hidden_states):
     """Mirror the training/validation target-layer preparation exactly."""
-    shared_projection, target_layer_states = draft._prepare_target_hidden(hidden_states)
-    shared_context = draft.hidden_norm(shared_projection)
-    return shared_projection, target_layer_states, shared_context
-
-
-def _target_context_for_draft_layer(
-    draft,
-    *,
-    shared_projection,
-    target_layer_states,
-    shared_context,
-    layer_idx: int,
-):
-    """Return the shared or DFly draft-layer-specific target context."""
-    if not draft.dflash_dfly_layer_residual:
-        return shared_context
-    return draft._add_dfly_layer_residual(
-        shared_projection,
-        target_layer_states,
-        layer_idx,
-    )
+    return draft._fuse_target_hidden(hidden_states)
 
 
 def speculative_slots_for_draft(draft) -> int:
     block = int(draft.block_size)
-    return block if _draft_sample_from_anchor(draft) else max(1, block - 1)
+    if _draft_sample_from_anchor(draft):
+        return block
+    if block <= 1:
+        raise ValueError(
+            "sample_from_anchor=False requires block_size >= 2 for offline "
+            "speculative evaluation"
+        )
+    return block - 1
 
 
 def first_draft_slot_for_draft(draft) -> int:
@@ -947,10 +945,6 @@ class DSparkOfflineRunner:
         self.sample_from_anchor = _draft_sample_from_anchor(draft_model)
         self.first_draft_slot = first_draft_slot_for_draft(draft_model)
         self.max_proposal_tokens = speculative_slots_for_draft(draft_model)
-        self.uses_verifier_pre_lm_context = bool(
-            draft_model.config.dflash_verifier_final_residual
-            or draft_model.config.correction_cross_block_memory
-        )
         correction_output_mode = getattr(
             getattr(draft_model, "correction_head", None),
             "output_mode",
@@ -959,14 +953,7 @@ class DSparkOfflineRunner:
         self.uses_initial_correction_logits = bool(
             draft_model.correction_head is not None
             and not self.sample_from_anchor
-            and (
-                correction_output_mode == "logits"
-                or getattr(
-                    draft_model.config,
-                    "correction_moe_logit_routing",
-                    False,
-                )
-            )
+            and correction_output_mode == "logits"
         )
         self._draft_target_logit_indices = None
         if self.uses_initial_correction_logits and draft_model.use_draft_vocab:
@@ -978,31 +965,6 @@ class DSparkOfflineRunner:
                 dtype=draft_model.d2t.dtype,
             )
             self._draft_target_logit_indices = (draft_ids + draft_model.d2t).long()
-        self._latest_verifier_pre_lm_hidden = None
-        self._verifier_pre_lm_hook = None
-        if self.uses_verifier_pre_lm_context:
-            verifier_lm_head = target_model.get_output_embeddings()
-            if verifier_lm_head is None:
-                raise RuntimeError("Target model does not expose an output LM head")
-            self._verifier_pre_lm_hook = verifier_lm_head.register_forward_pre_hook(
-                self._capture_verifier_pre_lm_hidden
-            )
-
-    def _capture_verifier_pre_lm_hidden(self, _module, inputs) -> None:
-        if not inputs:
-            raise RuntimeError("Verifier LM head did not receive hidden states")
-        self._latest_verifier_pre_lm_hidden = inputs[0].detach()
-
-    def _require_latest_verifier_pre_lm_hidden(self):
-        hidden = self._latest_verifier_pre_lm_hidden
-        if hidden is None:
-            raise RuntimeError("Verifier pre-LM hidden state was not captured")
-        if hidden.ndim != 3:
-            raise RuntimeError(
-                f"Expected rank-3 verifier pre-LM hidden, got {hidden.shape}"
-            )
-        return hidden
-
     def _extract_context_feature(self, hidden_states):
         return torch.cat(
             [hidden_states[i] for i in self.draft_model.target_layer_ids],
@@ -1038,23 +1000,8 @@ class DSparkOfflineRunner:
         self,
         *,
         initial_output,
-        initial_token,
         **_kwargs,
     ) -> SimpleNamespace:
-        verifier_pre_lm_hidden = None
-        correction_memory = None
-        if self.uses_verifier_pre_lm_context:
-            verifier_pre_lm_hidden = self._require_latest_verifier_pre_lm_hidden()
-        if self.draft_model.config.correction_cross_block_memory:
-            if verifier_pre_lm_hidden is None:
-                raise RuntimeError(
-                    "Cross-block memory requires captured verifier pre-LM hidden"
-                )
-            correction_memory = self.draft_model.update_cross_block_memory(
-                None,
-                verifier_pre_lm_hidden[:, -1, :],
-                initial_token.reshape(-1),
-            )
         correction_previous_logits = None
         if self.uses_initial_correction_logits:
             correction_previous_logits = self._target_logits_to_draft_vocab(
@@ -1064,46 +1011,27 @@ class DSparkOfflineRunner:
             target_hidden_states=self._extract_context_feature(
                 initial_output.hidden_states,
             ),
-            target_pre_lm_hidden_states=verifier_pre_lm_hidden,
-            correction_memory=correction_memory,
             correction_previous_logits=correction_previous_logits,
         )
 
     def _single_anchor_backbone(
         self,
         hidden_states,
-        verifier_pre_lm_hidden,
         input_ids,
         start: int,
     ):
         draft = self.draft_model
         block = int(draft.block_size)
-        pre_lm_length = (
-            None if verifier_pre_lm_hidden is None else verifier_pre_lm_hidden.shape[1]
-        )
-        if hidden_states.shape[1] != start or (
-            verifier_pre_lm_hidden is not None and pre_lm_length != start
-        ):
+        if hidden_states.shape[1] != start:
             raise ValueError(
                 "DSpark context states must contain exactly the prefix before the "
-                "current anchor; got auxiliary/pre-LM lengths "
-                f"{hidden_states.shape[1]}/{pre_lm_length} "
-                f"and start={start}."
+                f"current anchor; got length {hidden_states.shape[1]} and "
+                f"start={start}."
             )
         hidden_states = torch.cat(
             [hidden_states, hidden_states.new_zeros(hidden_states[:, :1, :].shape)],
             dim=1,
         )
-        if verifier_pre_lm_hidden is not None:
-            verifier_pre_lm_hidden = torch.cat(
-                [
-                    verifier_pre_lm_hidden,
-                    verifier_pre_lm_hidden.new_zeros(
-                        verifier_pre_lm_hidden[:, :1, :].shape
-                    ),
-                ],
-                dim=1,
-            )
         total_seq_len = hidden_states.shape[1]
         current_ids = input_ids[:, :total_seq_len]
         anchor_positions = torch.tensor([start], dtype=torch.long, device=self.device)
@@ -1138,15 +1066,12 @@ class DSparkOfflineRunner:
         )
         mask_token_ids[:, 0] = input_ids[:, start]
         noise_embedding = draft.embed_tokens(mask_token_ids)
-        shared_projection, target_layer_states, fc_output = (
-            _prepare_dflash_target_context(draft, hidden_states)
-        )
+        fc_output = _prepare_dflash_target_context(draft, hidden_states)
         noise_embedding = draft._condition_noise_embedding(
             noise_embedding,
             fc_output,
             anchor_positions,
             document_ids,
-            verifier_pre_lm_hidden=verifier_pre_lm_hidden,
         )
         base_position_ids = torch.arange(
             total_seq_len,
@@ -1168,13 +1093,7 @@ class DSparkOfflineRunner:
             )
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=_target_context_for_draft_layer(
-                    draft,
-                    shared_projection=shared_projection,
-                    target_layer_states=target_layer_states,
-                    shared_context=fc_output,
-                    layer_idx=layer_idx,
-                ),
+                target_hidden=fc_output,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
                 use_cache=False,
@@ -1182,11 +1101,21 @@ class DSparkOfflineRunner:
             )
 
         hidden = draft.norm(noise_embedding)
-        # Correction rollout performs its own per-position projection so it can
-        # feed generated tokens (and, in logits mode, final logits) forward.
-        # Markov/plain DSpark consumes this ordinary block-level base projection.
+        # Selector-conditioned Correction needs pure DFlash logits before the
+        # correction pass. LM-head fusion also needs one parallel base projection
+        # so sequential Correction can add only low-rank vocabulary residuals.
+        # With both features disabled, retain the historical per-position path.
+        reuse_base_logits = bool(
+            getattr(draft.config, "correction_lm_head_fusion", False)
+        )
         base_logits = (
-            None if draft.correction_head is not None else draft.lm_head(hidden)
+            None
+            if (
+                draft.correction_head is not None
+                and draft.candidate_selector is None
+                and not reuse_base_logits
+            )
+            else draft.lm_head(hidden)
         )
         return hidden, base_logits
 
@@ -1195,11 +1124,9 @@ class DSparkOfflineRunner:
         base_logits,
         hidden_states,
         first_prev_token_id,
-        block_memory,
         initial_previous_logits,
     ):
         """Sample with native causal Correction rollout."""
-        del base_logits
         draft = self.draft_model
         temperature = float(self.args.temperature)
         draft_ids, final_logits = _run_preprojection_correction_rollout(
@@ -1207,8 +1134,8 @@ class DSparkOfflineRunner:
             hidden_states=hidden_states,
             anchor_token_ids=first_prev_token_id.reshape(-1).long(),
             temperature=temperature,
-            block_memory=block_memory,
             initial_previous_logits=initial_previous_logits,
+            base_logits=base_logits,
         )
 
         # The model returns all block slots.  With sample_from_anchor=False,
@@ -1235,7 +1162,6 @@ class DSparkOfflineRunner:
         base_logits,
         hidden_states,
         first_prev_token_id,
-        block_memory,
         initial_previous_logits=None,
     ):
         draft = self.draft_model
@@ -1244,12 +1170,45 @@ class DSparkOfflineRunner:
                 base_logits,
                 hidden_states,
                 first_prev_token_id,
-                block_memory,
                 initial_previous_logits,
             )
 
         if base_logits is None:
             raise RuntimeError("Markov/plain DSpark evaluation requires base logits")
+        selector_search_mode = getattr(
+            getattr(draft, "config", None),
+            "dflash2_selector_search_mode",
+            "greedy",
+        )
+        if draft.candidate_selector is not None and selector_search_mode == "global":
+            if draft.markov_head is not None:
+                raise RuntimeError(
+                    "Global DFlash2 path search is not compatible with a standalone "
+                    "predecessor-dependent Markov head; use Correction collaboration"
+                )
+            _, _, selected_ids = draft.dflash2_select_path(
+                base_logits,
+                hidden_states,
+                first_prev_token_id.reshape(-1).long(),
+            )
+            first_slot = self.first_draft_slot
+            last_slot = first_slot + self.max_proposal_tokens
+            selected_ids = selected_ids[:, first_slot:last_slot]
+            if selected_ids.shape[1] != self.max_proposal_tokens:
+                raise RuntimeError(
+                    "Global DFlash2 selector returned the wrong proposal length"
+                )
+            # Viterbi is a deterministic block-level proposal. Returning its exact
+            # one-hot q keeps speculative rejection sampling lossless even when the
+            # evaluator's target temperature is non-zero.
+            draft_probs = torch.zeros_like(
+                base_logits[:, first_slot:last_slot], dtype=torch.float32
+            )
+            draft_probs.scatter_(-1, selected_ids.unsqueeze(-1), 1.0)
+            proposed_target_ids = _draft_ids_to_target_ids(
+                draft, [int(token_id) for token_id in selected_ids[0].tolist()]
+            )
+            return proposed_target_ids, draft_probs
         proposed_target_ids: list[int] = []
         draft_probs = []
         prev_token = first_prev_token_id.reshape(1, 1).long()
@@ -1321,7 +1280,6 @@ class DSparkOfflineRunner:
         del position_ids, stop_token_ids
         hidden, base_logits = self._single_anchor_backbone(
             context.target_hidden_states,
-            context.target_pre_lm_hidden_states,
             output_ids,
             start,
         )
@@ -1329,7 +1287,6 @@ class DSparkOfflineRunner:
             base_logits,
             hidden,
             output_ids[:, start],
-            context.correction_memory,
             context.correction_previous_logits,
         )
         verify_input_ids = torch.cat(
@@ -1360,21 +1317,6 @@ class DSparkOfflineRunner:
             [context.target_hidden_states, committed_hidden],
             dim=1,
         )
-        if self.uses_verifier_pre_lm_context:
-            verifier_pre_lm_hidden = self._require_latest_verifier_pre_lm_hidden()
-            committed_pre_lm_hidden = verifier_pre_lm_hidden[
-                :, : verification.accepted_draft_tokens + 1, :
-            ]
-            context.target_pre_lm_hidden_states = torch.cat(
-                [context.target_pre_lm_hidden_states, committed_pre_lm_hidden],
-                dim=1,
-            )
-            if self.draft_model.config.correction_cross_block_memory:
-                context.correction_memory = self.draft_model.update_cross_block_memory(
-                    context.correction_memory,
-                    verifier_pre_lm_hidden[:, verification.accepted_draft_tokens, :],
-                    verification.next_token.reshape(-1),
-                )
         if self.uses_initial_correction_logits:
             context.correction_previous_logits = self._target_logits_to_draft_vocab(
                 verification.target_output.logits[
@@ -1955,21 +1897,12 @@ def run(args: argparse.Namespace) -> None:
     logger.info(
         "Loaded DSpark | block_size=%d sample_from_anchor=%s "
         "max_proposal_tokens=%d sequential_head=%s lm_head_fusion=%s "
-        "dfly_layer_residual=%s heterogeneous_kv=%s dflash2_conv=%s "
-        "dflash2_selector=%s",
+        "dflash2_conv=%s dflash2_selector=%s",
         int(draft_model.block_size),
         bool(draft_config.sample_from_anchor),
         speculative_slots_for_draft(draft_model),
         sequential_head,
         bool(getattr(draft_config, "correction_lm_head_fusion", False)),
-        bool(getattr(draft_config, "dflash_dfly_layer_residual", False)),
-        bool(
-            getattr(
-                draft_config,
-                "dflash_heterogeneous_kv_projections",
-                False,
-            )
-        ),
         bool(getattr(draft_config, "dflash2_dynamic_conv", False)),
         bool(getattr(draft_config, "dflash2_candidate_selector", False)),
     )

@@ -214,10 +214,6 @@ class Trainer:
         self._ssal_curriculum = False
         self._ssal_curriculum_start = 0.1
         self._ssal_curriculum_end = 0.6
-        self._correction_generated_token_curriculum = False
-        self._correction_generated_token_target_ratio = 0.0
-        self._correction_generated_token_warmup = 0.2
-        self._correction_generated_token_ramp = 0.4
         self._curriculum_total_steps: int | None = None
         if kwargs and kwargs.pop("ssal_curriculum", False):
             self._ssal_curriculum = True
@@ -225,19 +221,6 @@ class Trainer:
                 kwargs.pop("ssal_curriculum_start", 0.1)
             )
             self._ssal_curriculum_end = float(kwargs.pop("ssal_curriculum_end", 0.6))
-        if kwargs and kwargs.pop(
-            "correction_generated_token_curriculum", False
-        ):
-            self._correction_generated_token_curriculum = True
-            self._correction_generated_token_target_ratio = float(
-                kwargs.pop("correction_generated_token_target_ratio")
-            )
-            self._correction_generated_token_warmup = float(
-                kwargs.pop("correction_generated_token_warmup", 0.2)
-            )
-            self._correction_generated_token_ramp = float(
-                kwargs.pop("correction_generated_token_ramp", 0.4)
-            )
 
     def _curriculum_decay_weight(self, start: float, end: float) -> float:
         """Return a 1-to-0 linear weight over a training-progress interval."""
@@ -249,36 +232,6 @@ class Trainer:
         if progress >= end:
             return 0.0
         return 1.0 - (progress - start) / (end - start)
-
-    def _curriculum_ramp_weight(self, start: float, end: float) -> float:
-        """Return a 0-to-1 linear weight over a training-progress interval."""
-        if self._curriculum_total_steps is None or self._curriculum_total_steps <= 0:
-            raise RuntimeError("curriculum total steps must be initialized")
-        progress = self.global_step / self._curriculum_total_steps
-        if end <= start:
-            return float(progress >= start)
-        if progress <= start:
-            return 0.0
-        if progress >= end:
-            return 1.0
-        return (progress - start) / (end - start)
-
-    def _current_correction_generated_token_ratio(self) -> float:
-        """Return the scheduled generated-feedback probability for this step."""
-        start = self._correction_generated_token_warmup
-        end = start + self._correction_generated_token_ramp
-        ramp_weight = self._curriculum_ramp_weight(start, end)
-        return self._correction_generated_token_target_ratio * ramp_weight
-
-    def _sample_correction_generated_token_batch(self, ratio: float) -> bool:
-        """Deterministically sample one shared TF/generated path per global step."""
-        if ratio <= 0.0:
-            return False
-        if ratio >= 1.0:
-            return True
-        generator = torch.Generator()
-        generator.manual_seed(self.global_step + 0xD5A9)
-        return bool(torch.rand((), generator=generator).item() < ratio)
 
     def _training_state_path(self, epoch: int) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
@@ -516,10 +469,7 @@ class Trainer:
 
         # Capture full-epoch step count before any resume fast-skip mutation.
         num_steps = len(self.train_loader)
-        if (
-            self._ssal_curriculum
-            or self._correction_generated_token_curriculum
-        ) and self._curriculum_total_steps is None:
+        if self._ssal_curriculum and self._curriculum_total_steps is None:
             self._curriculum_total_steps = self.config.num_epochs * num_steps
 
         # Determine how many batches to skip for mid-epoch resume.
@@ -567,19 +517,6 @@ class Trainer:
                         ssal_weight,
                         device=batch_device,
                         dtype=torch.float32,
-                    )
-                if self._correction_generated_token_curriculum:
-                    generated_ratio = (
-                        self._current_correction_generated_token_ratio()
-                    )
-                    call_kwargs[
-                        "correction_generated_token_curriculum_active"
-                    ] = True
-                    call_kwargs["correction_generated_token_ratio"] = generated_ratio
-                    call_kwargs["correction_use_generated_tokens"] = (
-                        self._sample_correction_generated_token_batch(
-                            generated_ratio
-                        )
                     )
                 _draft_tokens, loss, metrics = self.model(
                     **gpu_batch, **call_kwargs

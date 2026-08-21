@@ -49,27 +49,13 @@ CORRECTION_HEAD_ARGS=()
 CORRECTION_OUTPUT_MODE="hidden"
 CORRECTION_HIDDEN_SIZE=512
 CORRECTION_RANK=256
-# In hidden mode, replace sequential full LM-head projections during rollout
-# with cached rank-to-vocabulary projections. Training remains unchanged.
+# In hidden mode, or logits mode with dual corrected-hidden projection, replace
+# sequential full LM-head projections during rollout with cached low-rank
+# vocabulary projections. Training remains unchanged.
 CORRECTION_LM_HEAD_FUSION_ARGS=(--no-correction-lm-head-fusion)
 CORRECTION_NUM_LAYERS=1
 CORRECTION_NUM_HEADS=8
 CORRECTION_GATE_BIAS=0.0
-
-# ---- Correction MoE -----------------------------------------------------------
-# Conditional Correction capacity. Keep both arrays negative for the exact
-# non-MoE baseline. Set CORRECTION_MOE_ARGS=(--correction-moe) to enable one
-# shared expert plus one Top-1 selected expert. Logits mode fuses both experts
-# at CORRECTION_RANK before its single shared vocabulary projection.
-CORRECTION_MOE_ARGS=(--no-correction-moe)
-CORRECTION_MOE_SHARED_RANK=128
-CORRECTION_MOE_EXPERT_RANK=64
-CORRECTION_MOE_NUM_EXPERTS=4
-CORRECTION_MOE_LOAD_BALANCE_WEIGHT=0.01
-# Set this to (--correction-moe-logit-routing) to additionally feed detached
-# entropy/top-1/margin statistics only to the MoE router and correction gate.
-# It works with both hidden and logits output modes.
-CORRECTION_MOE_LOGIT_ROUTING_ARGS=(--no-correction-moe-logit-routing)
 
 # ---- Representation supervision and recurrence -------------------------------
 # Optional hidden-state supervision and recurrent corrected-hidden feedback.
@@ -77,12 +63,11 @@ CORRECTION_MOE_LOGIT_ROUTING_ARGS=(--no-correction-moe-logit-routing)
 CORRECTION_HIDDEN_AUX_ARGS=(--no-correction-hidden-aux-loss)
 CORRECTION_HIDDEN_AUX_WEIGHT=0.1
 CORRECTION_HIDDEN_FEEDBACK_ARGS=(--no-correction-hidden-feedback)
+# static keeps the Selector path fixed. corrected feeds each Correction token
+# into the next greedy Selector/Correction slot; global only supports static.
+SELECTOR_CORRECTION_FEEDBACK=static
 
-# ---- Cross-block memory and output composition --------------------------------
-# Acceptance-aware cross-block memory. It is trained from verifier-confirmed
-# context and updated only after speculative verification at inference time.
-CORRECTION_CROSS_BLOCK_MEMORY_ARGS=(--no-correction-cross-block-memory)
-CORRECTION_MEMORY_GATE_BIAS=-2.0
+# ---- Output composition --------------------------------------------------------
 # In logits mode, enable this for LMHead(h_DFlash + delta_hidden) + delta_logits.
 CORRECTION_PROJECT_HIDDEN_ARGS=(--no-correction-project-corrected-hidden)
 
@@ -92,12 +77,7 @@ CORRECTION_PROJECT_HIDDEN_ARGS=(--no-correction-project-corrected-hidden)
 CORRECTION_COLLABORATION_ARGS=(--no-correction-with-markov)
 CORRECTION_MARKOV_GATE_BIAS=-2.0
 
-# ---- Feedback curriculum and validation --------------------------------------
-# Teacher forcing remains the baseline at ratio 0. A typical curriculum uses
-# ratio=0.25, warmup=0.2, and ramp=0.4.
-CORRECTION_GENERATED_TOKEN_RATIO=0.0
-CORRECTION_GENERATED_TOKEN_WARMUP=0.2
-CORRECTION_GENERATED_TOKEN_RAMP=0.4
+# ---- Validation ---------------------------------------------------------------
 # Enable only for Correction validation; it adds a self-feedback rollout pass.
 CORRECTION_ROLLOUT_METRICS_ARGS=(--no-correction-rollout-metrics)
 # Hidden mode: enable only when validation-only base change/gain diagnostics are
@@ -123,12 +103,8 @@ SSAL_CURRICULUM_END=0.6
 # ---- DFlash backbone experiments ---------------------------------------------
 # Optional DFlash backbone experiments. All are disabled to preserve the baseline.
 DFLASH_CONTEXT_RESIDUAL_ARGS=(--no-dflash-context-residual)
-DFLASH_VERIFIER_FINAL_RESIDUAL_ARGS=(--no-dflash-verifier-final-residual)
 DFLASH_BLOCK_POSITION_ARGS=(--no-dflash-block-position-embedding)
 DFLASH_GATED_LAYER_FUSION_ARGS=(--no-dflash-gated-layer-fusion)
-# Requires DFLASH_GATED_LAYER_FUSION_ARGS=(--dflash-gated-layer-fusion).
-DFLASH_DFLY_LAYER_RESIDUAL_ARGS=(--no-dflash-dfly-layer-residual)
-DFLASH_HETEROGENEOUS_KV_ARGS=(--no-dflash-heterogeneous-kv-projections)
 # DFlash2 modules can be enabled independently or together. They remain off in
 # this baseline recipe and stack after the existing DFlash/DSpark components.
 DFLASH2_DYNAMIC_CONV_ARGS=(--no-dflash2-dynamic-conv)
@@ -137,7 +113,29 @@ DFLASH2_CONV_GROUP_SIZE=16
 DFLASH2_CANDIDATE_SELECTOR_ARGS=(--no-dflash2-candidate-selector)
 DFLASH2_SELECTOR_RANK=256
 DFLASH2_SELECTOR_TOP_K=16
+# Choose exactly one: greedy or global.
+DFLASH2_SELECTOR_SEARCH_MODE=greedy
 DFLASH2_SELECTOR_LOSS_WEIGHT=1.0
+
+case "$DFLASH2_SELECTOR_SEARCH_MODE" in
+    greedy|global) ;;
+    *)
+        echo "DFLASH2_SELECTOR_SEARCH_MODE must be greedy or global" >&2
+        exit 2
+        ;;
+esac
+
+case "$SELECTOR_CORRECTION_FEEDBACK" in
+    static|corrected) ;;
+    *)
+        echo "SELECTOR_CORRECTION_FEEDBACK must be static or corrected" >&2
+        exit 2
+        ;;
+esac
+if [[ "$SELECTOR_CORRECTION_FEEDBACK" == corrected && "$DFLASH2_SELECTOR_SEARCH_MODE" != greedy ]]; then
+    echo "corrected Selector feedback requires greedy search" >&2
+    exit 2
+fi
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
 VLLM_NPUS="0,1,2,3"
@@ -196,37 +194,25 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --correction-num-layers "$CORRECTION_NUM_LAYERS" \
     --correction-num-heads "$CORRECTION_NUM_HEADS" \
     --correction-gate-bias "$CORRECTION_GATE_BIAS" \
-    "${CORRECTION_MOE_ARGS[@]}" \
-    --correction-moe-shared-rank "$CORRECTION_MOE_SHARED_RANK" \
-    --correction-moe-expert-rank "$CORRECTION_MOE_EXPERT_RANK" \
-    --correction-moe-num-experts "$CORRECTION_MOE_NUM_EXPERTS" \
-    --correction-moe-load-balance-weight "$CORRECTION_MOE_LOAD_BALANCE_WEIGHT" \
-    "${CORRECTION_MOE_LOGIT_ROUTING_ARGS[@]}" \
     "${CORRECTION_HIDDEN_AUX_ARGS[@]}" \
     --correction-hidden-aux-weight "$CORRECTION_HIDDEN_AUX_WEIGHT" \
     "${CORRECTION_HIDDEN_FEEDBACK_ARGS[@]}" \
-    "${CORRECTION_CROSS_BLOCK_MEMORY_ARGS[@]}" \
-    --correction-memory-gate-bias "$CORRECTION_MEMORY_GATE_BIAS" \
+    --selector-correction-feedback "$SELECTOR_CORRECTION_FEEDBACK" \
     "${CORRECTION_PROJECT_HIDDEN_ARGS[@]}" \
     "${CORRECTION_COLLABORATION_ARGS[@]}" \
     --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS" \
-    --correction-generated-token-ratio "$CORRECTION_GENERATED_TOKEN_RATIO" \
-    --correction-generated-token-warmup "$CORRECTION_GENERATED_TOKEN_WARMUP" \
-    --correction-generated-token-ramp "$CORRECTION_GENERATED_TOKEN_RAMP" \
     "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
     "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}" \
     "${DFLASH_CONTEXT_RESIDUAL_ARGS[@]}" \
-    "${DFLASH_VERIFIER_FINAL_RESIDUAL_ARGS[@]}" \
     "${DFLASH_BLOCK_POSITION_ARGS[@]}" \
     "${DFLASH_GATED_LAYER_FUSION_ARGS[@]}" \
-    "${DFLASH_DFLY_LAYER_RESIDUAL_ARGS[@]}" \
-    "${DFLASH_HETEROGENEOUS_KV_ARGS[@]}" \
     "${DFLASH2_DYNAMIC_CONV_ARGS[@]}" \
     --dflash2-conv-kernel-size "$DFLASH2_CONV_KERNEL_SIZE" \
     --dflash2-conv-group-size "$DFLASH2_CONV_GROUP_SIZE" \
     "${DFLASH2_CANDIDATE_SELECTOR_ARGS[@]}" \
     --dflash2-selector-rank "$DFLASH2_SELECTOR_RANK" \
     --dflash2-selector-top-k "$DFLASH2_SELECTOR_TOP_K" \
+    "--dflash2-selector-${DFLASH2_SELECTOR_SEARCH_MODE}" \
     --dflash2-selector-loss-weight "$DFLASH2_SELECTOR_LOSS_WEIGHT" \
     "${CONFIDENCE_HEAD_ARGS[@]}" \
     "${CONFIDENCE_SEQUENTIAL_FEATURE_ARGS[@]}" \

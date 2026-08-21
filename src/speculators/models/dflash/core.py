@@ -112,9 +112,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 Qwen3DFlashDecoderLayer(
                     config.transformer_layer_config,  # type: ignore[arg-type]
                     layer_idx,
-                    heterogeneous_kv_projections=(
-                        config.dflash_heterogeneous_kv_projections
-                    ),
                     dflash2_dynamic_conv=config.dflash2_dynamic_conv,
                     dflash2_conv_kernel_size=config.dflash2_conv_kernel_size,
                     dflash2_conv_group_size=config.dflash2_conv_group_size,
@@ -140,11 +137,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.rotary_emb = Qwen3RotaryEmbedding(config.transformer_layer_config)  # type: ignore[arg-type]
 
         self.dflash_gated_layer_fusion = config.dflash_gated_layer_fusion
-        self.dflash_dfly_layer_residual = config.dflash_dfly_layer_residual
-        if self.dflash_dfly_layer_residual and not self.dflash_gated_layer_fusion:
-            raise ValueError(
-                "dflash_dfly_layer_residual requires dflash_gated_layer_fusion"
-            )
         self.fc = nn.Linear(
             num_target_layers * hidden_size,
             hidden_size,
@@ -168,14 +160,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             self.layer_fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
             self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
 
-        self.dfly_layer_fusion_logits: nn.Parameter | None = None
-        self.dfly_layer_residual_gate: nn.Parameter | None = None
-        if self.dflash_dfly_layer_residual:
-            self.dfly_layer_fusion_logits = nn.Parameter(
-                torch.zeros(num_draft_layers, num_target_layers)
-            )
-            self.dfly_layer_residual_gate = nn.Parameter(torch.zeros(()))
-
         self.hidden_norm = Qwen3RMSNorm(
             hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
@@ -191,14 +175,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         if config.dflash_context_residual:
             self.context_hidden_proj = nn.Linear(hidden_size, hidden_size, bias=False)
             self.context_hidden_gate = nn.Parameter(torch.zeros(()))
-
-        self.verifier_final_hidden_proj: nn.Linear | None = None
-        self.verifier_final_hidden_gate: nn.Parameter | None = None
-        if config.dflash_verifier_final_residual:
-            self.verifier_final_hidden_proj = nn.Linear(
-                hidden_size, hidden_size, bias=False
-            )
-            self.verifier_final_hidden_gate = nn.Parameter(torch.zeros(()))
 
         self.block_position_embedding: nn.Embedding | None = None
         if config.dflash_block_position_embedding:
@@ -225,10 +201,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.post_init()
         if self.layer_fusion_score is not None:
             nn.init.zeros_(self.layer_fusion_score.weight)
-        if self.dfly_layer_fusion_logits is not None:
-            nn.init.zeros_(self.dfly_layer_fusion_logits)
-        if self.dfly_layer_residual_gate is not None:
-            nn.init.zeros_(self.dfly_layer_residual_gate)
         if self.block_position_embedding is not None:
             nn.init.zeros_(self.block_position_embedding.weight)
         for module in self.modules():
@@ -326,19 +298,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
             "dflash_context_residual": kwargs.get("dflash_context_residual", False),
-            "dflash_verifier_final_residual": kwargs.get(
-                "dflash_verifier_final_residual", False
-            ),
             "dflash_block_position_embedding": kwargs.get(
                 "dflash_block_position_embedding", False
             ),
             "dflash_gated_layer_fusion": kwargs.get("dflash_gated_layer_fusion", False),
-            "dflash_dfly_layer_residual": kwargs.get(
-                "dflash_dfly_layer_residual", False
-            ),
-            "dflash_heterogeneous_kv_projections": kwargs.get(
-                "dflash_heterogeneous_kv_projections", False
-            ),
             "dflash2_dynamic_conv": kwargs.get("dflash2_dynamic_conv", False),
             "dflash2_conv_kernel_size": kwargs.get("dflash2_conv_kernel_size", 2),
             "dflash2_conv_group_size": kwargs.get("dflash2_conv_group_size", 16),
@@ -347,6 +310,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ),
             "dflash2_selector_rank": kwargs.get("dflash2_selector_rank", 256),
             "dflash2_selector_top_k": kwargs.get("dflash2_selector_top_k", 16),
+            "dflash2_selector_search_mode": kwargs.get(
+                "dflash2_selector_search_mode", "greedy"
+            ),
             "dflash2_selector_loss_weight": kwargs.get(
                 "dflash2_selector_loss_weight", 1.0
             ),
@@ -505,32 +471,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         shared_projection, _ = self._prepare_target_hidden(hidden_states)
         return self.hidden_norm(shared_projection)
 
-    def _add_dfly_layer_residual(
-        self,
-        shared_projection: torch.Tensor,
-        target_layer_states: torch.Tensor | None,
-        draft_layer_idx: int,
-    ) -> torch.Tensor:
-        """Add DFly's draft-layer-specific target view to the shared projection."""
-        if not self.dflash_dfly_layer_residual:
-            return self.hidden_norm(shared_projection)
-        if (
-            self.dfly_layer_fusion_logits is None
-            or self.dfly_layer_residual_gate is None
-            or target_layer_states is None
-        ):
-            raise RuntimeError("DFly layer residual modules were not initialized")
-
-        weights = torch.softmax(
-            self.dfly_layer_fusion_logits[draft_layer_idx].float(), dim=-1
-        ).to(target_layer_states.dtype)
-        weight_shape = [1] * (target_layer_states.ndim - 2) + [weights.shape[0], 1]
-        layer_residual = (target_layer_states * weights.view(*weight_shape)).sum(dim=-2)
-        return self.hidden_norm(
-            shared_projection
-            + self.dfly_layer_residual_gate.to(layer_residual.dtype) * layer_residual
-        )
-
     def _prepare_missing_checkpoint_weights(self, loading_info: dict) -> None:
         """Safely initialize optional DFlash modules absent from a checkpoint."""
         missing_keys = tuple(loading_info.get("missing_keys", ()))
@@ -546,88 +486,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             fragments=("candidate_selector.",),
             feature_name="the DFlash2 candidate selector",
         )
-
-        if self.dflash_dfly_layer_residual:
-            trained_dfly_fragments = (
-                "dfly_layer_fusion_logits",
-                "layer_fusion_norms",
-                "layer_fusion_score",
-                "layer_fusion_proj",
-                "layer_fusion_gate",
-            )
-            missing_trained_dfly = [
-                key
-                for key in missing_keys
-                if any(fragment in key for fragment in trained_dfly_fragments)
-            ]
-            if missing_trained_dfly:
-                preview = ", ".join(missing_trained_dfly[:_MISSING_KEY_PREVIEW])
-                suffix = (
-                    " ..." if len(missing_trained_dfly) > _MISSING_KEY_PREVIEW else ""
-                )
-                raise RuntimeError(
-                    "The checkpoint enables DFly layer residuals but does not "
-                    f"contain their trained weights: {preview}{suffix}. Do not "
-                    "enable DFly by editing an older checkpoint config."
-                )
-            gate_missing = any(
-                "dfly_layer_residual_gate" in key for key in missing_keys
-            )
-            if gate_missing:
-                if self.dfly_layer_residual_gate is None:
-                    raise RuntimeError("DFly residual gate was not constructed")
-                with torch.no_grad():
-                    # Checkpoints from the original ungated implementation used
-                    # the full residual, so a scale of one preserves them exactly.
-                    self.dfly_layer_residual_gate.fill_(1.0)
-                logger.warning(
-                    "Loaded a legacy ungated DFly checkpoint; initialized its "
-                    "new residual gate to 1 for exact backward compatibility."
-                )
-
-        if self.config.dflash_heterogeneous_kv_projections:
-            copied: list[str] = []
-            for layer_idx, layer in enumerate(self.layers):
-                attention = layer.self_attn
-                for target_name, shared_name in (
-                    ("target_k_proj", "k_proj"),
-                    ("target_v_proj", "v_proj"),
-                ):
-                    target_proj = getattr(attention, target_name, None)
-                    shared_proj = getattr(attention, shared_name, None)
-                    if target_proj is None or shared_proj is None:
-                        raise RuntimeError(
-                            "Heterogeneous K/V is enabled but its projection "
-                            "modules were not constructed"
-                        )
-                    key_fragment = f"layers.{layer_idx}.self_attn.{target_name}."
-                    state_names = tuple(target_proj.state_dict())
-                    missing_state_names = tuple(
-                        name
-                        for name in state_names
-                        if any(
-                            key_fragment in key
-                            and key.endswith(f"{target_name}.{name}")
-                            for key in missing_keys
-                        )
-                    )
-                    if not missing_state_names:
-                        continue
-                    if len(missing_state_names) != len(state_names):
-                        raise RuntimeError(
-                            "Checkpoint contains only part of heterogeneous K/V "
-                            f"projection {layer_idx}.{target_name}; refusing to "
-                            "overwrite its loaded weights."
-                        )
-                    target_proj.load_state_dict(shared_proj.state_dict())
-                    copied.append(f"layer {layer_idx} {target_name}")
-            if copied:
-                logger.warning(
-                    "Checkpoint has no trained heterogeneous K/V weights; copied "
-                    "the loaded shared K/V projections for baseline-equivalent "
-                    "initialization: %s",
-                    ", ".join(copied),
-                )
 
     def _draft_ids_to_verifier(self, draft_ids: torch.Tensor) -> torch.Tensor:
         """Map draft-vocabulary IDs to the verifier vocabulary."""
@@ -682,6 +540,182 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         sparse_logits.scatter_(-1, candidate_ids, candidate_logits)
         return sparse_logits, candidate_ids
 
+    def _dflash2_select_topk_path(
+        self,
+        candidate_ids: torch.Tensor,
+        unary_logits: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Select one block path from fixed DFlash Top-K candidates.
+
+        Greedy mode reproduces the public DFlash2 walk. Global mode streams the
+        block-local K-by-K edge lattice one position at a time and uses Viterbi
+        backtracking to maximize the locally normalized joint path probability.
+        Path selection is intentionally discrete; selector parameters are trained
+        by the teacher-row loss in :meth:`_dflash2_block_outputs`.
+        """
+        if self.candidate_selector is None:
+            raise RuntimeError("DFlash2 candidate selector is not enabled")
+        if candidate_ids.shape != unary_logits.shape:
+            raise ValueError("DFlash2 candidate IDs and unary logits must align")
+        if candidate_ids.shape[:-1] != hidden_blocks.shape[:-1]:
+            raise ValueError("DFlash2 candidates and hidden blocks must align")
+        if anchor_token_ids.shape != (candidate_ids.shape[0],):
+            raise ValueError("DFlash2 path selection requires one anchor per block")
+
+        start_position = 0 if self.config.sample_from_anchor else 1
+        selected_ids = candidate_ids[..., 0].detach().clone()
+        realized_logits = unary_logits.detach().clone()
+        active_candidates = candidate_ids[:, start_position:]
+        if active_candidates.shape[1] == 0:
+            return selected_ids, realized_logits
+
+        active_unary = unary_logits[:, start_position:]
+        active_hidden = hidden_blocks[:, start_position:]
+        search_mode = self.config.dflash2_selector_search_mode
+        with torch.no_grad():
+            if search_mode == "greedy":
+                previous_ids = anchor_token_ids.long()
+                active_selected: list[torch.Tensor] = []
+                active_rows: list[torch.Tensor] = []
+                for position in range(active_candidates.shape[1]):
+                    row = self.candidate_selector(
+                        active_candidates[:, position],
+                        active_unary[:, position],
+                        active_hidden[:, position],
+                        previous_ids,
+                    )
+                    selected_indices = row.argmax(dim=-1, keepdim=True)
+                    selected_draft_ids = (
+                        active_candidates[:, position]
+                        .gather(-1, selected_indices)
+                        .squeeze(-1)
+                    )
+                    active_rows.append(row)
+                    active_selected.append(selected_draft_ids)
+                    previous_ids = self._draft_ids_to_verifier(selected_draft_ids)
+                selected_active = torch.stack(active_selected, dim=1)
+                realized_active = torch.stack(active_rows, dim=1)
+            elif search_mode == "global":
+                # The first predecessor is the anchor. Later predecessor rows are
+                # the verifier IDs corresponding to every prior Top-K candidate.
+                first_row = self.candidate_selector(
+                    active_candidates[:, 0],
+                    active_unary[:, 0],
+                    active_hidden[:, 0],
+                    anchor_token_ids.long(),
+                )
+                # Selector rows define locally normalized conditional
+                # distributions.  Viterbi must therefore add row log-probabilities,
+                # not raw energies whose partition function varies by predecessor.
+                best_scores = torch.log_softmax(first_row.float(), dim=-1)
+                backpointers: list[torch.Tensor] = []
+                for position in range(1, active_candidates.shape[1]):
+                    predecessor_ids = self._draft_ids_to_verifier(
+                        active_candidates[:, position - 1]
+                    )
+                    lattice = self.candidate_selector.score_lattice(
+                        active_candidates[:, position : position + 1],
+                        active_unary[:, position : position + 1],
+                        active_hidden[:, position : position + 1],
+                        predecessor_ids.unsqueeze(1),
+                    )[:, 0]
+                    edge_log_probs = torch.log_softmax(lattice.float(), dim=-1)
+                    path_scores = best_scores.unsqueeze(-1) + edge_log_probs
+                    best_scores, previous_indices = path_scores.max(dim=-2)
+                    backpointers.append(previous_indices)
+
+                active_indices: list[torch.Tensor] = [best_scores.argmax(dim=-1)]
+                for previous_indices in reversed(backpointers):
+                    active_indices.append(
+                        previous_indices.gather(
+                            -1, active_indices[-1].unsqueeze(-1)
+                        ).squeeze(-1)
+                    )
+                active_indices.reverse()
+                selected_indices = torch.stack(active_indices, dim=1)
+                selected_active = active_candidates.gather(
+                    -1, selected_indices.unsqueeze(-1)
+                ).squeeze(-1)
+
+                active_rows = []
+                previous_ids = anchor_token_ids.long()
+                for position in range(active_candidates.shape[1]):
+                    active_rows.append(
+                        self.candidate_selector(
+                            active_candidates[:, position],
+                            active_unary[:, position],
+                            active_hidden[:, position],
+                            previous_ids,
+                        )
+                    )
+                    previous_ids = self._draft_ids_to_verifier(
+                        selected_active[:, position]
+                    )
+                realized_active = torch.stack(active_rows, dim=1)
+            else:
+                raise ValueError(
+                    f"Unsupported DFlash2 selector search mode: {search_mode!r}"
+                )
+
+        selected_ids[:, start_position:] = selected_active
+        realized_logits[:, start_position:] = realized_active
+        return selected_ids, realized_logits
+
+    def dflash2_select_path(
+        self,
+        logits: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Return Top-K IDs, their realized path rows, and selected draft IDs."""
+        if self.candidate_selector is None:
+            raise RuntimeError("DFlash2 candidate selector is not enabled")
+        if logits.shape[:-1] != hidden_blocks.shape[:-1]:
+            raise ValueError("DFlash2 logits and hidden blocks must align")
+        unary_logits, candidate_ids = torch.topk(
+            logits,
+            k=self.candidate_selector.top_k,
+            dim=-1,
+        )
+        selected_ids, realized_logits = self._dflash2_select_topk_path(
+            candidate_ids,
+            unary_logits,
+            hidden_blocks,
+            anchor_token_ids,
+        )
+        return candidate_ids, realized_logits, selected_ids
+
+    def _dflash2_proposal_logits(
+        self,
+        candidate_ids: torch.Tensor,
+        realized_logits: torch.Tensor,
+        selected_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return candidate logits that reproduce the configured path proposal.
+
+        The public greedy walk selects the local argmax of every realized row, so
+        its original logits already describe the proposal. A Viterbi path can
+        deliberately take a locally suboptimal edge to improve later positions;
+        expose that deterministic whole-path decision as a one-hot distribution.
+        """
+        search_mode = getattr(self.config, "dflash2_selector_search_mode", "greedy")
+        if search_mode == "greedy":
+            return realized_logits
+        if search_mode != "global":
+            raise ValueError(
+                f"Unsupported DFlash2 selector search mode: {search_mode!r}"
+            )
+        selected_mask = candidate_ids == selected_ids.unsqueeze(-1)
+        if not selected_mask.any(dim=-1).all():
+            raise RuntimeError("DFlash2 global path selected an ID outside its Top-K")
+        return torch.where(
+            selected_mask,
+            torch.zeros_like(realized_logits),
+            torch.full_like(realized_logits, -torch.inf),
+        )
+
     def _dflash2_block_outputs(
         self,
         logits: torch.Tensor,
@@ -690,8 +724,13 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         anchor_token_ids: torch.Tensor,
         loss_mask: torch.Tensor,
         teacher_previous_token_ids: torch.Tensor,
-        realized_previous_token_ids: torch.Tensor | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
         """Build selector rollout scores and its restricted-Top-K train loss.
 
         The public DFlash2 inference implementation exposes a K-by-K transition
@@ -717,13 +756,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             raise ValueError(
                 "DFlash2 teacher predecessor IDs must align with hidden blocks"
             )
-        if realized_previous_token_ids is not None and (
-            realized_previous_token_ids.shape != (num_blocks, block_size)
-        ):
-            raise ValueError(
-                "DFlash2 realized predecessor IDs must align with hidden blocks"
-            )
-
         logits_blocks = logits.view(num_blocks, block_size, -1)
         target_blocks = targets.view_as(logits_blocks)
         mask_blocks = loss_mask.view(num_blocks, block_size)
@@ -744,50 +776,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             active_hidden,
             teacher_previous_token_ids[:, start_position:],
         )
-
-        if realized_previous_token_ids is not None:
-            # Markov/Correction logits and hidden states depend on their actual
-            # predecessor. Score that realized row directly instead of walking
-            # a counterfactual lattice whose downstream features were not
-            # recomputed for the alternate predecessor.
-            if realized_previous_token_ids is teacher_previous_token_ids:
-                active_realized = teacher_rows.detach()
-            else:
-                with torch.no_grad():
-                    active_realized = self.candidate_selector(
-                        active_candidates,
-                        active_unary,
-                        active_hidden,
-                        realized_previous_token_ids[:, start_position:],
-                    )
-        elif active_candidates.shape[1] == 0:
-            # A reserved-only block has no proposal row to walk.
-            active_realized = active_unary.detach()
-        else:
-            # Pure DFlash features are predecessor-independent, so an exact
-            # greedy walk only needs one K-wide row at a time. It is reporting
-            # only and therefore must not retain another training graph.
-            with torch.no_grad():
-                previous_ids = anchor_token_ids
-                realized_rows: list[torch.Tensor] = []
-                for position in range(active_candidates.shape[1]):
-                    row = self.candidate_selector(
-                        active_candidates[:, position],
-                        active_unary[:, position],
-                        active_hidden[:, position],
-                        previous_ids,
-                    )
-                    realized_rows.append(row)
-                    selected_indices = row.argmax(dim=-1, keepdim=True)
-                    selected_draft_ids = active_candidates[:, position].gather(
-                        -1, selected_indices
-                    ).squeeze(-1)
-                    previous_ids = self._draft_ids_to_verifier(selected_draft_ids)
-                active_realized = torch.stack(realized_rows, dim=1)
-
-        # For reporting only, inactive anchor slots retain the unary Top-K row.
-        realized_logits = unary_logits.detach().clone()
-        realized_logits[:, start_position:] = active_realized
+        selected_ids, realized_logits = self._dflash2_select_topk_path(
+            candidate_ids,
+            unary_logits,
+            hidden_blocks,
+            anchor_token_ids,
+        )
 
         target_topk_logits = active_targets.gather(-1, active_candidates)
         target_topk_probs = torch.softmax(target_topk_logits.float(), dim=-1).detach()
@@ -798,7 +792,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         selector_loss = (selector_loss_per_position * selector_mask).sum() / (
             selector_mask.sum().clamp_min(1.0)
         )
-        return candidate_ids, realized_logits, selector_loss
+        full_teacher_rows = torch.cat(
+            [unary_logits[:, :start_position], teacher_rows],
+            dim=1,
+        )
+        return (
+            candidate_ids,
+            realized_logits,
+            selector_loss,
+            selected_ids,
+            full_teacher_rows,
+        )
 
     def _condition_noise_embedding(
         self,
@@ -806,8 +810,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         fused_context: torch.Tensor,
         anchor_positions: torch.Tensor,
         document_ids: torch.Tensor,
-        *,
-        verifier_pre_lm_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Apply opt-in, inference-safe DFlash block conditioning."""
         if self.block_position_embedding is not None:
@@ -841,37 +843,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             residual = residual * valid_context.to(residual.dtype)
             noise_embedding = noise_embedding + (
                 torch.tanh(self.context_hidden_gate)
-                * residual.to(noise_embedding.dtype)
-            )
-
-        if self.verifier_final_hidden_proj is not None:
-            if self.verifier_final_hidden_gate is None:
-                raise RuntimeError(
-                    "Verifier final-hidden residual gate was not initialized"
-                )
-            if verifier_pre_lm_hidden is None:
-                raise ValueError(
-                    "verifier_pre_lm_hidden is required when the verifier "
-                    "final-hidden residual is enabled"
-                )
-            context_positions = (anchor_positions - 1).clamp_min(0)
-            last_context = verifier_pre_lm_hidden[:, context_positions, :]
-            residual = self.verifier_final_hidden_proj(last_context)
-            residual = residual.repeat_interleave(self.block_size, dim=1)
-
-            anchor_docs = document_ids[:, anchor_positions]
-            context_docs = document_ids[:, context_positions]
-            valid_context = (
-                (anchor_positions.unsqueeze(0) > 0)
-                & (anchor_docs == context_docs)
-                & (anchor_docs != -1)
-            )
-            valid_context = valid_context.repeat_interleave(
-                self.block_size, dim=1
-            ).unsqueeze(-1)
-            residual = residual * valid_context.to(residual.dtype)
-            noise_embedding = noise_embedding + (
-                torch.tanh(self.verifier_final_hidden_gate)
                 * residual.to(noise_embedding.dtype)
             )
 
@@ -926,16 +897,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
             )
 
-        shared_projection, target_layer_states = self._prepare_target_hidden(
-            hidden_states
-        )
-        fc_output = self.hidden_norm(shared_projection)
+        fc_output = self._fuse_target_hidden(hidden_states)
         noise_embedding = self._condition_noise_embedding(
             noise_embedding,
             fc_output,
             anchor_positions,
             document_ids,
-            verifier_pre_lm_hidden=verifier_pre_lm_hidden,
         )
         # shape: [1, total_seq_len, hidden_size]
 
@@ -963,16 +930,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
-            target_hidden = fc_output
-            if self.dflash_dfly_layer_residual:
-                target_hidden = self._add_dfly_layer_residual(
-                    shared_projection,
-                    target_layer_states,
-                    layer_idx,
-                )
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=target_hidden,
+                target_hidden=fc_output,
                 attention_mask=sliding_window_attn_mask
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask,
@@ -1041,7 +1001,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             block_tokens = input_ids[0, anchored_block_indices].view(
                 num_blocks, self.block_size
             )
-            candidate_ids, candidate_logits, selector_loss = (
+            candidate_ids, candidate_logits, selector_loss, selected_ids, _ = (
                 self._dflash2_block_outputs(
                     logits,
                     targets,
@@ -1056,6 +1016,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                         )
                     ),
                 )
+            )
+            candidate_logits = self._dflash2_proposal_logits(
+                candidate_ids,
+                candidate_logits,
+                selected_ids,
             )
             proposal_candidate_ids = candidate_ids.view(
                 1, num_blocks * self.block_size, -1

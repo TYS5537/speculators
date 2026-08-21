@@ -732,17 +732,17 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "sample_from_anchor": "--sample-from-anchor",
     "sliding_window_non_causal": "--sliding-window-non-causal",
     "dflash_context_residual": "--dflash-context-residual",
-    "dflash_verifier_final_residual": "--dflash-verifier-final-residual",
     "dflash_block_position_embedding": "--dflash-block-position-embedding",
     "dflash_gated_layer_fusion": "--dflash-gated-layer-fusion",
-    "dflash_dfly_layer_residual": "--dflash-dfly-layer-residual",
-    "dflash_heterogeneous_kv_projections": ("--dflash-heterogeneous-kv-projections"),
     "dflash2_dynamic_conv": "--dflash2-dynamic-conv",
     "dflash2_conv_kernel_size": "--dflash2-conv-kernel-size",
     "dflash2_conv_group_size": "--dflash2-conv-group-size",
     "dflash2_candidate_selector": "--dflash2-candidate-selector",
     "dflash2_selector_rank": "--dflash2-selector-rank",
     "dflash2_selector_top_k": "--dflash2-selector-top-k",
+    "dflash2_selector_search_mode": (
+        "--dflash2-selector-greedy/--dflash2-selector-global"
+    ),
     "dflash2_selector_loss_weight": "--dflash2-selector-loss-weight",
     "markov_rank": "--markov-rank",
     "markov_head_type": "--markov-head-type",
@@ -754,23 +754,13 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "correction_num_layers": "--correction-num-layers",
     "correction_num_heads": "--correction-num-heads",
     "correction_gate_bias": "--correction-gate-bias",
-    "correction_moe": "--correction-moe",
-    "correction_moe_shared_rank": "--correction-moe-shared-rank",
-    "correction_moe_expert_rank": "--correction-moe-expert-rank",
-    "correction_moe_num_experts": "--correction-moe-num-experts",
-    "correction_moe_load_balance_weight": ("--correction-moe-load-balance-weight"),
-    "correction_moe_logit_routing": "--correction-moe-logit-routing",
     "correction_hidden_aux_loss": "--correction-hidden-aux-loss",
     "correction_hidden_aux_weight": "--correction-hidden-aux-weight",
     "correction_hidden_feedback": "--correction-hidden-feedback",
-    "correction_cross_block_memory": "--correction-cross-block-memory",
-    "correction_memory_gate_bias": "--correction-memory-gate-bias",
+    "selector_correction_feedback": "--selector-correction-feedback",
     "correction_project_corrected_hidden": ("--correction-project-corrected-hidden"),
     "correction_with_markov": "--correction-with-markov",
     "correction_markov_gate_bias": "--correction-markov-gate-bias",
-    "correction_generated_token_ratio": "--correction-generated-token-ratio",
-    "correction_generated_token_warmup": "--correction-generated-token-warmup",
-    "correction_generated_token_ramp": "--correction-generated-token-ramp",
     "correction_rollout_metrics": "--correction-rollout-metrics",
     "correction_base_diagnostics": "--correction-base-diagnostics",
     "enable_confidence_head": "--enable-confidence-head",
@@ -780,15 +770,12 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
 
 PRETRAINED_RUNTIME_CONFIG_FIELDS = {
     "correction_lm_head_fusion",
-    "correction_moe_load_balance_weight",
     "correction_hidden_aux_weight",
-    "correction_generated_token_ratio",
-    "correction_generated_token_warmup",
-    "correction_generated_token_ramp",
     "correction_rollout_metrics",
     "correction_base_diagnostics",
     "confidence_detach_features",
     "dflash2_selector_loss_weight",
+    "dflash2_selector_search_mode",
 }
 
 
@@ -1260,15 +1247,6 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--dflash-verifier-final-residual",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "DFlash/DSpark: inject the last inference-available verifier "
-            "final/pre-LM hidden into each draft block (default: disabled)."
-        ),
-    )
-    parser.add_argument(
         "--dflash-block-position-embedding",
         action=argparse.BooleanOptionalAction,
         default=False,
@@ -1284,25 +1262,6 @@ def parse_args():
         help=(
             "DFlash/DSpark: use normalized per-token gated auxiliary-layer fusion "
             "(default: disabled)."
-        ),
-    )
-    parser.add_argument(
-        "--dflash-dfly-layer-residual",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "DFlash/DSpark: add a DFly-style per-draft-layer residual to the "
-            "existing token-adaptive gated fusion; requires "
-            "--dflash-gated-layer-fusion (default: disabled)."
-        ),
-    )
-    parser.add_argument(
-        "--dflash-heterogeneous-kv-projections",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "DFlash/DSpark: use separate target-context and draft/noise K/V "
-            "projections (default: disabled)."
         ),
     )
     parser.add_argument(
@@ -1347,6 +1306,25 @@ def parse_args():
         default=16,
         help="DFlash2 candidate-selector Top-K width (default: 16).",
     )
+    selector_search_group = parser.add_mutually_exclusive_group()
+    selector_search_group.add_argument(
+        "--dflash2-selector-greedy",
+        dest="dflash2_selector_search_mode",
+        action="store_const",
+        const="greedy",
+        help="Use the original sequential greedy DFlash2 selector walk (default).",
+    )
+    selector_search_group.add_argument(
+        "--dflash2-selector-global",
+        dest="dflash2_selector_search_mode",
+        action="store_const",
+        const="global",
+        help=(
+            "Use global Viterbi search over locally normalized probabilities in "
+            "the block-local Top-K selector lattice."
+        ),
+    )
+    parser.set_defaults(dflash2_selector_search_mode="greedy")
     parser.add_argument(
         "--dflash2-selector-loss-weight",
         type=float,
@@ -1404,9 +1382,10 @@ def parse_args():
         action=argparse.BooleanOptionalAction,
         default=False,
         help=(
-            "DSpark hidden Correction: during no-grad rollout, fuse its low-rank "
-            "output weights with the LM head and avoid per-slot full hidden-to-vocab "
-            "projections (default: disabled)."
+            "DSpark Correction: during no-grad rollout, project the DFlash block "
+            "once and fuse low-rank hidden residuals with the LM head. Supports "
+            "hidden mode and logits mode with corrected-hidden projection "
+            "(default: disabled)."
         ),
     )
     parser.add_argument(
@@ -1426,50 +1405,6 @@ def parse_args():
         type=float,
         default=0.0,
         help="DSpark initial correction residual-gate bias (default: 0).",
-    )
-    parser.add_argument(
-        "--correction-moe",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "DSpark Correction: use one shared low-rank expert plus a Top-1 "
-            "selected expert; logits mode shares one final vocabulary projection "
-            "across experts (default: disabled)."
-        ),
-    )
-    parser.add_argument(
-        "--correction-moe-shared-rank",
-        type=int,
-        default=128,
-        help="DSpark Correction shared-expert rank (default: 128).",
-    )
-    parser.add_argument(
-        "--correction-moe-expert-rank",
-        type=int,
-        default=64,
-        help="DSpark Correction selected-expert rank (default: 64).",
-    )
-    parser.add_argument(
-        "--correction-moe-num-experts",
-        type=int,
-        default=4,
-        help="DSpark Correction selected-expert count (default: 4).",
-    )
-    parser.add_argument(
-        "--correction-moe-load-balance-weight",
-        type=float,
-        default=0.01,
-        help="DSpark Correction router balance-loss weight (default: 0.01).",
-    )
-    parser.add_argument(
-        "--correction-moe-logit-routing",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help=(
-            "DSpark: condition only the Correction MoE router and gate on "
-            "detached previous-logit uncertainty statistics "
-            "(default: disabled)."
-        ),
     )
     parser.add_argument(
         "--correction-hidden-aux-loss",
@@ -1496,19 +1431,13 @@ def parse_args():
         ),
     )
     parser.add_argument(
-        "--correction-cross-block-memory",
-        action=argparse.BooleanOptionalAction,
-        default=False,
+        "--selector-correction-feedback",
+        choices=("static", "corrected"),
+        default="static",
         help=(
-            "DSpark: carry a verifier-confirmed gated residual memory between "
-            "Correction blocks (default: disabled)."
+            "Selector-to-Correction token feedback: static keeps the selected path; "
+            "corrected feeds each Correction token into the next greedy slot."
         ),
-    )
-    parser.add_argument(
-        "--correction-memory-gate-bias",
-        type=float,
-        default=-2.0,
-        help="DSpark initial cross-block memory update-gate bias (default: -2.0).",
     )
     parser.add_argument(
         "--correction-project-corrected-hidden",
@@ -1534,33 +1463,6 @@ def parse_args():
         type=float,
         default=-2.0,
         help="DSpark initial collaboration gate bias (default: -2.0).",
-    )
-    parser.add_argument(
-        "--correction-generated-token-ratio",
-        type=float,
-        default=0.0,
-        help=(
-            "DSpark: target fraction of training steps using generated-token "
-            "feedback instead of teacher forcing (default: 0)."
-        ),
-    )
-    parser.add_argument(
-        "--correction-generated-token-warmup",
-        type=float,
-        default=0.2,
-        help=(
-            "DSpark: initial training fraction kept at zero generated-token ratio "
-            "(default: 0.2)."
-        ),
-    )
-    parser.add_argument(
-        "--correction-generated-token-ramp",
-        type=float,
-        default=0.4,
-        help=(
-            "DSpark: training fraction used to ramp to the target generated-token "
-            "ratio (default: 0.4)."
-        ),
     )
     parser.add_argument(
         "--correction-rollout-metrics",
@@ -1862,31 +1764,18 @@ def parse_args():
             parser.error(
                 "--correction-lm-head-fusion requires --enable-correction-head"
             )
-        if args.correction_output_mode != "hidden":
-            parser.error(
-                "--correction-lm-head-fusion requires --correction-output-mode=hidden"
-            )
-    if args.correction_moe:
-        if not args.enable_correction_head and not args.from_pretrained:
-            parser.error("--correction-moe requires --enable-correction-head")
         if (
-            min(
-                args.correction_moe_shared_rank,
-                args.correction_moe_expert_rank,
-                args.correction_moe_num_experts,
-            )
-            <= 0
+            args.correction_output_mode == "logits"
+            and not args.correction_project_corrected_hidden
         ):
-            parser.error("Correction MoE ranks and expert count must be > 0")
-        if args.correction_moe_load_balance_weight < 0.0:
-            parser.error("--correction-moe-load-balance-weight must be >= 0")
-    elif args.correction_moe_logit_routing and not args.from_pretrained:
-        parser.error("--correction-moe-logit-routing requires --correction-moe")
+            parser.error(
+                "Logits --correction-lm-head-fusion requires "
+                "--correction-project-corrected-hidden"
+            )
     if (
         (
             args.correction_hidden_aux_loss
             or args.correction_hidden_feedback
-            or args.correction_cross_block_memory
             or args.correction_project_corrected_hidden
         )
         and not args.enable_correction_head
@@ -1906,29 +1795,6 @@ def parse_args():
             "--correction-project-corrected-hidden requires "
             "--correction-output-mode=logits"
         )
-    if (
-        args.correction_generated_token_ratio > 0.0
-        and not args.enable_correction_head
-        and not args.from_pretrained
-    ):
-        parser.error(
-            "--correction-generated-token-ratio > 0 requires --enable-correction-head"
-        )
-    if not 0.0 <= args.correction_generated_token_ratio <= 1.0:
-        parser.error("--correction-generated-token-ratio must be in [0, 1]")
-    if not 0.0 <= args.correction_generated_token_warmup <= 1.0:
-        parser.error("--correction-generated-token-warmup must be in [0, 1]")
-    if not 0.0 <= args.correction_generated_token_ramp <= 1.0:
-        parser.error("--correction-generated-token-ramp must be in [0, 1]")
-    if (
-        args.correction_generated_token_warmup + args.correction_generated_token_ramp
-        > 1.0
-        and not args.from_pretrained
-    ):
-        parser.error(
-            "--correction-generated-token-warmup + "
-            "--correction-generated-token-ramp must be <= 1"
-        )
     if args.correction_with_markov:
         if not args.enable_correction_head and not args.from_pretrained:
             parser.error("--correction-with-markov requires --enable-correction-head")
@@ -1938,26 +1804,26 @@ def parse_args():
             parser.error(
                 "--correction-with-markov supports only vanilla or gated Markov heads"
             )
+    if args.selector_correction_feedback == "corrected" and not args.from_pretrained:
+        if not args.enable_correction_head or not args.dflash2_candidate_selector:
+            parser.error(
+                "--selector-correction-feedback=corrected requires Correction and "
+                "the DFlash2 candidate selector"
+            )
+        if args.dflash2_selector_search_mode != "greedy":
+            parser.error(
+                "--selector-correction-feedback=corrected requires "
+                "--dflash2-selector-greedy"
+            )
     if (
         args.dflash_context_residual
-        or args.dflash_verifier_final_residual
         or args.dflash_block_position_embedding
         or args.dflash_gated_layer_fusion
-        or args.dflash_dfly_layer_residual
-        or args.dflash_heterogeneous_kv_projections
         or args.dflash2_dynamic_conv
         or args.dflash2_candidate_selector
     ) and args.speculator_type not in ("dflash", "dspark"):
         parser.error(
             "DFlash backbone feature flags are only valid for DFlash or DSpark"
-        )
-    if (
-        args.dflash_dfly_layer_residual
-        and not args.dflash_gated_layer_fusion
-        and not args.from_pretrained
-    ):
-        parser.error(
-            "--dflash-dfly-layer-residual requires --dflash-gated-layer-fusion"
         )
     if args.dflash2_conv_kernel_size <= 0:
         parser.error("--dflash2-conv-kernel-size must be > 0")
