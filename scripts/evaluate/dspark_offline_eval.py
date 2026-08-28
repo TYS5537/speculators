@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline DSpark evaluation on JSONL datasets.
+"""Offline DSpark/DFlash2 evaluation on JSONL datasets.
 
 This evaluator intentionally mirrors the training-time DSpark alignment in this
 repository.  In particular, DSpark defaults to ``sample_from_anchor=True``:
@@ -951,7 +951,7 @@ class DSparkOfflineRunner:
             "hidden",
         )
         self.uses_initial_correction_logits = bool(
-            draft_model.correction_head is not None
+            getattr(draft_model, "correction_head", None) is not None
             and not self.sample_from_anchor
             and correction_output_mode == "logits"
         )
@@ -1024,7 +1024,7 @@ class DSparkOfflineRunner:
         block = int(draft.block_size)
         if hidden_states.shape[1] != start:
             raise ValueError(
-                "DSpark context states must contain exactly the prefix before the "
+                "Draft context states must contain exactly the prefix before the "
                 f"current anchor; got length {hidden_states.shape[1]} and "
                 f"start={start}."
             )
@@ -1108,11 +1108,13 @@ class DSparkOfflineRunner:
         reuse_base_logits = bool(
             getattr(draft.config, "correction_lm_head_fusion", False)
         )
+        correction_head = getattr(draft, "correction_head", None)
+        candidate_selector = getattr(draft, "candidate_selector", None)
         base_logits = (
             None
             if (
-                draft.correction_head is not None
-                and draft.candidate_selector is None
+                correction_head is not None
+                and candidate_selector is None
                 and not reuse_base_logits
             )
             else draft.lm_head(hidden)
@@ -1165,7 +1167,10 @@ class DSparkOfflineRunner:
         initial_previous_logits=None,
     ):
         draft = self.draft_model
-        if draft.correction_head is not None:
+        correction_head = getattr(draft, "correction_head", None)
+        candidate_selector = getattr(draft, "candidate_selector", None)
+        markov_head = getattr(draft, "markov_head", None)
+        if correction_head is not None:
             return self._sample_correction_tokens(
                 base_logits,
                 hidden_states,
@@ -1174,14 +1179,16 @@ class DSparkOfflineRunner:
             )
 
         if base_logits is None:
-            raise RuntimeError("Markov/plain DSpark evaluation requires base logits")
+            raise RuntimeError(
+                "Sequential/plain draft evaluation requires base logits"
+            )
         selector_search_mode = getattr(
             getattr(draft, "config", None),
             "dflash2_selector_search_mode",
             "greedy",
         )
-        if draft.candidate_selector is not None and selector_search_mode == "global":
-            if draft.markov_head is not None:
+        if candidate_selector is not None and selector_search_mode == "global":
+            if markov_head is not None:
                 raise RuntimeError(
                     "Global DFlash2 path search is not compatible with a standalone "
                     "predecessor-dependent Markov head; use Correction collaboration"
@@ -1216,12 +1223,12 @@ class DSparkOfflineRunner:
         for token_idx in range(self.max_proposal_tokens):
             slot = self.first_draft_slot + token_idx
             logits = base_logits[:, slot : slot + 1, :]
-            if draft.markov_head is not None:
-                logits = logits + draft.markov_head.block_bias(
+            if markov_head is not None:
+                logits = logits + markov_head.block_bias(
                     prev_token_ids=prev_token,
                     hidden_states=hidden_states[:, slot : slot + 1, :],
                 )
-            if draft.candidate_selector is not None:
+            if candidate_selector is not None:
                 candidate_ids, candidate_logits = draft.dflash2_select_candidates(
                     logits,
                     hidden_states[:, slot : slot + 1, :],
@@ -1837,6 +1844,7 @@ def run(args: argparse.Namespace) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
     from transformers import DynamicCache as DynamicCacheClass  # noqa: PLC0415
 
+    from speculators.models.dflash2.core import DFlash2DraftModel  # noqa: PLC0415
     from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
 
     torch = torch_module
@@ -1859,7 +1867,21 @@ def run(args: argparse.Namespace) -> None:
         .eval()
     )
 
-    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    draft_config_dict, _ = DSparkDraftModel.config_class.get_config_dict(
+        args.draft_model
+    )
+    draft_type = str(draft_config_dict.get("speculators_model_type", "dspark"))
+    if draft_type == "dflash2":
+        draft_model_class = DFlash2DraftModel
+    elif draft_type == "dspark":
+        draft_model_class = DSparkDraftModel
+    else:
+        raise ValueError(
+            "This offline evaluator supports DSpark and standalone DFlash2 "
+            f"checkpoints, got speculators_model_type={draft_type!r}."
+        )
+
+    draft_config = draft_model_class.config_class.from_pretrained(args.draft_model)
     sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
     if sample_from_anchor is not None:
         draft_config.sample_from_anchor = sample_from_anchor
@@ -1871,7 +1893,7 @@ def run(args: argparse.Namespace) -> None:
         d2t_path=args.d2t_path,
         t2d_path=args.t2d_path,
     )
-    draft_model = DSparkDraftModel.from_pretrained(
+    draft_model = draft_model_class.from_pretrained(
         args.draft_model,
         config=draft_config,
         d2t=d2t,
@@ -1879,7 +1901,10 @@ def run(args: argparse.Namespace) -> None:
     )
     draft_model = draft_model.to(device).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
-    if draft_model.correction_head is not None:
+    correction_head = getattr(draft_model, "correction_head", None)
+    markov_head = getattr(draft_model, "markov_head", None)
+    candidate_selector = getattr(draft_model, "candidate_selector", None)
+    if correction_head is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
                 "Loaded checkpoint does not use the native causal CorrectionHead"
@@ -1887,28 +1912,36 @@ def run(args: argparse.Namespace) -> None:
         sequential_head = (
             f"correction:{draft_config.correction_output_mode}"
             f"+markov:{draft_config.markov_head_type}"
-            if draft_model.markov_head is not None
+            if markov_head is not None
             else f"correction:{draft_config.correction_output_mode}"
         )
-    elif draft_model.markov_head is not None:
+    elif markov_head is not None:
         sequential_head = f"markov:{draft_config.markov_head_type}"
     else:
         sequential_head = "none"
     logger.info(
-        "Loaded DSpark | block_size=%d sample_from_anchor=%s "
+        "Loaded %s | block_size=%d sample_from_anchor=%s "
         "max_proposal_tokens=%d sequential_head=%s lm_head_fusion=%s "
         "dflash2_conv=%s dflash2_selector=%s",
+        draft_type,
         int(draft_model.block_size),
         bool(draft_config.sample_from_anchor),
         speculative_slots_for_draft(draft_model),
         sequential_head,
         bool(getattr(draft_config, "correction_lm_head_fusion", False)),
-        bool(getattr(draft_config, "dflash2_dynamic_conv", False)),
-        bool(getattr(draft_config, "dflash2_candidate_selector", False)),
+        bool(
+            draft_type == "dflash2"
+            or getattr(draft_config, "dflash2_dynamic_conv", False)
+        ),
+        bool(
+            candidate_selector is not None
+            or getattr(draft_config, "dflash2_candidate_selector", False)
+        ),
     )
     logger.info(
-        "DSpark implementation: %s",
-        sys.modules[DSparkDraftModel.__module__].__file__,
+        "%s implementation: %s",
+        draft_type,
+        sys.modules[draft_model_class.__module__].__file__,
     )
 
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
@@ -1989,7 +2022,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Also run verifier-only autoregressive decoding and report measured "
-            "DSpark output-throughput speedup."
+            "draft-model output-throughput speedup."
         ),
     )
     parser.add_argument(

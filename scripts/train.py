@@ -579,6 +579,17 @@ def main(args: argparse.Namespace):  # noqa: C901
         # transformer_layer_config is resolved later in build_draft_model.
         d2t, t2d, draft_vocab_size = None, None, None
         args.mask_token_id = None
+    elif args.speculator_type == "dflash2":
+        if args.draft_vocab_size is not None or args.d2t_path or args.t2d_path:
+            raise ValueError(
+                "Standalone DFlash2 requires the full verifier vocabulary; omit "
+                "--draft-vocab-size, --d2t-path, and --t2d-path."
+            )
+        # Do not auto-load d2t.npy/t2d.npy that may coexist with the shared
+        # DSpark dataset directory. DFlash2's public serving contract selects
+        # candidates before any vocabulary mapping.
+        verifier_config = get_verifier_config(args.verifier_name_or_path)
+        d2t, t2d, draft_vocab_size = None, None, verifier_config.vocab_size
     else:
         d2t, t2d, draft_vocab_size = parse_vocab_mappings(args)
 
@@ -744,6 +755,10 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
         "--dflash2-selector-greedy/--dflash2-selector-global"
     ),
     "dflash2_selector_loss_weight": "--dflash2-selector-loss-weight",
+    "conv_kernel_size": "--conv-kernel-size",
+    "conv_group_size": "--conv-group-size",
+    "selector_rank": "--selector-rank",
+    "selector_top_k": "--selector-top-k",
     "markov_rank": "--markov-rank",
     "markov_head_type": "--markov-head-type",
     "enable_correction_head": "--enable-correction-head",
@@ -1331,6 +1346,38 @@ def parse_args():
         default=1.0,
         help="Weight of the DFlash2 restricted-Top-K selector loss (default: 1.0).",
     )
+    # Standalone upstream DFlash2 arguments. These are deliberately separate
+    # from this branch's historical opt-in DFlash/DSpark DFlash2-like flags.
+    parser.add_argument(
+        "--conv-kernel-size",
+        type=int,
+        default=2,
+        help="Standalone DFlash2 causal convolution taps (default: 2).",
+    )
+    parser.add_argument(
+        "--conv-group-size",
+        type=int,
+        default=16,
+        help="Standalone DFlash2 channels per convolution group (default: 16).",
+    )
+    parser.add_argument(
+        "--selector-rank",
+        type=int,
+        default=256,
+        help="Standalone DFlash2 selector rank (default: 256).",
+    )
+    parser.add_argument(
+        "--selector-top-k",
+        type=int,
+        default=16,
+        help="Standalone DFlash2 unary candidate count (default: 16).",
+    )
+    parser.add_argument(
+        "--selector-loss-alpha",
+        type=float,
+        default=1.0,
+        help="Standalone DFlash2 K-way selector CE weight (default: 1.0).",
+    )
     # DSpark-specific arguments (sequential correction + confidence head).
     parser.add_argument(
         "--markov-rank",
@@ -1723,6 +1770,32 @@ def parse_args():
             args.loss_fn = DSPARK_PAPER_LOSS_FN
         if "num_layers" not in dspark_provided:
             args.num_layers = DSPARK_PAPER_NUM_LAYERS
+    elif args.speculator_type == "dflash2":
+        if "num_layers" not in dspark_provided:
+            args.num_layers = 5
+        if "block_size" not in dspark_provided:
+            args.block_size = 8
+        if args.sample_from_anchor is True:
+            parser.error("Standalone DFlash2 requires --no-sample-from-anchor")
+        if args.sample_from_anchor is None:
+            args.sample_from_anchor = False
+        # The standalone model owns these modules. Reject this branch's older
+        # opt-in variants instead of silently stacking duplicate implementations.
+        if args.dflash2_dynamic_conv or args.dflash2_candidate_selector:
+            parser.error(
+                "--speculator-type dflash2 already includes upstream Conv and "
+                "Selector; do not pass --dflash2-dynamic-conv or "
+                "--dflash2-candidate-selector"
+            )
+        if (
+            args.dflash_context_residual
+            or args.dflash_block_position_embedding
+            or args.dflash_gated_layer_fusion
+        ):
+            parser.error(
+                "Standalone DFlash2 does not stack the custom DFlash residual/"
+                "fusion experiments"
+            )
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:
@@ -1835,6 +1908,15 @@ def parse_args():
         parser.error("--dflash2-selector-top-k must be > 0")
     if args.dflash2_selector_loss_weight < 0.0:
         parser.error("--dflash2-selector-loss-weight must be >= 0")
+    if min(
+        args.conv_kernel_size,
+        args.conv_group_size,
+        args.selector_rank,
+        args.selector_top_k,
+    ) <= 0:
+        parser.error("Standalone DFlash2 Conv/Selector dimensions must be > 0")
+    if args.selector_loss_alpha < 0.0:
+        parser.error("--selector-loss-alpha must be >= 0")
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":
             parser.error("--per-position-loss-weight=dpace requires --loss-fn=ce")

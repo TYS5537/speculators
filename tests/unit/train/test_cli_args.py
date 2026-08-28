@@ -4,6 +4,7 @@ import pytest
 
 from scripts.train import parse_args
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dflash2.core import DFlash2DraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.metrics import ce_loss, kl_div_loss, tv_loss_fused_or_eager
@@ -133,6 +134,29 @@ def test_dspark_defaults_match_paper_weighting(monkeypatch):
     assert val_kw["confidence_head_alpha"] == 1.0
     assert train_kw["confidence_loss_weighting"] == "match-draft"
     assert val_kw["confidence_loss_weighting"] == "match-draft"
+
+
+def test_standalone_dflash2_defaults_match_upstream_contract(monkeypatch):
+    args = _parse(monkeypatch, ["--speculator-type", "dflash2"])
+    assert args.block_size == 8
+    assert args.num_layers == 5
+    assert args.sample_from_anchor is False
+    assert args.conv_kernel_size == 2
+    assert args.conv_group_size == 16
+    assert args.selector_rank == 256
+    assert args.selector_top_k == 16
+    assert args.selector_loss_alpha == 1.0
+    train_kw, val_kw = DFlash2DraftModel.get_trainer_kwargs(**vars(args))
+    assert train_kw["selector_loss_alpha"] == 1.0
+    assert val_kw["selector_loss_alpha"] == 1.0
+
+
+def test_standalone_dflash2_rejects_anchor_sampling(monkeypatch):
+    with pytest.raises(SystemExit):
+        _parse(
+            monkeypatch,
+            ["--speculator-type", "dflash2", "--sample-from-anchor"],
+        )
 
 
 def test_dspark_explicit_recipe_overrides_win(monkeypatch):

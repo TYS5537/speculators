@@ -206,6 +206,23 @@ def test_no_sample_from_anchor_rejects_zero_proposal_block():
         module.speculative_slots_for_draft(draft)
 
 
+def test_dspark_and_dflash2_use_the_same_seven_token_proposal_budget():
+    module = _load_module()
+    dspark = SimpleNamespace(
+        block_size=7,
+        config=SimpleNamespace(sample_from_anchor=True),
+    )
+    dflash2 = SimpleNamespace(
+        block_size=8,
+        config=SimpleNamespace(sample_from_anchor=False),
+    )
+
+    assert module.speculative_slots_for_draft(dspark) == 7
+    assert module.speculative_slots_for_draft(dflash2) == 7
+    assert module.first_draft_slot_for_draft(dspark) == 0
+    assert module.first_draft_slot_for_draft(dflash2) == 1
+
+
 def test_detects_preprojection_correction():
     module = _load_module()
 

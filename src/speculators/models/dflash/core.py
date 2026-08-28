@@ -80,6 +80,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     t2d: torch.Tensor | None
     d2t: torch.Tensor | None
 
+    def _make_decoder_layer(
+        self, config: DFlashSpeculatorConfig, layer_idx: int
+    ) -> nn.Module:
+        """Build one decoder layer without changing existing DFlash defaults.
+
+        Standalone DFlash-family variants can override this factory while the
+        existing opt-in DFlash/DSpark convolution flags keep their current path.
+        """
+        return Qwen3DFlashDecoderLayer(
+            config.transformer_layer_config,  # type: ignore[arg-type]
+            layer_idx,
+            dflash2_dynamic_conv=config.dflash2_dynamic_conv,
+            dflash2_conv_kernel_size=config.dflash2_conv_kernel_size,
+            dflash2_conv_group_size=config.dflash2_conv_group_size,
+            block_size=config.block_size,
+        )
+
     def __init__(
         self,
         config: DFlashSpeculatorConfig,
@@ -109,14 +126,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         self.block_size = config.block_size
         self.layers = nn.ModuleList(
             [
-                Qwen3DFlashDecoderLayer(
-                    config.transformer_layer_config,  # type: ignore[arg-type]
-                    layer_idx,
-                    dflash2_dynamic_conv=config.dflash2_dynamic_conv,
-                    dflash2_conv_kernel_size=config.dflash2_conv_kernel_size,
-                    dflash2_conv_group_size=config.dflash2_conv_group_size,
-                    block_size=config.block_size,
-                )
+                self._make_decoder_layer(config, layer_idx)
                 for layer_idx in range(num_draft_layers)
             ]
         )
