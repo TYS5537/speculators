@@ -717,6 +717,19 @@ def verify_draft_tokens(
             effective_proposal_length = accepted_draft_tokens
             terminated_by_stop_token = True
 
+    # A verifier call still scores the whole proposal block, but positions after
+    # the first accepted stop token are not part of the effective proposal.  Keep
+    # the probability diagnostics aligned with ``effective_proposal_length`` so
+    # per-position aggregation uses the same EOS-truncated denominator as the
+    # accepted/proposed token counters.
+    if effective_proposal_length < draft_token_count:
+        if accept_probs is not None:
+            accept_probs = accept_probs[:, :effective_proposal_length]
+        if support_accept_rates is not None:
+            support_accept_rates = support_accept_rates[
+                :, :effective_proposal_length
+            ]
+
     if 0 < draft_token_count and accepted_draft_tokens < draft_token_count:
         next_token = sample_residual(
             target_probs[:, accepted_draft_tokens, :],
