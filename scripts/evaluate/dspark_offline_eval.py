@@ -717,6 +717,13 @@ def verify_draft_tokens(
             effective_proposal_length = accepted_draft_tokens
             terminated_by_stop_token = True
 
+    # Keep probability diagnostics aligned with the EOS-truncated proposal.
+    if effective_proposal_length < draft_token_count:
+        if accept_probs is not None:
+            accept_probs = accept_probs[:, :effective_proposal_length]
+        if support_accept_rates is not None:
+            support_accept_rates = support_accept_rates[:, :effective_proposal_length]
+
     if 0 < draft_token_count and accepted_draft_tokens < draft_token_count:
         next_token = sample_residual(
             target_probs[:, accepted_draft_tokens, :],

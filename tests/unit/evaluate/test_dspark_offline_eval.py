@@ -206,6 +206,45 @@ def test_no_sample_from_anchor_rejects_zero_proposal_block():
         module.speculative_slots_for_draft(draft)
 
 
+def test_stop_token_truncates_probability_stats_with_effective_proposal():
+    module = _load_module()
+
+    class TargetModel:
+        @staticmethod
+        def __call__(**_kwargs):
+            logits = torch.full((1, 4, 5), -10.0)
+            logits[0, 0, 1] = 10.0
+            logits[0, 1, 2] = 10.0
+            logits[0, 2, 3] = 10.0
+            logits[0, 3, 4] = 10.0
+            return SimpleNamespace(logits=logits)
+
+    draft_ids = torch.tensor([[1, 2, 3]])
+    proposal = module.DraftProposal(
+        draft_token_count=3,
+        verify_input_ids=torch.tensor([[0, 1, 2, 3]]),
+        draft_probs=torch.nn.functional.one_hot(draft_ids, num_classes=5).float(),
+    )
+
+    result = module.verify_draft_tokens(
+        target_model=TargetModel(),
+        proposal=proposal,
+        position_ids=torch.arange(4).unsqueeze(0),
+        start=0,
+        past_key_values_target=None,
+        temperature=0.0,
+        max_proposal_tokens=3,
+        current_token_ids=torch.tensor([[0]]),
+        stop_token_ids=[2],
+    )
+
+    assert result.terminated_by_stop_token
+    assert result.accepted_draft_tokens == 2
+    assert result.effective_proposal_length == 2
+    assert result.accept_probs.shape == (1, 2)
+    assert result.support_accept_rates.shape == (1, 2)
+
+
 def test_detects_preprojection_correction():
     module = _load_module()
 
