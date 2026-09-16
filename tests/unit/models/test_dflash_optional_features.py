@@ -97,6 +97,42 @@ def test_explicitly_disabled_dflash2_has_exact_baseline_state_dict():
         )
 
 
+@pytest.mark.parametrize("hs_format", ["standard", "deepseek_v4_mean_hc_head"])
+def test_target_hs_format_does_not_change_dense_backbone(hs_format):
+    """The new field controls target IO, never drafter math or initialization."""
+    features = {
+        "dflash_gated_layer_fusion": True,
+        "dflash_context_residual": True,
+        "dflash_block_position_embedding": True,
+        "dflash2_dynamic_conv": True,
+        "dflash2_conv_group_size": 4,
+        "dflash2_candidate_selector": True,
+    }
+    torch.manual_seed(31)
+    baseline = _make_model(**features)
+    torch.manual_seed(31)
+    explicit = _make_model(target_hidden_state_format=hs_format, **features)
+    assert explicit.config.to_dict()["target_hidden_state_format"] == hs_format
+    assert baseline.state_dict().keys() == explicit.state_dict().keys()
+    for key, value in baseline.state_dict().items():
+        torch.testing.assert_close(
+            value,
+            explicit.state_dict()[key],
+            rtol=0,
+            atol=0,
+            equal_nan=True,
+            msg=key,
+        )
+    hidden = torch.randn(1, 5, 32, requires_grad=True)
+    other_hidden = hidden.detach().clone().requires_grad_()
+    fused = baseline._fuse_target_hidden(hidden)
+    other_fused = explicit._fuse_target_hidden(other_hidden)
+    torch.testing.assert_close(fused, other_fused, rtol=0, atol=0)
+    fused.square().sum().backward()
+    other_fused.square().sum().backward()
+    torch.testing.assert_close(hidden.grad, other_hidden.grad, rtol=0, atol=0)
+
+
 def test_gated_layer_fusion_returns_draft_hidden_shape():
     torch.manual_seed(1)
     model = _make_model(dflash_gated_layer_fusion=True)

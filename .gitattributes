@@ -1,0 +1,5 @@
+# These launchers are executed in Linux containers, including Windows checkouts.
+/examples/train/dspark_dsv4_flash_bf16_*.sh text eol=lf
+/examples/train/dspark_dsv4_training_smoke.sh text eol=lf
+/examples/evaluate/dspark_dsv4_offline_eval.sh text eol=lf
+/examples/evaluate/dspark_dsv4_single_eval.sh text eol=lf

@@ -100,6 +100,18 @@ class BaseCheckpointer:
         loaded_list = loaded if isinstance(loaded, list) else [loaded]
         for sched, state_dict in zip(schedulers, loaded_list, strict=True):
             sched.load_state_dict(state_dict)
+            # Constructing a scheduler performs its initial step and can overwrite
+            # the optimizer LR loaded just before it. load_state_dict restores
+            # scheduler counters only; restore the recorded LR before the first
+            # resumed optimizer step (including each Muon/AdamW optimizer).
+            if "_last_lr" in state_dict:
+                for group, lr in zip(
+                    sched.optimizer.param_groups, sched.get_last_lr(), strict=True
+                ):
+                    if isinstance(group["lr"], torch.Tensor):
+                        group["lr"].fill_(lr)
+                    else:
+                        group["lr"] = lr
 
     @_rank0_only
     def save_scheduler_state_dict(self, scheduler: SchedulerOrList, epoch: int | str):

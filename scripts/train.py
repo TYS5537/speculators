@@ -142,6 +142,11 @@ def create_transformer_layer_config(  # noqa: C901
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
 
+    if getattr(verifier_config, "model_type", None) == "deepseek_v4":
+        raise ValueError(
+            "DSV4 requires an explicit dense --draft-config, not target MLA geometry."
+        )
+
     hidden_act = (
         hidden_act
         or getattr(verifier_config, "hidden_act", None)
@@ -368,9 +373,7 @@ def parse_vocab_mappings(args: argparse.Namespace):
         "None. Using full verifier vocab"
     )
     # When vocab mapping is not provided, use the full verifier vocab
-    verifier_config = AutoConfig.from_pretrained(args.verifier_name_or_path)
-    if hasattr(verifier_config, "text_config"):
-        verifier_config = verifier_config.text_config
+    verifier_config = get_verifier_config(args.verifier_name_or_path)
     return None, None, verifier_config.vocab_size
 
 
@@ -587,6 +590,26 @@ def main(args: argparse.Namespace):  # noqa: C901
                 "--full-attention-indices is not supported for mtp draft models."
             )
 
+    target_config = get_verifier_config(args.verifier_name_or_path)
+    target_is_dsv4 = getattr(target_config, "model_type", None) == "deepseek_v4"
+    use_dsv4_format = args.target_hidden_state_format == "deepseek_v4_mean_hc_head"
+    if target_is_dsv4 != use_dsv4_format:
+        raise ValueError(
+            "DSV4 targets require --target-hidden-state-format "
+            "deepseek_v4_mean_hc_head; "
+            "other targets must use standard."
+        )
+    if use_dsv4_format:
+        from speculators_dsv4.training import prepare_training  # noqa: PLC0415
+        from speculators_dsv4.training_contract import (  # noqa: PLC0415
+            distributed_validation,
+        )
+
+        distributed_validation(
+            lambda: prepare_training(args),
+            torch.distributed if is_distributed() else None,
+        )
+
     registry = SpeculatorModel.registry
     if registry is None or args.speculator_type not in registry:
         available = list(registry.keys()) if registry else []
@@ -597,6 +620,13 @@ def main(args: argparse.Namespace):  # noqa: C901
     model_class = registry[args.speculator_type]
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
+
+    if (
+        use_dsv4_format
+        and draft_model.config.target_hidden_state_format
+        != args.target_hidden_state_format
+    ):
+        raise ValueError("Restored draft has an incompatible target HS format.")
 
     # Get target layer IDs from the model (resolved at model level)
     num_target_layers = len(draft_model.target_layer_ids)  # type: ignore[arg-type]
@@ -728,6 +758,7 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
 # learned proposal semantics and therefore must match the checkpoint. The small
 # runtime-only subset below can safely change without adding/removing weights.
 PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
+    "target_hidden_state_format": "--target-hidden-state-format",
     "block_size": "--block-size",
     "sample_from_anchor": "--sample-from-anchor",
     "sliding_window_non_causal": "--sliding-window-non-causal",
@@ -1080,6 +1111,12 @@ def parse_args():
             "[2, num_hidden_layers // 2, num_hidden_layers - 3, num_hidden_layers]. "
             "Note: must be set explicitly if custom values were used to launch vllm"
         ),
+    )
+    parser.add_argument(
+        "--target-hidden-state-format",
+        choices=["standard", "deepseek_v4_mean_hc_head"],
+        default="standard",
+        help="Opt-in DSV4 auxiliary-mean / post-hc_head teacher HS contract.",
     )
     parser.add_argument(
         "--token-freq-path",

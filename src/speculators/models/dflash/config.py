@@ -53,6 +53,16 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         description="Hidden size of the target model (if different from draft model)",
     )
 
+    target_hidden_state_format: Literal["standard", "deepseek_v4_mean_hc_head"] = Field(
+        default="standard",
+        description="Target HS export contract; does not change the dense drafter.",
+    )
+
+    target_training_contract: dict[str, Any] | None = Field(
+        default=None,
+        description="Verified DSV4 exporter identity bound to these draft weights.",
+    )
+
     aux_hidden_state_layer_ids: list[int] | None = Field(
         default=None,
         description="Layer IDs of the DFlash auxiliary hidden state layers",

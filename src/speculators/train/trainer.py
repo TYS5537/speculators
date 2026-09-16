@@ -203,10 +203,32 @@ class Trainer:
         )
         self.checkpointer: BaseCheckpointer = checkpointer_class(self.config.save_path)
 
+        self.validate_training_identity()
         self.setup_trainer()
         self.setup_model()
         self.setup_optimizer()
         self._init_loss_curricula()
+
+    def validate_training_identity(self) -> None:
+        """Check DSV4 auto-resume identity before model/optimizer restoration."""
+        model_config = getattr(self.model, "config", None)
+        if (
+            getattr(model_config, "target_hidden_state_format", "standard")
+            != "deepseek_v4_mean_hc_head"
+        ):
+            return
+        from speculators_dsv4.training_contract import (  # noqa: PLC0415
+            distributed_validation,
+            validate_resume_contract,
+        )
+
+        checkpoint_path = (
+            self.checkpointer.prev_path if self.resume_from_checkpoint else None
+        )
+        distributed_validation(
+            lambda: validate_resume_contract(model_config.to_dict(), checkpoint_path),
+            dist if self.is_distributed else None,
+        )
 
     def _init_loss_curricula(self) -> None:
         """Pull trainer-owned curricula out of the model call kwargs."""
@@ -518,9 +540,7 @@ class Trainer:
                         device=batch_device,
                         dtype=torch.float32,
                     )
-                _draft_tokens, loss, metrics = self.model(
-                    **gpu_batch, **call_kwargs
-                )
+                _draft_tokens, loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
             timer.mark("fwd")
             self._optimizers_zero_grad()

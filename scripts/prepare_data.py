@@ -24,6 +24,7 @@ Usage:
 
 import argparse
 import glob
+import json
 import logging
 import shutil
 import sys
@@ -46,6 +47,7 @@ PREPARE_DATA_OVERWRITE_ALLOWED_FILES = {
     "dataset_info.json",
     "state.json",
     "token_freq.pt",
+    "dspark_dsv4_data.json",
 }
 
 
@@ -147,6 +149,29 @@ def parse_args():
         help="Render training conversations in non-thinking mode.",
     )
     parser.set_defaults(enable_thinking=None)
+    parser.add_argument(
+        "--dsv4",
+        action="store_true",
+        help="Use the strict DeepSeek V4 text/token data contract.",
+    )
+    parser.add_argument(
+        "--dsv4-tokenizer-endpoint",
+        help="Running target root URL, e.g. http://127.0.0.1:8000",
+    )
+    parser.add_argument(
+        "--dsv4-served-model-name", help="Exact target served model name"
+    )
+    parser.add_argument(
+        "--dsv4-hs-manifest", help="Target HS directory or dspark_dsv4_hs.json"
+    )
+    parser.add_argument("--dsv4-tokenizer-timeout", type=float, default=120)
+    parser.add_argument(
+        "--dsv4-source-manifest",
+        help=(
+            "Verified DSV4 data contract for pre-tokenized input; "
+            "defaults to its data directory"
+        ),
+    )
 
     # Output arguments
     parser.add_argument(
@@ -196,8 +221,18 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
+def main():  # noqa: C901
     args = parse_args()
+
+    if not args.dsv4 and any(
+        (
+            args.dsv4_tokenizer_endpoint,
+            args.dsv4_served_model_name,
+            args.dsv4_hs_manifest,
+            args.dsv4_source_manifest,
+        )
+    ):
+        raise ValueError("DSV4-specific preprocessing arguments require --dsv4")
 
     log.section("Preparing data")
     log.config(
@@ -208,7 +243,9 @@ def main():
             "Thinking Mode": (
                 "model default"
                 if args.enable_thinking is None
-                else "enabled" if args.enable_thinking else "disabled"
+                else "enabled"
+                if args.enable_thinking
+                else "disabled"
             ),
         }
     )
@@ -219,9 +256,35 @@ def main():
         if args.token_freq_path is None
         else Path(args.token_freq_path)
     )
+    if args.overwrite:
+        output_root = output.resolve()
+        # In-place repackaging would remove the inputs before they are read.
+        for source in [*args.data, args.dsv4_source_manifest, args.dsv4_hs_manifest]:
+            if source and Path(source).exists():
+                source_path = Path(source).resolve()
+                if source_path.is_relative_to(output_root):
+                    raise ValueError(
+                        "--overwrite output contains an input dataset or manifest"
+                    )
 
     if output.exists():
         if not args.overwrite and glob.glob(str(output / "*.arrow")):
+            if args.dsv4:
+                from speculators_dsv4.contract import (  # noqa: PLC0415
+                    inspect_checkpoint,
+                )
+                from speculators_dsv4.preprocessing import (  # noqa: PLC0415
+                    validate_data_manifest,
+                )
+
+                existing = validate_data_manifest(
+                    output, inspect_checkpoint(args.model)
+                )
+                if (
+                    args.enable_thinking is not None
+                    and existing["enable_thinking"] != args.enable_thinking
+                ):
+                    raise ValueError("Existing DSV4 data has a different thinking mode")
             log.warning(
                 "Dataset files already exists in output directory, skipping "
                 "preprocessing. To existing overwrite files use --overwrite."
@@ -235,24 +298,37 @@ def main():
     else:
         output.mkdir(parents=True)
 
-    dataset, _ = load_and_preprocess_dataset(
-        target_model_path=args.model,
-        train_data_paths=args.data,
-        seq_length=args.seq_length,
-        build_dataset_num_proc=args.num_preprocessing_workers,
-        seed=args.seed,
-        max_samples=args.max_samples,
-        token_freq_path=token_freq_path,
-        assistant_pattern=args.assistant_pattern,
-        minimum_valid_tokens=args.minimum_valid_tokens,
-        allow_empty_output=args.allow_empty_output,
-        trust_remote_code=args.trust_remote_code,
-        enable_thinking=args.enable_thinking,
-    )
+    metadata = None
+    if args.dsv4:
+        from speculators_dsv4.preprocessing import (  # noqa: PLC0415
+            DATA_MANIFEST,
+            prepare_dsv4_dataset,
+        )
+
+        dataset, metadata = prepare_dsv4_dataset(args, token_freq_path)
+    else:
+        dataset, _ = load_and_preprocess_dataset(
+            target_model_path=args.model,
+            train_data_paths=args.data,
+            seq_length=args.seq_length,
+            build_dataset_num_proc=args.num_preprocessing_workers,
+            seed=args.seed,
+            max_samples=args.max_samples,
+            token_freq_path=token_freq_path,
+            assistant_pattern=args.assistant_pattern,
+            minimum_valid_tokens=args.minimum_valid_tokens,
+            allow_empty_output=args.allow_empty_output,
+            trust_remote_code=args.trust_remote_code,
+            enable_thinking=args.enable_thinking,
+        )
 
     log.info("Done preparing data")
     log.section(f"Writing dataset to {args.output}")
     dataset.save_to_disk(args.output)
+    if metadata is not None:
+        (output / DATA_MANIFEST).write_text(
+            json.dumps(metadata, indent=2, ensure_ascii=False) + "\n", encoding="utf-8"
+        )
 
 
 if __name__ == "__main__":

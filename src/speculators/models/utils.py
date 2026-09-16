@@ -14,7 +14,17 @@ def conditional_torch_compile(func=None, *args, **kwargs):
 
 
 def get_verifier_config(verifier_name_or_path: str) -> PretrainedConfig:
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    try:
+        verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    except ValueError:
+        # HS-only training needs V4 metadata, not an HF target implementation.
+        # Preserve all other AutoConfig failures and the existing Qwen path.
+        raw, _ = PretrainedConfig.get_config_dict(verifier_name_or_path)
+        if raw.get("model_type") != "deepseek_v4":
+            raise
+        verifier_config = PretrainedConfig.from_dict(raw)
+        verifier_config.model_type = "deepseek_v4"
+        verifier_config.name_or_path = verifier_name_or_path
     if hasattr(verifier_config, "text_config"):
         verifier_config = verifier_config.text_config
     return verifier_config

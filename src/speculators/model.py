@@ -146,10 +146,26 @@ class DraftVocabMixin(nn.Module):
         if hasattr(self, "verifier_norm"):
             weights_to_load.append("model.norm.weight")
 
-        verifier_weights = load_model_layers(
-            weights_to_load,
-            verifier_config.name_or_path,
-        )
+        if getattr(self.config, "target_hidden_state_format", "standard") == (
+            "deepseek_v4_mean_hc_head"
+        ):
+            from speculators_dsv4.contract import inspect_checkpoint  # noqa: PLC0415
+
+            report = inspect_checkpoint(verifier_config.name_or_path)
+            io_keys = report["io_keys"]
+            loaded = load_model_layers(
+                list(io_keys.values()), verifier_config.name_or_path
+            )
+            verifier_weights = {name: loaded[key] for name, key in io_keys.items()}
+            if self.verifier_norm.variance_epsilon != report["config"]["rms_norm_eps"]:
+                raise ValueError(
+                    "Draft verifier_norm epsilon must match the DSV4 target."
+                )
+        else:
+            verifier_weights = load_model_layers(
+                weights_to_load,
+                verifier_config.name_or_path,
+            )
 
         embed_tokens_weight = verifier_weights["embed_tokens.weight"]
         lm_head_weight = verifier_weights.get("lm_head.weight", embed_tokens_weight)

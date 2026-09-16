@@ -9,7 +9,7 @@ from typing import cast
 
 import torch
 from datasets import Dataset as HFDataset
-from datasets import concatenate_datasets, load_dataset
+from datasets import concatenate_datasets, load_dataset, load_from_disk
 from packaging.version import Version
 from transformers import (
     AutoProcessor,
@@ -552,7 +552,7 @@ def _passthrough_pretokenized(
 
 def _preprocess_batch(
     examples: dict,
-    processor: ProcessorLike,
+    processor: ProcessorLike | None,
     max_length: int,
     assistant_pattern: str | Pattern[str] | None,
     minimum_valid_tokens: int | None = None,
@@ -647,7 +647,7 @@ def _preprocess_batch(
 
 def build_eagle3_dataset(
     dataset: HFDataset,
-    processor: ProcessorLike,
+    processor: ProcessorLike | None,
     max_length: int = 2048,
     num_proc: int = 8,
     assistant_pattern: str | Pattern[str] | None = None,
@@ -687,6 +687,8 @@ def build_eagle3_dataset(
                 "assistant_pattern does not apply to pre-tokenized rows; ignoring"
             )
     # Detect and use provided assistant message pattern
+    elif processor is None:
+        raise ValueError("Raw conversations require a processor")
     elif assistant_pattern is not None:
         log.info(f"Using custom assistant pattern: {str(assistant_pattern)[:80]}...")
     elif _supports_assistant_mask(
@@ -768,7 +770,10 @@ def _load_hf_dataset(spec: str) -> tuple[HFDataset, None]:
 
     raw_dataset = load_dataset(hf_id, name=subset, split=split)
 
-    if "conversations" not in raw_dataset.column_names:
+    if not (
+        {"conversations", "messages"} & set(raw_dataset.column_names)
+        or {"input_ids", "loss_mask"} <= set(raw_dataset.column_names)
+    ):
         raise ValueError(
             f"HuggingFace dataset '{hf_id}' (split '{split}') is not in "
             f"conversations format: expected a 'conversations' column but found "
@@ -809,8 +814,15 @@ def load_raw_dataset(
     # 2. Local directory
     path = Path(train_data_path)
     if path.is_dir():
+        if (path / "state.json").is_file() and (path / "dataset_info.json").is_file():
+            dataset = load_from_disk(str(path))
+            if not isinstance(dataset, HFDataset):
+                raise ValueError("Expected one saved Dataset, not a DatasetDict")
+            return dataset.with_format(None), None
         data_files = sorted(
-            str(p) for p in (*path.rglob("*.json"), *path.rglob("*.jsonl"))
+            str(p)
+            for p in (*path.rglob("*.json"), *path.rglob("*.jsonl"))
+            if p.name not in {"dspark_dsv4_data.json", "dspark_dsv4_hs.json"}
         )
         if not data_files:
             raise ValueError(
@@ -876,7 +888,7 @@ def load_and_preprocess_dataset(
     allow_empty_output: bool = False,
     trust_remote_code: bool = False,
     enable_thinking: bool | None = None,
-) -> tuple[HFDataset, ProcessorLike]:
+) -> tuple[HFDataset, ProcessorLike | None]:
     """Load, tokenize, and preprocess a dataset for EAGLE3 training.
 
     Uses the processor's built-in chat template via apply_chat_template.
@@ -912,17 +924,12 @@ def load_and_preprocess_dataset(
             f"Filtering samples with fewer than {minimum_valid_tokens} valid tokens"
         )
 
-    log.subsection("Loading processor")
-    processor = load_processor(target_model_path, trust_remote_code=trust_remote_code)
+    # Encoded rows already carry an exact generation boundary. Do not even load
+    # AutoProcessor for them: a missing/unsupported model template is irrelevant.
+    processor = None
     if enable_thinking is not None:
         mode = "thinking" if enable_thinking else "non-thinking"
         log.info(f"Chat-template mode: {mode}")
-
-    if not hasattr(processor, "apply_chat_template") or processor.chat_template is None:
-        raise ValueError(
-            f"Processor for {target_model_path} does not support chat templates. "
-            "Please use a model with a pre-configured chat template."
-        )
 
     processed_datasets = []
     for train_data_path in train_data_paths:
@@ -944,6 +951,22 @@ def load_and_preprocess_dataset(
             )
 
         log.info(f"Loaded {len(raw_dataset)} samples")
+
+        if not {"input_ids", "loss_mask"} <= set(raw_dataset.column_names):
+            if processor is None:
+                log.subsection("Loading processor")
+                processor = load_processor(
+                    target_model_path, trust_remote_code=trust_remote_code
+                )
+            if (
+                not hasattr(processor, "apply_chat_template")
+                or processor.chat_template is None
+            ):
+                raise ValueError(
+                    f"Processor for {target_model_path} "
+                    "does not support chat templates. "
+                    "Please use a model with a pre-configured chat template."
+                )
 
         preprocessed_dataset = build_eagle3_dataset(
             dataset=raw_dataset,
@@ -981,6 +1004,8 @@ def load_and_preprocess_dataset(
 
     if len(combined_dataset) == 0:
         log.warning("No samples remain after preprocessing; skipping visualization")
+    elif processor is None:
+        log.info("Pre-tokenized dataset: skipping processor-dependent visualization")
     else:
         log.subsection("Visualizing sample")
         _visualize_sample(combined_dataset, processor, idx=0)

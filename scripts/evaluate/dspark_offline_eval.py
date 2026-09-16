@@ -19,6 +19,7 @@ import random
 import subprocess
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
@@ -753,6 +754,11 @@ def verify_draft_tokens(
     )
 
 
+def _new_target_cache(target_model):
+    factory = getattr(target_model, "new_cache", None)
+    return factory() if factory is not None else DynamicCache()
+
+
 def generate_decoding_sample(
     *,
     target_model,
@@ -776,7 +782,7 @@ def generate_decoding_sample(
         device=device,
     )
     position_ids = torch.arange(output_ids.shape[1], device=device).unsqueeze(0)
-    past_key_values_target = DynamicCache()
+    past_key_values_target = _new_target_cache(target_model)
 
     output = target_model(
         input_ids=input_ids,
@@ -904,7 +910,7 @@ def generate_base_model_sample(
     )
     output_ids[:, :num_input_tokens] = input_ids
     position_ids = torch.arange(max_length, device=device).unsqueeze(0)
-    past_key_values = DynamicCache()
+    past_key_values = _new_target_cache(target_model)
 
     output = target_model(
         input_ids=input_ids,
@@ -1335,6 +1341,13 @@ class DSparkOfflineRunner:
         input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
             self.device
         )
+        validate_budget = getattr(self.target_model, "validate_request_budget", None)
+        if validate_budget is not None:
+            validate_budget(
+                input_ids.shape[1],
+                int(self.args.max_new_tokens),
+                self.max_proposal_tokens,
+            )
         with torch.inference_mode():
             return generate_decoding_sample(
                 target_model=self.target_model,
@@ -1687,6 +1700,30 @@ def _read_worker_artifacts(output_dir: Path, dataset: str) -> list[dict[str, Any
     return _load_jsonl(path)
 
 
+def _target_worker_args(args: argparse.Namespace) -> list[str]:
+    if getattr(args, "target_backend", "hf") != "dsv4-vllm":
+        return []
+    result = [
+        "--target-backend",
+        "dsv4-vllm",
+        "--vllm-endpoint",
+        args.vllm_endpoint,
+        "--hidden-states-path",
+        str(args.hidden_states_path),
+        "--dsv4-max-model-len",
+        str(args.dsv4_max_model_len),
+        "--dsv4-verification-mode",
+        getattr(args, "dsv4_verification_mode", "reference"),
+        "--target-request-timeout",
+        str(args.target_request_timeout),
+    ]
+    if args.served_model_name:
+        result.extend(["--served-model-name", args.served_model_name])
+    if args.keep_target_hs:
+        result.append("--keep-target-hs")
+    return result
+
+
 def _worker_command(
     args: argparse.Namespace,
     *,
@@ -1742,6 +1779,7 @@ def _worker_command(
         cmd.append("--trust-remote-code")
     if args.sample_from_anchor is not None:
         cmd.extend(["--sample-from-anchor", str(args.sample_from_anchor).lower()])
+    cmd.extend(_target_worker_args(args))
     if args.measure_base_speedup:
         cmd.extend(
             [
@@ -1831,8 +1869,76 @@ def _parse_bool_override(value: str | None) -> bool | None:
     raise ValueError(f"Expected boolean value, got {value}")
 
 
+def _validate_target_cache_support(verifier_model: str, target_backend="hf") -> dict:
+    from transformers import PretrainedConfig  # noqa: PLC0415
+
+    target_config, _ = PretrainedConfig.get_config_dict(verifier_model)
+    is_dsv4 = target_config.get("model_type") == "deepseek_v4"
+    if is_dsv4 and target_backend != "dsv4-vllm":
+        raise NotImplementedError(
+            "DSV4 cannot use this runner's DynamicCache.crop rollback. "
+            "Select --target-backend dsv4-vllm with a running DSV4 HS service."
+        )
+    if target_backend == "dsv4-vllm" and not is_dsv4:
+        raise ValueError("The dsv4-vllm backend requires a DSV4 target")
+    return target_config
+
+
+def _write_backend_metadata(args, report):
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    mode = getattr(args, "dsv4_verification_mode", "reference")
+    metadata = {
+        "target_backend": "dsv4-vllm",
+        "verification_mode": mode,
+        "verification": (
+            "full-prefix-block-recompute"
+            if mode == "block"
+            else "full-prefix-per-position-recompute"
+        ),
+        "probability_source": (
+            "target_native_full_vocabulary_logprobs_packet"
+            if mode == "block"
+            else "target_api_full_vocabulary_logprobs"
+        ),
+        "online_speedup_benchmark": False,
+        "target_model": report["model_path"],
+        "checkpoint_signature": report["checkpoint_signature"],
+        "hidden_states_path": str(Path(args.hidden_states_path).resolve()),
+        "max_model_len": args.dsv4_max_model_len,
+        "temperature": args.temperature,
+        "top_p": 1.0,
+        "top_k": "disabled",
+        "acceptance_length": "1 + accepted_draft_tokens / proposals",
+        "position_accept_rates": "accepted_prefix_count / proposed_count",
+    }
+    with (args.output_dir / "eval_backend.json").open("w", encoding="utf-8") as stream:
+        json.dump(metadata, stream, indent=2)
+
+
 def run(args: argparse.Namespace) -> None:
+    # Close service clients on failed setup, transport errors and interrupts too.
+    with ExitStack() as resources:
+        _run(args, resources)
+
+
+def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     global torch, DynamicCache
+    target_backend = getattr(args, "target_backend", "hf")
+    target_config = _validate_target_cache_support(args.verifier_model, target_backend)
+    report = None
+    if target_backend == "dsv4-vllm":
+        from speculators_dsv4.contract import inspect_checkpoint  # noqa: PLC0415
+
+        if not args.vllm_endpoint or not args.hidden_states_path:
+            raise ValueError("DSV4 needs --vllm-endpoint and --hidden-states-path")
+        if args.measure_base_speedup:
+            raise ValueError(
+                "DSV4 recompute evaluates acceptance, not online base speedup"
+            )
+        if args.dtype != "bfloat16":
+            raise ValueError("DSV4 evaluation requires --dtype bfloat16")
+        report = inspect_checkpoint(args.verifier_model)
+        _write_backend_metadata(args, report)
     if (
         getattr(args, "ascend_devices", None)
         and getattr(args, "worker_shard_index", None) is None
@@ -1852,21 +1958,36 @@ def run(args: argparse.Namespace) -> None:
     device = torch.device(args.device)
     dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.verifier_model,
-        trust_remote_code=args.trust_remote_code,
-    )
-    target_model = (
-        AutoModelForCausalLM.from_pretrained(
+    target_model = None
+    if target_backend == "hf":
+        tokenizer = AutoTokenizer.from_pretrained(
             args.verifier_model,
-            torch_dtype=dtype,
             trust_remote_code=args.trust_remote_code,
         )
-        .to(device)
-        .eval()
-    )
+        target_model = (
+            AutoModelForCausalLM.from_pretrained(
+                args.verifier_model,
+                torch_dtype=dtype,
+                trust_remote_code=args.trust_remote_code,
+            )
+            .to(device)
+            .eval()
+        )
 
     draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    if target_backend == "dsv4-vllm":
+        from speculators_dsv4 import HS_FORMAT  # noqa: PLC0415
+
+        if getattr(draft_config, "target_hidden_state_format", "standard") != HS_FORMAT:
+            raise ValueError(
+                "Select a draft checkpoint trained with the DSV4 HS format"
+            )
+        saved_target = draft_config.speculators_config.verifier.name_or_path
+        if (
+            not saved_target
+            or Path(saved_target).resolve() != Path(args.verifier_model).resolve()
+        ):
+            raise ValueError("Draft checkpoint and --verifier-model paths must match")
     sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
     if sample_from_anchor is not None:
         draft_config.sample_from_anchor = sample_from_anchor
@@ -1884,8 +2005,58 @@ def run(args: argparse.Namespace) -> None:
         d2t=d2t,
         t2d=t2d,
     )
-    draft_model = draft_model.to(device).eval()
+    if target_backend == "dsv4-vllm":
+        draft_model = draft_model.to(device=device, dtype=torch.bfloat16).eval()
+    else:
+        draft_model = draft_model.to(device).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
+    if target_backend == "dsv4-vllm":
+        from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+
+        import openai  # noqa: PLC0415
+
+        from speculators_dsv4.offline import DSV4OfflineTarget  # noqa: PLC0415
+        from speculators_dsv4.tokenizer import DSV4ServerTokenizer  # noqa: PLC0415
+
+        client = openai.OpenAI(
+            base_url=args.vllm_endpoint,
+            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+            timeout=args.target_request_timeout,
+            max_retries=0,
+        )
+        resources.callback(client.close)
+        model_name = args.served_model_name or args.verifier_model
+        target_model = DSV4OfflineTarget(
+            draft_model,
+            report,
+            hidden_states_path=args.hidden_states_path,
+            client=client,
+            model_name=model_name,
+            max_model_len=args.dsv4_max_model_len,
+            timeout=args.target_request_timeout,
+            keep_hidden_states=args.keep_target_hs,
+            verification_mode=args.dsv4_verification_mode,
+        )
+        endpoint = urlsplit(args.vllm_endpoint)
+        root_path = endpoint.path.rstrip("/").removesuffix("/v1")
+        tokenizer_client = openai.OpenAI(
+            base_url=urlunsplit((endpoint.scheme, endpoint.netloc, root_path, "", "")),
+            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+            timeout=args.target_request_timeout,
+            max_retries=0,
+        )
+        resources.callback(tokenizer_client.close)
+        tokenizer = DSV4ServerTokenizer(
+            tokenizer_client,
+            model_name,
+            target_model.generation_config.eos_token_id,
+            vocab_size=target_config["vocab_size"],
+        )
+        logger.warning(
+            "DSV4 %s verification uses full-prefix recomputation and native target "
+            "probabilities. Reported elapsed time is NOT online speculative speed.",
+            args.dsv4_verification_mode,
+        )
     if draft_model.correction_head is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
@@ -1957,6 +2128,16 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--verifier-model", required=True)
     parser.add_argument("--draft-model", required=True)
+    parser.add_argument("--target-backend", choices=["hf", "dsv4-vllm"], default="hf")
+    parser.add_argument("--vllm-endpoint", default=None)
+    parser.add_argument("--hidden-states-path", type=Path, default=None)
+    parser.add_argument("--served-model-name", default=None)
+    parser.add_argument("--dsv4-max-model-len", type=int, default=4096)
+    parser.add_argument(
+        "--dsv4-verification-mode", choices=["reference", "block"], default="reference"
+    )
+    parser.add_argument("--target-request-timeout", type=float, default=120.0)
+    parser.add_argument("--keep-target-hs", action="store_true")
     parser.add_argument("--datasets-root", type=Path, required=True)
     parser.add_argument("--datasets", default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("dspark_offline_eval"))

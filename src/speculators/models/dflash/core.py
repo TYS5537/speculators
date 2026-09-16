@@ -295,6 +295,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "draft_vocab_size": kwargs["draft_vocab_size"],
             "block_size": block_size,
             "aux_hidden_state_layer_ids": target_layer_ids,
+            "target_hidden_state_format": kwargs.get(
+                "target_hidden_state_format", "standard"
+            ),
+            "target_training_contract": kwargs.get("target_training_contract"),
             "mask_token_id": kwargs.get("mask_token_id"),
             "sliding_window_non_causal": kwargs.get("sliding_window_non_causal", False),
             "dflash_context_residual": kwargs.get("dflash_context_residual", False),
