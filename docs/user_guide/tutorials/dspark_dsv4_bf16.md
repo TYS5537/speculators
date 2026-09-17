@@ -10,6 +10,10 @@ MoE/mHC drafter，不修改 Qwen 的默认计算路径**。当前状态是可供
 - 分散取层、teacher HS 修正、冻结 target embedding / head / norm 的加载。
 - checkpoint 结构与训练 IO 检查、HS 目录契约检查、单请求 HS 检查脚本。
 - 训练 HS 服务可选单机 DP2，检查 TP×DP 设备数；提供多请求并发 HS 接线检查。
+- vLLM 0.26.0 / Ascend 0.26.0rc1 的默认 V1 runner 缓存兼容：保留原生 C4/C128/SWA 分组与共享，
+  将 HS 独立成缓存组和物理 tensor，并纳入统一 block 池的显存预算及容量检查。
+  `--dsv4` 自动启用；只调整缓存规划及 HS tensor 绑定，不改模型结构、取层或训练计算。
+  此修复未覆盖强制 `VLLM_USE_V2_MODEL_RUNNER=1` 的启动方式。
 - 通用数据入口支持 DSV4 官方服务端编码、已有 token 数据直通及数据来源契约。
 - teacher 概率对照工具；显式加载和自动续训均校验 checkpoint 的 target 身份。
 - 独立输出目录中的短程训练、验证、保存与恢复验收入口；不替代 A3 实测。
@@ -23,6 +27,12 @@ MoE/mHC drafter，不修改 Qwen 的默认计算路径**。当前状态是可供
 - 新增单机单入口评估：自动启动本地 target、等待就绪、运行 eval 并回收自己启动的
   子进程；可以分卡，也可在显式授权及设置 target 内存预算后共卡。
 - 尚未在真实 A3 上验证启动、HS 导出、teacher logits 或训练收敛。
+
+更新此兼容补丁后，应在 **target 的 vLLM 环境**安装当前 checkout
+（`pip install -e . --no-deps`）并重启服务；现有 TP/DP 和训练启动参数无需因此修改。
+预算包含 HS 缓存数据；后端的 tensor 对齐开销仍沿用原生处理。
+显式 `--num-gpu-blocks-override` 仍继承 vLLM 的强制容量语义，可能超过真实显存，
+通常应省略此调试选项，交由显存 profiling 决定容量。
 
 ## 权重：`torch_dtype=bf16` 不等于全量 BF16
 

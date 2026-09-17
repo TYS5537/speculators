@@ -6,6 +6,7 @@ import ast
 import importlib.util
 import io
 import json
+import os
 import shlex
 import sys
 import unittest
@@ -14,7 +15,7 @@ from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock, patch
 
-from speculators_dsv4 import ARCHITECTURE, register
+from speculators_dsv4 import ARCHITECTURE, KV_CACHE_COMPAT_ENV, register
 from speculators_dsv4.block_protocol import BLOCK_CONNECTOR
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -132,6 +133,9 @@ class RuntimeTests(unittest.TestCase):
         )
         self.version.start()
         self.addCleanup(self.version.stop)
+        binding = patch.object(self.module, "install_worker_cache_compatibility")
+        self.binding = binding.start()
+        self.addCleanup(binding.stop)
 
     def make_model(self, config=None):
         return self.module.SpeculatorsDeepseekV4ForCausalLM(
@@ -140,6 +144,7 @@ class RuntimeTests(unittest.TestCase):
 
     def test_teacher_capture_does_not_mutate_target_or_auxiliary(self):
         model = self.make_model()
+        self.binding.assert_called_once_with()
         model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
         normalized, auxiliary = model.forward(None, None)
         self.assertIs(normalized, model.normalized)
@@ -272,15 +277,37 @@ class RuntimeTests(unittest.TestCase):
     def test_plugin_only_registers_new_architecture_lazily(self):
         fake_vllm = ModuleType("vllm")
         fake_vllm.ModelRegistry = SimpleNamespace(register_model=Mock())
-        with patch.dict(sys.modules, {"vllm": fake_vllm}):
+        with (
+            patch.dict(
+                sys.modules, {"vllm": fake_vllm, "speculators_dsv4.kv_cache": None}
+            ),
+            patch.dict(os.environ, {KV_CACHE_COMPAT_ENV: "0"}),
+        ):
             register()
         fake_vllm.ModelRegistry.register_model.assert_called_once_with(
             ARCHITECTURE, "speculators_dsv4.ascend:SpeculatorsDeepseekV4ForCausalLM"
         )
 
+    def test_opted_in_plugin_installs_cache_compatibility(self):
+        fake_vllm = ModuleType("vllm")
+        fake_vllm.ModelRegistry = SimpleNamespace(register_model=Mock())
+        with (
+            patch.dict(sys.modules, {"vllm": fake_vllm}),
+            patch.dict(os.environ, {KV_CACHE_COMPAT_ENV: "1"}),
+            patch(
+                "speculators_dsv4.kv_cache.install_kv_cache_compatibility"
+            ) as install,
+        ):
+            register()
+        install.assert_called_once_with()
+
 
 class LauncherTests(unittest.TestCase):
     def setUp(self):
+        environment = patch.dict(os.environ)
+        environment.start()
+        self.addCleanup(environment.stop)
+        os.environ.pop(KV_CACHE_COMPAT_ENV, None)
         # Force the dependency-free inline file connector for these CLI tests.
         with patch.dict(sys.modules, {"hs_connectors": None}):
             self.launcher = load_module(
@@ -320,6 +347,7 @@ class LauncherTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             self.launcher.main()
+            self.assertEqual(os.environ.get(KV_CACHE_COMPAT_ENV), "1")
         inspect.assert_called_once_with("fixture")
         self.manifest_call = manifest.call_args
         return execute.call_args.args[1]
@@ -460,6 +488,8 @@ class LauncherTests(unittest.TestCase):
         manifest.assert_not_called()
         execute.assert_not_called()
         self.assertIn("-q ascend", output.getvalue())
+        self.assertIn(f"{KV_CACHE_COMPAT_ENV}=1", output.getvalue())
+        self.assertNotIn(KV_CACHE_COMPAT_ENV, os.environ)
 
     def test_dsv4_still_rejects_dtype_hf_and_hidden_state_overrides(self):
         for option in (
@@ -545,6 +575,7 @@ class LauncherTests(unittest.TestCase):
         )
         self.assertNotIn("--hf-overrides", cmd)
         self.assertNotIn("--dtype", cmd)
+        self.assertNotIn(KV_CACHE_COMPAT_ENV, os.environ)
 
 
 class CheckpointCliTests(unittest.TestCase):

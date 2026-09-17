@@ -124,7 +124,7 @@ def main():  # noqa: C901
     if args.dsv4:
         from importlib.metadata import entry_points  # noqa: PLC0415
 
-        from speculators_dsv4 import ARCHITECTURE  # noqa: PLC0415
+        from speculators_dsv4 import ARCHITECTURE, KV_CACHE_COMPAT_ENV  # noqa: PLC0415
         from speculators_dsv4.contract import (  # noqa: PLC0415
             DEFAULT_LAYERS,
             ensure_manifest,
@@ -275,6 +275,8 @@ def main():  # noqa: C901
         cmd.append(disable_cp_arg)
 
     print("Running command:")
+    if args.dsv4:
+        print(f"{KV_CACHE_COMPAT_ENV}=1", end=" ")
     print(" ".join(cmd))
 
     if not args.dry_run:
@@ -285,6 +287,9 @@ def main():  # noqa: C901
                 create=True,
                 runtime_quantization=dsv4_runtime_quantization,
             )
+            # Inherited by EngineCore/worker children. The general plugin must
+            # patch KV planning before initialization, not at model construction.
+            os.environ[KV_CACHE_COMPAT_ENV] = "1"
         os.execvp(cmd[0], cmd)  # noqa: S606
 
 

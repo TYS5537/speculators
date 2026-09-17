@@ -16,6 +16,7 @@ from speculators_dsv4.contract import (
     validate_config,
     validate_layers,
 )
+from speculators_dsv4.kv_cache import install_worker_cache_compatibility
 from speculators_dsv4.parallel import validate_parallel_config
 
 logger = logging.getLogger(__name__)
@@ -63,6 +64,7 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
         if vllm_config.compilation_config.pass_config.enable_sp:
             raise ValueError("Disable sequence parallelism for DSV4 HS export.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
+        install_worker_cache_compatibility()
         self._teacher_pre_norm = None
         self._export_count = None
         self.model.norm.register_forward_pre_hook(self._capture_teacher)
