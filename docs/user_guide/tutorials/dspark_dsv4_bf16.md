@@ -266,6 +266,10 @@ communication-environment checks.
 Both hosts must share the same absolute MODEL and HS_PATH paths. Restrict the
 service port to a trusted internal network, not the public internet. Point the
 trainer's `VLLM_ENDPOINT` at the target host's internal address.
+The trainer script adds that endpoint's hostname/IP and local loopback hosts to
+both `NO_PROXY` and `no_proxy`, preserving entries from both existing lists.
+Training workers therefore contact the target directly; proxy settings for other
+destinations remain unchanged.
 
 Once the service is ready, run a small request first. The token IDs below are
 only a transport probe, not an evaluation prompt:

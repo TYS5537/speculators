@@ -33,6 +33,20 @@ export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREAD
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 
+# Contact the configured target directly; keep proxies for other destinations.
+# Preserve both existing exclusion lists and export both spellings to workers.
+vllm_proxy_host="${VLLM_ENDPOINT#*://}"
+vllm_proxy_host="${vllm_proxy_host%%[/?#]*}"
+vllm_proxy_host="${vllm_proxy_host##*@}"
+if [[ "$vllm_proxy_host" == \[* ]]; then
+  vllm_proxy_host="${vllm_proxy_host#\[}"
+  vllm_proxy_host="${vllm_proxy_host%%\]*}"
+else
+  vllm_proxy_host="${vllm_proxy_host%%:*}"
+fi
+export NO_PROXY="${NO_PROXY:-}${NO_PROXY:+,}${no_proxy:-}${no_proxy:+,}localhost,127.0.0.1,$vllm_proxy_host"
+export no_proxy="$NO_PROXY"
+
 # Explicit optimizer/scheduler pin the CURRENT local defaults. The user confirmed linear.
 # The decoder keeps 32 Q / 8 KV heads, head_dim=128, FFN=9728, SWA=2048.
 # Only hidden size / vocabulary change for target IO compatibility (4096 / 129280).

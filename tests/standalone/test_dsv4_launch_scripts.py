@@ -43,14 +43,33 @@ sleep() { SECONDS=$((SECONDS + 5)); }
 """
 
 TRAINER_STUBS = r"""
+# Set case-sensitive fixture variables inside Bash, including on Windows hosts.
+export NO_PROXY="$FIXTURE_NO_PROXY_UPPER" no_proxy="$FIXTURE_NO_PROXY_LOWER"
+if [[ -z "$FIXTURE_NO_PROXY_UPPER" && -z "$FIXTURE_NO_PROXY_LOWER" ]]; then
+  unset NO_PROXY no_proxy
+fi
+export HTTP_PROXY=http://http-proxy.fixture:3128 http_proxy=http://http-lower.fixture:3128
+export HTTPS_PROXY=http://https-proxy.fixture:3128 https_proxy=http://https-lower.fixture:3128
+export ALL_PROXY=socks5://all-proxy.fixture:1080 all_proxy=socks5://all-lower.fixture:1080
+capture_proxy_environment() {
+  # env is a child process: unexported shell variables must not satisfy this test.
+  env | while IFS='=' read -r name value; do
+    case "$name" in
+      NO_PROXY|no_proxy|HTTP_PROXY|http_proxy|HTTPS_PROXY|https_proxy|ALL_PROXY|all_proxy)
+        printf '%s=%s\n' "$name" "$value" ;;
+    esac
+  done > "$ENV_CAPTURE"
+}
 # The fixture already owns this directory; avoid MSYS mkdir path translation.
 mkdir() { [[ "$1" == -p && -d "$2" ]]; }
 nohup() {
+  capture_proxy_environment
   printf '%s\n' "$@" > "$CAPTURE"
   echo training-stdout
   echo training-stderr >&2
 }
 exec() {
+  capture_proxy_environment
   printf '%s\n' "$@" > "$CAPTURE"
   exit 17
 }
@@ -64,6 +83,7 @@ class LaunchScriptTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.capture = self.root / "arguments"
+        self.environment_capture = self.root / "proxy-environment"
         self.signals = self.root / "signals"
         self.output = self.root / "output with spaces"
 
@@ -71,6 +91,9 @@ class LaunchScriptTests(unittest.TestCase):
         environment = {
             **os.environ,
             "CAPTURE": self.capture.as_posix(),
+            "ENV_CAPTURE": self.environment_capture.as_posix(),
+            "FIXTURE_NO_PROXY_UPPER": "",
+            "FIXTURE_NO_PROXY_LOWER": "",
             "SIGNALS": self.signals.as_posix(),
             "OUTPUT_DIR": self.output.as_posix(),
             "MODEL": "/fixture/model",
@@ -197,6 +220,83 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertNotIn("scripts/train.py", args)
         self.assertNotIn("--dsv4-external-arrow", args)
         self.assertFalse((self.output / "logs/train.pid").exists())
+
+    def proxy_environment(self):
+        return dict(
+            line.split("=", 1)
+            for line in self.environment_capture.read_text().splitlines()
+        )
+
+    def test_no_proxy_is_exported_to_background_and_smoke_with_existing_entries(self):
+        (self.output / "logs").mkdir(parents=True)
+        for smoke in ("0", "1"):
+            with self.subTest(smoke=smoke):
+                result = self.run_script(
+                    "trainer",
+                    VLLM_ENDPOINT="http://teacher.fixture:8001/v1",
+                    FIXTURE_NO_PROXY_UPPER="upper.fixture,192.0.2.0/24",
+                    FIXTURE_NO_PROXY_LOWER="lower.fixture,.svc",
+                    TRAINING_SMOKE=smoke,
+                    SMOKE_PHASE="fresh",
+                    SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                )
+                self.assertEqual(
+                    result.returncode, 17 if smoke == "1" else 0, result.stderr
+                )
+                environment = self.proxy_environment()
+                self.assertEqual(environment["NO_PROXY"], environment["no_proxy"])
+                self.assertEqual(
+                    set(environment["NO_PROXY"].split(",")),
+                    {
+                        "upper.fixture",
+                        "192.0.2.0/24",
+                        "lower.fixture",
+                        ".svc",
+                        "localhost",
+                        "127.0.0.1",
+                        "teacher.fixture",
+                    },
+                )
+                self.assertEqual(
+                    {
+                        key: value
+                        for key, value in environment.items()
+                        if key.upper() != "NO_PROXY"
+                    },
+                    {
+                        "HTTP_PROXY": "http://http-proxy.fixture:3128",
+                        "http_proxy": "http://http-lower.fixture:3128",
+                        "HTTPS_PROXY": "http://https-proxy.fixture:3128",
+                        "https_proxy": "http://https-lower.fixture:3128",
+                        "ALL_PROXY": "socks5://all-proxy.fixture:1080",
+                        "all_proxy": "socks5://all-lower.fixture:1080",
+                    },
+                )
+
+    def test_no_proxy_extracts_hostname_ipv4_and_bracketed_ipv6_without_port_or_path(
+        self,
+    ):
+        for endpoint, host in (
+            ("https://teacher.fixture/v1", "teacher.fixture"),
+            ("http://10.12.0.15:8001/v1", "10.12.0.15"),
+            ("http://[2001:db8::3]:8001/v1", "2001:db8::3"),
+            ("https://[::1]/v1/", "::1"),
+        ):
+            with self.subTest(endpoint=endpoint):
+                result = self.run_script(
+                    "trainer",
+                    VLLM_ENDPOINT=endpoint,
+                    TRAINING_SMOKE="1",
+                    SMOKE_PHASE="fresh",
+                    SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                )
+                self.assertEqual(result.returncode, 17, result.stderr)
+                environment = self.proxy_environment()
+                for key in ("NO_PROXY", "no_proxy"):
+                    self.assertEqual(
+                        set(environment[key].split(",")),
+                        {"localhost", "127.0.0.1", host},
+                    )
 
     def test_external_arrow_opt_in_reaches_normal_and_smoke_training(self):
         (self.output / "logs").mkdir(parents=True)
