@@ -40,16 +40,16 @@ def load_module(name, path):
 
 
 class FakeTensor:
-    def __init__(self, value):
+    def __init__(self, value, shape=(4, 4096)):
         self.value = value
         self.ndim = 2
-        self.shape = (4, 4096)
+        self.shape = shape
 
     def detach(self):
         return self
 
     def clone(self):
-        return FakeTensor(self.value)
+        return FakeTensor(self.value, self.shape)
 
 
 class FakeNativeModel:
@@ -66,11 +66,12 @@ class FakeNativeModel:
         self.layers = layers
 
     def forward(self, *args):
-        teacher = FakeTensor(7)
+        shape = getattr(self, "test_shape", (4, 4096))
+        teacher = FakeTensor(getattr(self, "test_teacher", 7), shape)
         self.hook(None, (teacher,))
         teacher.value = 99  # Simulate an in-place norm backend.
-        self.normalized = FakeTensor(2)
-        self.auxiliary = [FakeTensor(i) for i in self.layers]
+        self.normalized = FakeTensor(2, shape)
+        self.auxiliary = [FakeTensor(i, shape) for i in self.layers]
         return self.normalized, self.auxiliary
 
 
@@ -87,8 +88,11 @@ def runtime_config():
         scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
         speculative_config=SimpleNamespace(method="extract_hidden_states"),
         parallel_config=SimpleNamespace(
+            tensor_parallel_size=1,
             pipeline_parallel_size=1,
             data_parallel_size=1,
+            data_parallel_size_local=1,
+            enable_expert_parallel=False,
             prefill_context_parallel_size=1,
             decode_context_parallel_size=1,
         ),
@@ -192,6 +196,40 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "dtype bfloat16"):
             self.make_model(config)
 
+    def test_dp2_replicas_keep_teacher_capture_local_across_uneven_forwards(self):
+        replicas = []
+        for rank in (0, 1):
+            config = runtime_config()
+            config.parallel_config.data_parallel_size = 2
+            config.parallel_config.data_parallel_size_local = 2
+            config.parallel_config.enable_expert_parallel = True
+            config.parallel_config.data_parallel_rank = rank
+            model = self.make_model(config)
+            model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
+            replicas.append(model)
+        retained = []
+        for rank, length, teacher in ((0, 4, 7), (1, 0, 8), (1, 3, 9), (0, 1, 10)):
+            model = replicas[rank]
+            model.test_shape, model.test_teacher = (length, 4096), teacher
+            normalized, auxiliary = model.forward(None, None)
+            self.assertIs(normalized, model.normalized)
+            self.assertEqual(auxiliary[-1].shape, (length, 4096))
+            self.assertEqual(auxiliary[-1].value, teacher)
+            self.assertTrue(
+                all(replica._teacher_pre_norm is None for replica in replicas)
+            )
+            retained.append(auxiliary[-1])
+        self.assertEqual([value.value for value in retained], [7, 8, 9, 10])
+
+    def test_dp2_rejects_block_verification_before_native_model_init(self):
+        config = runtime_config()
+        config.parallel_config.data_parallel_size = 2
+        config.parallel_config.data_parallel_size_local = 2
+        config.parallel_config.enable_expert_parallel = True
+        config.kv_transfer_config = SimpleNamespace(kv_connector=BLOCK_CONNECTOR)
+        with self.assertRaisesRegex(ValueError, "block verification"):
+            self.make_model(config)
+
     def test_explicit_layer_setup_is_required(self):
         model = self.make_model()
         with self.assertRaisesRegex(RuntimeError, "not configured"):
@@ -208,7 +246,7 @@ class RuntimeTests(unittest.TestCase):
             ("scheduler_config", "enable_chunked_prefill", True),
             ("speculative_config", "method", "dspark"),
             ("parallel_config", "pipeline_parallel_size", 2),
-            ("parallel_config", "data_parallel_size", 2),
+            ("parallel_config", "data_parallel_size", 3),
             ("parallel_config", "prefill_context_parallel_size", 2),
             ("parallel_config", "decode_context_parallel_size", 2),
         ):
@@ -311,6 +349,40 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(
             self.manifest_call.kwargs["runtime_quantization"], {"method": None}
         )
+
+    def test_dp2_launch_uses_two_local_engines_and_original_connector(self):
+        extra = [
+            "--tensor-parallel-size",
+            "2",
+            "--data-parallel-size",
+            "2",
+            "--enable-expert-parallel",
+        ]
+        with patch.dict(
+            self.launcher.os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1,2,3"}
+        ):
+            cmd = self.launch_dsv4(extra=extra)
+        self.assertEqual(cmd[cmd.index("--data-parallel-size-local") + 1], "2")
+        connector = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])
+        self.assertEqual(connector["kv_connector"], "ExampleHiddenStatesConnector")
+        self.assertEqual(
+            self.manifest_call.args[1]["auxiliary_hs_ids"], [1, 11, 21, 30, 40]
+        )
+
+    def test_invalid_dp2_launch_does_not_create_manifest_or_start_engines(self):
+        with (
+            patch.object(
+                sys, "argv", ["launch_vllm.py", "fixture", "--dsv4", "--", "-dp", "2"]
+            ),
+            patch("speculators_dsv4.contract.ensure_manifest") as manifest,
+            patch("speculators_dsv4.contract.inspect_checkpoint") as inspect,
+            patch.object(self.launcher.os, "execvp") as execute,
+            self.assertRaisesRegex(ValueError, "expert-parallel"),
+        ):
+            self.launcher.main()
+        manifest.assert_not_called()
+        inspect.assert_not_called()
+        execute.assert_not_called()
 
     def test_block_verification_selects_dedicated_connector_and_single_sequence(self):
         cmd = self.launch_dsv4(block=True)
@@ -499,11 +571,32 @@ class CheckpointCliTests(unittest.TestCase):
 
 
 class RecipeTests(unittest.TestCase):
+    def test_server_recipe_defaults_to_two_local_dp_engines(self):
+        source = (ROOT / "examples/train/dspark_dsv4_flash_bf16_server.sh").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn('DP_SIZE="${DP_SIZE:-2}"', source)
+        self.assertIn('TP_SIZE="${TP_SIZE:-8}"', source)
+        invocation = source.split('python scripts/launch_vllm.py "$MODEL"', 1)[1]
+        args = shlex.split(invocation.replace("\\\n", " "), comments=True)
+        for name, value in {
+            "--tensor-parallel-size": "$TP_SIZE",
+            "--data-parallel-size": "$DP_SIZE",
+            "--data-parallel-size-local": "$DP_SIZE",
+            "--distributed-executor-backend": "mp",
+            "--pipeline-parallel-size": "1",
+        }.items():
+            self.assertEqual(args[args.index(name) + 1], value)
+        self.assertIn("--enable-expert-parallel", args)
+        for name in ("VLLM_DP_SIZE", "VLLM_DP_RANK", "VLLM_DP_RANK_LOCAL"):
+            self.assertIn(f"-u {name}", source)
+
     def test_trainer_flags_are_real_and_pin_user_recipe(self):
         path = ROOT / "examples/train/dspark_dsv4_flash_bf16_trainer.sh"
         source = path.read_text(encoding="utf-8")
         self.assertIn("TRAIN_ENTRY=(scripts/train.py)", source)
         invocation = source.split('"${TRAIN_ENTRY[@]}" \\\n', 1)[1]
+        invocation = invocation.split("\n\n# The smoke wrapper", 1)[0].removesuffix(")")
         args = shlex.split(invocation.replace("\\\n", " "), comments=True)
         for name, value in {
             "--scheduler-type": "linear",
@@ -511,9 +604,10 @@ class RecipeTests(unittest.TestCase):
             "--lr": "6e-5",
             "--correction-gate-bias": "0",
             "--correction-markov-gate-bias": "-2.0",
-            "--epochs": "5",
+            "--epochs": "10",
             "--block-size": "7",
             "--total-seq-len": "3072",
+            "--log-dir": "$LOG_DIR/tensorboard",
         }.items():
             self.assertEqual(args[args.index(name) + 1], value)
         tree = ast.parse((ROOT / "scripts/train.py").read_text(encoding="utf-8"))

@@ -9,6 +9,7 @@ MoE/mHC drafter，不修改 Qwen 的默认计算路径**。当前状态是可供
 - 独立 vLLM architecture 插件；只有 `--dsv4` 启用，旧 `--dsv4-bf16` 为兼容别名。
 - 分散取层、teacher HS 修正、冻结 target embedding / head / norm 的加载。
 - checkpoint 结构与训练 IO 检查、HS 目录契约检查、单请求 HS 检查脚本。
+- 训练 HS 服务可选单机 DP2，检查 TP×DP 设备数；提供多请求并发 HS 接线检查。
 - 通用数据入口支持 DSV4 官方服务端编码、已有 token 数据直通及数据来源契约。
 - teacher 概率对照工具；显式加载和自动续训均校验 checkpoint 的 target 身份。
 - 独立输出目录中的短程训练、验证、保存与恢复验收入口；不替代 A3 实测。
@@ -103,7 +104,7 @@ SWA 2048、RoPE theta 1e6，以及原有 correction、dynamic conv、selector �
 改为 4096，vocab 改为 129280；**这不是参数量完全相同的模型，也不支持直接复用
 Qwen draft 权重**。不把 V4 的 MLA / 压缩注意力几何参数复制给 dense draft。
 
-训练脚本固定 `epochs=5`、`seq_len=3072`、`block_size=7`、`max_anchors=512`、
+训练脚本固定 `epochs=10`、`seq_len=3072`、`block_size=7`、`max_anchors=512`、
 `correction_gate_bias=0`、`correction_markov_gate_bias=-2`。
 优化器保持 Muon + linear，`--lr 6e-5` 对应 AdamW 部分基础 LR；未单独设置时
 Muon 基础 LR 为 `6e-4`。这沿用当前实验，不冒充官方 DeepSpec 的 AdamW + cosine。
@@ -113,8 +114,12 @@ Muon 基础 LR 为 `6e-4`。这沿用当前实验，不冒充官方 DeepSpec 的
 接口按 vLLM `0.26.0` / vllm-ascend `0.26.0rc1` 编写，并在初始化时校验版本。
 镜像 tar 文件名不能证明其内部软件版本；先在容器内核对。
 
-第一版限制：eager、file HS backend、DP=1、PP=1、PCP=DCP=1，关闭 prefix cache、
-chunked prefill、FlashComm1 / SP、DSA-CP。TP/EP 参数可配置；真实拓扑尚待验证。
+限制：eager、file HS backend、PP=1、PCP=DCP=1，关闭 prefix cache、
+chunked prefill、FlashComm1 / SP、DSA-CP。训练 HS 服务支持单机 DP=1 或 2，
+底层启动器默认仍为 DP1，当前 server 示例预置为 TP8×DP2；DP2 要求开启 EP、
+两个 DP engine 全部位于本机、使用 mp 后端和
+内部请求分发。多机 DP、DP>2 和外部负载均衡未开放。整块验证及自动离线评估入口
+仍为 DP1。真实 A3 拓扑、HS 导出和数值一致性尚待验证。
 不覆盖已有 vLLM/Ascend 安装，也不修改 native V4 / Qwen 注册。
 
 在服务端和训练端的既有环境中安装本 checkout（不要顺带升级 torch/vLLM）：
@@ -127,7 +132,10 @@ pip install -e hs_connectors --no-deps
 如设置了 `VLLM_PLUGINS` 白名单，需要加入 `speculators_dsv4`，并保留 Ascend
 需要的其他插件。不设置白名单时由 vLLM 自动发现。
 
-所有脚本都从仓库根目录运行。服务端需要显式设置以下变量：
+所有脚本都从仓库根目录运行。两个启动脚本已预置当前双机实验的 checkpoint、
+数据/HS 路径、16 个设备及 target 地址 `80.48.17.187:8001`，环境变量可覆盖。
+target 与 trainer 必须分别运行在两台机器上，不能直接把两个默认脚本放在同一台。
+服务端路径与设备不同时，显式设置以下变量：
 脚本与本文保留历史文件名中的 `bf16`，其含义是 BF16 HS 接口，不再要求全量 BF16 权重。
 
 ```bash
@@ -136,11 +144,39 @@ export HS_PATH=/shared/hs/dsv4-flash-target-spread-v1
 # 按实际设备与内存填写，不在这里假定每台机器的卡数。
 export VLLM_NPUS='<target device IDs>'
 export TP_SIZE='<target tensor parallel size>'
+export DP_SIZE=1  # 可选 2；VLLM_NPUS 的设备数必须等于 TP_SIZE * DP_SIZE。
 export VLLM_HOST='<target host internal IP; use 127.0.0.1 for local-only testing>'
 # 默认不设置，由后端识别 checkpoint；仅在匹配的 Ascend 量化格式要求时设置：
 # export TARGET_QUANTIZATION=ascend
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
+
+单台 A3 **确实暴露 16 个逻辑设备**时，可选择 `TP8 × DP2 / EP16`：
+
+```bash
+export VLLM_NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export TP_SIZE=8
+export DP_SIZE=2
+export HS_PATH=/shared/hs/dsv4-flash-target-spread-dp2-v1
+bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+这里 DP2 在 target **同一台机器内部**，不是两台机器各一个 DP；另一台机器仍
+运行 trainer。启动器设置 `--data-parallel-size-local 2`，保留 EP，并在启动前检查
+可见设备编号唯一、`设备数=TP×DP`。直接使用 `scripts/launch_vllm.py --dsv4` 时，
+也会检查这些条件；DP2 必须显式设置 `ASCEND_RT_VISIBLE_DEVICES`，不能指定
+`--headless`、外部 DP rank、Ray 或多机布局。插件在各 worker 中再次检查实际配置。
+PP/CP 仍为 1，MoE 的 EP 组大小在此为 TP×DP；EP 不额外乘一遍设备数。
+[vLLM 0.26 并行配置](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/config/parallel.py)
+
+HS 继续使用上游 `ExampleHiddenStatesConnector`：各 DP engine 的 TP rank 0
+写出自己调度的请求，通过响应返回文件路径。没有增加第二套 HS 文件格式，teacher
+仍是 final norm 前，trainer 参数、drafter 架构和 loss 不变。训练端的多卡 DDP 与
+server DP 独立，不需要把 `NUM_TRAIN_NPUS` 改成 2。
+
+更换 TP/DP 布局可能改变浮点计算与显存预算，首次验证建议使用新的 HS 目录，
+避免读到旧拓扑缓存。现有 manifest **不绑定 TP/DP 拓扑**；它通过不代表数值或
+显存验收通过。上述 16 设备示例也不保证当前量化 checkpoint 一定装得下。
 
 `TARGET_QUANTIZATION` 如非空会原样作为一个 `--quantization` 参数传给后端；
 不设置时不添加该参数。`ascend` 不是将任意官方 FP4/FP8 文件转成 Ascend W8A8 的开关。
@@ -172,6 +208,25 @@ python scripts/check_dsv4_hs.py \
 3. 用少量 DSV4 数据跑训练/验证，确认有限 loss、有效梯度和恢复 checkpoint。
 4. 用下方实验性离线后端验证接受长度和停止边界，再扩大到完整训练。
 
+DP2 服务还应在单请求检查后运行不同长度的并发请求：
+
+```bash
+python scripts/check_dsv4_hs.py \
+  --model "$MODEL" --hidden-states-path "$HS_PATH" \
+  --vllm-endpoint http://TARGET_INTERNAL_IP:8001/v1 \
+  --input-ids 100 200 300 400 --requests 8 --concurrency 2
+```
+
+检查器循环使用原输入及其较短前缀，逐请求检查 token、HS 形状、BF16/有限值和
+输出文件唯一性，保留所有生成文件。**并发请求通过不证明两个 DP engine 都收到
+请求**，还需看服务端各 engine 的请求指标/日志；初始化日志中的 DP rank 0/1
+仅证明两个副本初始化，不证明它们都处理过请求。实机要覆盖只有一个副本有任务、
+两副本输入长度不同及持续并发，检查 dummy forward、EP 通信和文件写入失败。
+这些检查不替代 teacher 概率对照或 DP1/DP2 数值比较，也不是吞吐基准。
+
+`DSV4_EVAL=1` 的普通 HS/reference 服务仍可开启 full-logprob 诊断；自动离线
+launcher 和专用 `--dsv4-block-verify` 继续限定 DP1，不随 `DP_SIZE=2` 自动放开。
+
 训练端：
 
 ```bash
@@ -183,7 +238,15 @@ export VLLM_ENDPOINT=http://TARGET_INTERNAL_IP:8001/v1
 bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
 ```
 
-不设置 `OUTPUT_DIR` 时默认使用 `./output/dspark_dsv4_flash_corrGate0`；
+普通训练通过 nohup 后台运行，输出日志和 PID 写到 `$OUTPUT_DIR/logs`；
+TensorBoard 写到 `$OUTPUT_DIR/logs/tensorboard`，脚本打印对应查看/停止命令。
+脚本返回只表示已提交后台进程，需要查看日志确认初始化成功；`TRAINING_SMOKE=1`
+仍前台运行并传回退出码，以保证 fresh/resume 按顺序执行。
+server 脚本前台等待就绪并保持运行，启动超时默认 1800 秒（`VLLM_STARTUP_TIMEOUT`
+可覆盖），提前退出会报错；Ctrl+C/退出时仅清理自己创建的进程组。
+server 需要 Linux `setsid` 和 `curl`。服务端口应限制在可信网络，保持共享路径一致。
+
+不设置 `OUTPUT_DIR` 时默认使用 `./output/dspark_dsv4_flash_bestArch`；
 切换 checkpoint / 量化方案时应使用独立输出目录，不直接续训另一版本的实验。
 
 DATA_PATH 必须是 DSV4 自己的 token IDs/loss masks 和数据 manifest；不能复用 Qwen
@@ -312,7 +375,7 @@ bash examples/train/dspark_dsv4_training_smoke.sh
 训练计算、基础 LR、`corrGate=0`、Muon + linear 和 loss 开关保持原配方；验收专用
 覆盖为短程 epoch 数、两阶段共用的 scheduler 总步数、零 warmup、每阶段保存及
 `num_workers=0`（避免为几步验收预取大量无用 HS 请求）。实际覆盖项写入报告，
-不能把短程 loss 当作原来 5-epoch 实验的质量结论。
+不能把短程 loss 当作完整 10-epoch 实验的质量结论。
 
 每次创建新的 `run.*` 目录，不使用/覆盖原 `OUTPUT_DIR` 实验；日志、两个 checkpoint
 和 `reports/{fresh,resume}.rank-N.json` 全部保留。张量恢复检查为每个张量前 8 个值的

@@ -16,12 +16,13 @@ from speculators_dsv4.contract import (
     validate_config,
     validate_layers,
 )
+from speculators_dsv4.parallel import validate_parallel_config
 
 logger = logging.getLogger(__name__)
 
 
 class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
-    def __init__(self, *, vllm_config, prefix=""):  # noqa: C901
+    def __init__(self, *, vllm_config, prefix=""):
         for package, expected in (("vllm", "0.26.0"), ("vllm-ascend", "0.26.0rc1")):
             actual = version(package).split("+")[0]
             if actual != expected:
@@ -47,16 +48,13 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
                 "not DSpark serving."
             )
         parallel = vllm_config.parallel_config
-        for name in (
-            "pipeline_parallel_size",
-            "data_parallel_size",
-            "prefill_context_parallel_size",
-            "decode_context_parallel_size",
-        ):
-            if getattr(parallel, name, 1) != 1:
-                raise ValueError(
-                    f"Initial DSV4 HS bridge requires {name}=1; TP/EP are allowed."
-                )
+        self._block_verify = (
+            getattr(
+                getattr(vllm_config, "kv_transfer_config", None), "kv_connector", None
+            )
+            == BLOCK_CONNECTOR
+        )
+        validate_parallel_config(parallel, block_verify=self._block_verify)
         ascend = get_ascend_config()
         if getattr(ascend, "enable_flashcomm1", False) or getattr(
             ascend, "enable_dsa_cp", False
@@ -65,18 +63,14 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
         if vllm_config.compilation_config.pass_config.enable_sp:
             raise ValueError("Disable sequence parallelism for DSV4 HS export.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        self._block_verify = (
-            getattr(
-                getattr(vllm_config, "kv_transfer_config", None), "kv_connector", None
-            )
-            == BLOCK_CONNECTOR
-        )
         self._teacher_pre_norm = None
         self._export_count = None
         self.model.norm.register_forward_pre_hook(self._capture_teacher)
         logger.warning(
             "Experimental DSV4 HS bridge active: "
-            "auxiliary mean, teacher hc_head -> pre-norm."
+            "auxiliary mean, teacher hc_head -> pre-norm; DP=%s, DP rank=%s.",
+            parallel.data_parallel_size,
+            getattr(parallel, "data_parallel_rank", 0),
         )
 
     def _capture_teacher(self, _module, inputs):

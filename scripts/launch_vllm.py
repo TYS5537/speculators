@@ -132,7 +132,11 @@ def main():  # noqa: C901
             make_manifest,
             validate_layers,
         )
+        from speculators_dsv4.parallel import configure_parallel_args  # noqa: PLC0415
 
+        configure_parallel_args(
+            vllm_args, os.environ, block_verify=args.dsv4_block_verify
+        )
         report = inspect_checkpoint(args.model)
         num_hidden_layers = report["config"]["num_hidden_layers"]
         if args.hidden_states_backend != "file" or not args.include_last_layer:
