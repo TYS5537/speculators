@@ -172,8 +172,10 @@ The interfaces target vLLM `0.26.0` / vllm-ascend `0.26.0rc1` and validate
 versions during initialization. An image tar filename does not establish its
 installed software versions; check them inside the container first.
 
-Requirements: eager execution, file HS backend, PP=1, PCP=DCP=1, and disabled
-prefix caching, chunked prefill, FlashComm1 / SP, and DSA-CP. The training HS
+The default baseline uses eager execution and synchronous scheduling. Training
+HS performance opt-ins are described below; they do not change the requirements
+for file HS backend, PP=1, PCP=DCP=1, and disabled prefix caching, chunked
+prefill, FlashComm1 / SP, and DSA-CP. The training HS
 service supports single-host DP=1 or 2. The underlying launcher still defaults
 to DP1; the current server example uses TP8 x DP2. DP2 requires EP, both DP
 engines on the same host, the mp backend, and internal request dispatch.
@@ -250,6 +252,92 @@ caches from the old topology. The current manifest **does not bind TP/DP
 topology**; passing its checks does not validate numerical behavior or memory
 capacity. The 16-device example above does not guarantee that the current
 quantized checkpoint fits.
+
+The training HS server exposes two independent, experimental performance options:
+
+- `DSV4_EXECUTION_MODE=eager` (default) or `full-decode-only`.
+- `DSV4_ASYNC_SCHEDULING=0` (default) or `1`.
+
+Both values are validated before checkpoint checks or server startup, and the
+script prints the resolved settings. The execution mode goes to the launcher
+as `--dsv4-execution-mode`; scheduling is passed explicitly to vLLM as either
+`--no-async-scheduling` or `--async-scheduling`. Neither switch changes TP/DP,
+batch limits, the training recipe, or the HS file format.
+
+Keep the eager/synchronous baseline for initial checks, then compare one option
+at a time before combining them. Use a separate `HS_PATH` for each comparison
+so cached files from another mode cannot satisfy the test:
+
+```bash
+# Baseline (also the defaults when both variables are unset).
+DSV4_EXECUTION_MODE=eager DSV4_ASYNC_SCHEDULING=0 \
+  HS_PATH=/shared/hs/dsv4-eager-sync \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+
+# Decode graphs only; keep synchronous scheduling.
+DSV4_EXECUTION_MODE=full-decode-only DSV4_ASYNC_SCHEDULING=0 \
+  HS_PATH=/shared/hs/dsv4-decode-graph-sync \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+
+# Asynchronous scheduling only; keep eager execution.
+DSV4_EXECUTION_MODE=eager DSV4_ASYNC_SCHEDULING=1 \
+  HS_PATH=/shared/hs/dsv4-eager-async \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+
+# Combine the options only after validating each separately.
+DSV4_EXECUTION_MODE=full-decode-only DSV4_ASYNC_SCHEDULING=1 \
+  HS_PATH=/shared/hs/dsv4-decode-graph-async \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+`full-decode-only` selects only `FULL_DECODE_ONLY`: prefill still runs eagerly.
+The launcher pins compilation `mode=0` (no `torch.compile`) so an inner compiled
+model cannot bypass the bridge's pre-norm teacher hook. The pinned Ascend runner
+captures the complete ForCausalLM for decode; the teacher clone is part of that
+graph's tensor outputs. HS cache writes retain the upstream eager extractor and
+connector event/lock lifecycle. Other graph modes and raw compilation overrides
+are rejected instead of silently enabling unvalidated paths. Qwen is unaffected.
+The bridge also excludes its cache-only HS backend from the **target graph
+capability check only**: that layer runs separately in the eager extractor, not
+inside the target graph. Actual target attention capabilities, KV groups, cache
+allocation, and metadata remain unchanged. If the native capability check still
+disables the requested decode graph, startup fails explicitly rather than silently
+running with graphs off.
+Training HS requests mostly process the input prefix and request just one output
+token, so this mode does **not** promise a prefill speedup or any end-to-end
+throughput gain. Asynchronous scheduling is a separate opt-in, not a prerequisite
+for decode graphs. No NPU validation has been performed for either option.
+Before using them for training, compare exported HS numerically against the
+eager/synchronous baseline on the actual checkpoint and hardware, using identical
+token IDs, short and long inputs, and concurrent requests. Check token alignment,
+shape, dtype, finiteness, and teacher-logit agreement as described below; startup
+success or shape-only checks are insufficient. Measure throughput separately.
+The dedicated `--dsv4-block-verify` service remains eager and synchronous; these
+options do not enable graph execution or asynchronous scheduling for block
+verification.
+
+The usual one-token HS probe cannot establish decode-graph coverage. After the
+ordinary HS checks, exercise multiple decode steps on the graph-enabled service:
+
+```bash
+python scripts/check_dsv4_hs.py \
+  --model "$MODEL" --hidden-states-path "$HS_PATH" \
+  --vllm-endpoint http://TARGET_INTERNAL_IP:8001/v1 \
+  --input-ids 100 200 300 400 --requests 8 --concurrency 2 \
+  --probe-max-tokens 4
+```
+
+This diagnostic uses greedy decoding with EOS ignored and requires all four
+output tokens to complete; leave room for input plus output in the context limit.
+It does not alter the trainer's one-token requests. Confirm graph replay using
+server dispatch logs/profiling, including repeated requests and different batch
+sizes. A successful response alone is not graph evidence. The connector exports
+only prompt HS, so this test does not certify generated-token teacher values;
+compare target decode outputs separately with the eager baseline.
+
+Implementation references: [Ascend 0.26.0rc1 runner](https://github.com/vllm-project/vllm-ascend/blob/v0.26.0rc1/vllm_ascend/worker/model_runner_v1.py),
+[ACL graph wrapper](https://github.com/vllm-project/vllm-ascend/blob/v0.26.0rc1/vllm_ascend/compilation/acl_graph.py),
+and [vLLM 0.26 HS extractor](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/v1/spec_decode/extract_hidden_states.py).
 
 If nonempty, `TARGET_QUANTIZATION` is forwarded unchanged as a single
 `--quantization` argument; when unset, no such argument is added. `ascend` is

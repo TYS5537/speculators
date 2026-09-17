@@ -97,6 +97,16 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--dsv4-execution-mode",
+        choices=("eager", "full-decode-only"),
+        default=None,
+        help=(
+            "DSV4 HS execution mode (default: eager). FULL_DECODE_ONLY uses "
+            "ACL graphs only for decode; prefill remains eager. Native "
+            "--async-scheduling is an independent opt-in."
+        ),
+    )
+    parser.add_argument(
         "--dsv4-block-verify",
         action="store_true",
         help=(
@@ -118,6 +128,8 @@ def main():  # noqa: C901
         vllm_args.remove("--")
     if args.dsv4_block_verify and not args.dsv4:
         raise ValueError("--dsv4-block-verify requires --dsv4.")
+    if args.dsv4_execution_mode is not None and not args.dsv4:
+        raise ValueError("--dsv4-execution-mode requires --dsv4.")
 
     dsv4_manifest = None
     dsv4_runtime_quantization = None
@@ -132,8 +144,14 @@ def main():  # noqa: C901
             make_manifest,
             validate_layers,
         )
+        from speculators_dsv4.execution import configure_execution_args  # noqa: PLC0415
         from speculators_dsv4.parallel import configure_parallel_args  # noqa: PLC0415
 
+        configure_execution_args(
+            vllm_args,
+            args.dsv4_execution_mode or "eager",
+            block_verify=args.dsv4_block_verify,
+        )
         configure_parallel_args(
             vllm_args, os.environ, block_verify=args.dsv4_block_verify
         )
@@ -192,7 +210,6 @@ def main():  # noqa: C901
                 json.dumps({"architectures": [ARCHITECTURE]}),
                 "--dtype",
                 "bfloat16",
-                "--enforce-eager",
                 "--no-enable-prefix-caching",
             ]
         )

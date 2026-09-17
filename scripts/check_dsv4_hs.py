@@ -51,6 +51,29 @@ def validate_payload(payload, input_ids, layer_count, torch):
     return hidden
 
 
+def request_decode_probe(client, model, input_ids, *, max_tokens, timeout):
+    """Exercise decode without changing the trainer's max_tokens=1 requests.
+
+    Finishing several decode steps is not proof of graph replay; verify dispatch
+    using server logs/profiling. The connector still exports only prompt HS.
+    """
+    response = client.completions.create(
+        model=model,
+        prompt=input_ids,
+        max_tokens=max_tokens,
+        temperature=0,
+        extra_body={"return_token_ids": True, "ignore_eos": True},
+        timeout=timeout,
+    )
+    completed = getattr(getattr(response, "usage", None), "completion_tokens", None)
+    if completed != max_tokens:
+        raise ValueError(
+            f"Decode probe requested {max_tokens} output tokens, got {completed}; "
+            "check the context/output limit before claiming decode coverage."
+        )
+    return response
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Shared DSV4 checkpoint path")
@@ -61,6 +84,15 @@ def main():
         "--target-layer-ids", nargs="+", type=int, default=DEFAULT_LAYERS
     )
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--probe-max-tokens",
+        type=int,
+        default=1,
+        help=(
+            "Diagnostic output length only (trainer stays at 1). Use 4 or more "
+            "to exercise decode; requires context room and server graph metrics."
+        ),
+    )
     parser.add_argument(
         "--requests",
         type=int,
@@ -74,14 +106,17 @@ def main():
         help="Concurrent HS requests (use 2 or more to exercise DP2 load balancing)",
     )
     args = parser.parse_args()
-    if args.requests < 1 or args.concurrency < 1:
-        parser.error("--requests and --concurrency must be positive")
+    if args.requests < 1 or args.concurrency < 1 or args.probe_max_tokens < 1:
+        parser.error(
+            "--requests, --concurrency and --probe-max-tokens must be positive"
+        )
 
     import openai  # noqa: PLC0415
     import torch  # noqa: PLC0415
 
     from hs_connectors import FileTransfer  # noqa: PLC0415
     from speculators.data_generation.vllm_client import (  # noqa: PLC0415
+        extract_output,
         generate_hidden_states,
     )
 
@@ -101,13 +136,23 @@ def main():
             api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
             max_retries=0,
         ) as client:
-            handle = generate_hidden_states(
-                client,
-                args.model,
-                {"input_ids": input_ids},
-                timeout=args.timeout,
-                max_retries=0,
-            )
+            if args.probe_max_tokens == 1:
+                handle = generate_hidden_states(
+                    client,
+                    args.model,
+                    {"input_ids": input_ids},
+                    timeout=args.timeout,
+                    max_retries=0,
+                )
+            else:
+                response = request_decode_probe(
+                    client,
+                    args.model,
+                    input_ids,
+                    max_tokens=args.probe_max_tokens,
+                    timeout=args.timeout,
+                )
+                handle = extract_output(response, input_ids)
         if not handle or not Path(handle).resolve().is_relative_to(directory):
             raise ValueError(
                 "Server returned an HS path outside the shared HS directory."
@@ -122,6 +167,7 @@ def main():
             "dtype": str(hidden.dtype),
             "auxiliary_hs_ids": args.target_layer_ids,
             "teacher_hs_id": 43,
+            "probe_max_tokens": args.probe_max_tokens,
             "per_slot_rms": hidden.float().square().mean(dim=(0, 2)).sqrt().tolist(),
         }
 
@@ -138,6 +184,12 @@ def main():
         print(
             "Concurrent probes do NOT prove both DP engines were used; "
             "check server per-engine request metrics/logs. All HS files are retained."
+        )
+    if args.probe_max_tokens > 1:
+        print(
+            "Multi-token decode completed. Check server graph dispatch/replay "
+            "logs or profiling: completion alone does not prove graph execution. "
+            "The HS files contain prompt positions only, not generated-token HS."
         )
     print(
         "HS transport/layout passed. "

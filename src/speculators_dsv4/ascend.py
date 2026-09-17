@@ -1,4 +1,4 @@
-"""Experimental, eager-only HS exporter for vLLM Ascend 0.26.0rc1.
+"""Experimental HS exporter for vLLM Ascend 0.26.0rc1.
 
 Uses a separate architecture so Qwen and the native V4 serving path are untouched.
 """
@@ -16,6 +16,8 @@ from speculators_dsv4.contract import (
     validate_config,
     validate_layers,
 )
+from speculators_dsv4.execution import validate_execution_config
+from speculators_dsv4.graph import install_worker_graph_compatibility
 from speculators_dsv4.kv_cache import install_worker_cache_compatibility
 from speculators_dsv4.parallel import validate_parallel_config
 
@@ -32,10 +34,8 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
                 )
         model = vllm_config.model_config
         validate_config(model.hf_config.to_dict())
-        if not model.enforce_eager or model.dtype != torch.bfloat16:
-            raise ValueError(
-                "DSV4 HS export requires --enforce-eager --dtype bfloat16."
-            )
+        if model.dtype != torch.bfloat16:
+            raise ValueError("DSV4 HS export requires --dtype bfloat16.")
         # Quantization is resolved by the native target backend. BF16 describes
         # the exported activations, not the storage format of target weights.
         if vllm_config.cache_config.enable_prefix_caching:
@@ -55,6 +55,9 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
             )
             == BLOCK_CONNECTOR
         )
+        execution, asynchronous = validate_execution_config(
+            vllm_config, block_verify=self._block_verify
+        )
         validate_parallel_config(parallel, block_verify=self._block_verify)
         ascend = get_ascend_config()
         if getattr(ascend, "enable_flashcomm1", False) or getattr(
@@ -65,18 +68,27 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
             raise ValueError("Disable sequence parallelism for DSV4 HS export.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         install_worker_cache_compatibility()
+        if execution == "full-decode-only":
+            install_worker_graph_compatibility()
         self._teacher_pre_norm = None
         self._export_count = None
         self.model.norm.register_forward_pre_hook(self._capture_teacher)
         logger.warning(
             "Experimental DSV4 HS bridge active: "
-            "auxiliary mean, teacher hc_head -> pre-norm; DP=%s, DP rank=%s.",
+            "auxiliary mean, teacher hc_head -> pre-norm; DP=%s, DP rank=%s, "
+            "execution=%s, async_scheduling=%s.",
             parallel.data_parallel_size,
             getattr(parallel, "data_parallel_rank", 0),
+            execution,
+            asynchronous,
         )
 
     def _capture_teacher(self, _module, inputs):
         # Clone before RMSNorm so any backend in-place implementation is harmless.
+        # With compile=NONE + FULL_DECODE_ONLY the WHOLE ForCausalLM is captured
+        # by ACLGraphWrapper. This clone is a graph node and its output remains
+        # in the returned auxiliary tensors; replay does not need this Python
+        # attribute or hook to run again. Prefill still calls forward normally.
         self._teacher_pre_norm = inputs[0].detach().clone()
 
     def set_aux_hidden_state_layers(self, layers):

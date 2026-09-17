@@ -17,7 +17,7 @@ else:
     BASH = shutil.which("bash")
 
 SERVER_STUBS = r"""
-python() { return 0; }
+python() { printf '%s\n' "$@" >> "$CHECKPOINT_CAPTURE"; }
 setsid() { printf '%s\n' "$@" > "$CAPTURE"; }
 curl_calls=0
 curl() {
@@ -83,6 +83,7 @@ class LaunchScriptTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
         self.capture = self.root / "arguments"
+        self.checkpoint_capture = self.root / "checkpoint-arguments"
         self.environment_capture = self.root / "proxy-environment"
         self.signals = self.root / "signals"
         self.output = self.root / "output with spaces"
@@ -91,6 +92,7 @@ class LaunchScriptTests(unittest.TestCase):
         environment = {
             **os.environ,
             "CAPTURE": self.capture.as_posix(),
+            "CHECKPOINT_CAPTURE": self.checkpoint_capture.as_posix(),
             "ENV_CAPTURE": self.environment_capture.as_posix(),
             "FIXTURE_NO_PROXY_UPPER": "",
             "FIXTURE_NO_PROXY_LOWER": "",
@@ -110,6 +112,8 @@ class LaunchScriptTests(unittest.TestCase):
             "NUM_TRAIN_NPUS": "16",
             "TARGET_QUANTIZATION": "",
             "DSV4_EVAL": "0",
+            "DSV4_EXECUTION_MODE": "",
+            "DSV4_ASYNC_SCHEDULING": "",
             "DSV4_EXTERNAL_ARROW": "0",
             "RECOMPUTE": "",
             "TRAINING_SMOKE": "0",
@@ -153,7 +157,77 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertEqual(args[args.index("--data-parallel-size") + 1], "2")
         self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
         self.assertEqual(args[args.index("--port") + 1], "9123")
+        self.assertEqual(args[args.index("--dsv4-execution-mode") + 1], "eager")
+        self.assertLess(args.index("--dsv4-execution-mode"), args.index("--"))
+        self.assertGreater(args.index("--no-async-scheduling"), args.index("--"))
+        self.assertNotIn("--async-scheduling", args)
+        self.assertIn("execution mode: eager; async scheduling: 0", result.stdout)
         self.assertRegex(self.signals.read_text(), r"^-TERM -- -[1-9][0-9]*\n$")
+
+    def test_server_execution_mode_and_async_scheduling_are_independent(self):
+        for execution_mode in ("eager", "full-decode-only"):
+            for async_scheduling in ("0", "1"):
+                with self.subTest(
+                    mode=execution_mode, async_scheduling=async_scheduling
+                ):
+                    result = self.run_script(
+                        "server",
+                        DSV4_EXECUTION_MODE=execution_mode,
+                        DSV4_ASYNC_SCHEDULING=async_scheduling,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    args = self.capture.read_text().splitlines()
+                    self.assertEqual(args.count("--dsv4-execution-mode"), 1)
+                    self.assertEqual(
+                        args[args.index("--dsv4-execution-mode") + 1], execution_mode
+                    )
+                    self.assertLess(
+                        args.index("--dsv4-execution-mode"), args.index("--")
+                    )
+                    enabled_flag, disabled_flag = (
+                        ("--async-scheduling", "--no-async-scheduling")
+                        if async_scheduling == "1"
+                        else ("--no-async-scheduling", "--async-scheduling")
+                    )
+                    self.assertEqual(args.count(enabled_flag), 1)
+                    self.assertNotIn(disabled_flag, args)
+                    self.assertGreater(args.index(enabled_flag), args.index("--"))
+                    self.assertIn(
+                        f"execution mode: {execution_mode}; "
+                        f"async scheduling: {async_scheduling}",
+                        result.stdout,
+                    )
+                    for flag, value in (
+                        ("--tensor-parallel-size", "8"),
+                        ("--data-parallel-size", "2"),
+                        ("--data-parallel-size-local", "2"),
+                        ("--max-model-len", "4096"),
+                        ("--max-num-batched-tokens", "4096"),
+                        ("--max-num-seqs", "1"),
+                    ):
+                        self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_invalid_server_performance_settings_fail_before_checkpoint_check(self):
+        for variable, values, expected in (
+            (
+                "DSV4_EXECUTION_MODE",
+                ("full", "FULL_DECODE_ONLY", "0"),
+                "DSV4_EXECUTION_MODE must be eager or full-decode-only",
+            ),
+            (
+                "DSV4_ASYNC_SCHEDULING",
+                ("true", "2", "-1"),
+                "DSV4_ASYNC_SCHEDULING must be 0 or 1",
+            ),
+        ):
+            for value in values:
+                with self.subTest(variable=variable, value=value):
+                    result = self.run_script("server", **{variable: value})
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn(expected, result.stderr)
+                    self.assertFalse(self.checkpoint_capture.exists())
+                    self.assertFalse(self.capture.exists())
+                    self.assertFalse(self.signals.exists())
 
     def test_server_early_exit_reports_failure_without_waiting_forever(self):
         result = self.run_script("server", MODE="dead", WAIT_STATUS="7")

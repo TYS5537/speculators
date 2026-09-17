@@ -13,6 +13,17 @@ VLLM_HOST="${VLLM_HOST:-80.48.17.187}"
 VLLM_PORT="${VLLM_PORT:-8001}"
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-1800}"
 export DSV4_EVAL="${DSV4_EVAL:-0}"
+DSV4_EXECUTION_MODE="${DSV4_EXECUTION_MODE:-eager}"
+DSV4_ASYNC_SCHEDULING="${DSV4_ASYNC_SCHEDULING:-0}"
+case "$DSV4_EXECUTION_MODE" in
+  eager|full-decode-only) ;;
+  *) printf '%s\n' 'DSV4_EXECUTION_MODE must be eager or full-decode-only.' >&2; exit 2 ;;
+esac
+case "$DSV4_ASYNC_SCHEDULING" in
+  0) target_scheduling_args=(--no-async-scheduling) ;;
+  1) target_scheduling_args=(--async-scheduling) ;;
+  *) printf '%s\n' 'DSV4_ASYNC_SCHEDULING must be 0 or 1.' >&2; exit 2 ;;
+esac
 case "$DP_SIZE" in
   1|2) ;;
   *) printf '%s\n' 'DP_SIZE must be 1 or 2 (single-host HS service).' >&2; exit 2 ;;
@@ -25,6 +36,8 @@ if [[ ! "$VLLM_STARTUP_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
   echo "VLLM_STARTUP_TIMEOUT must be a positive number of seconds." >&2
   exit 2
 fi
+printf 'DSV4 HS execution mode: %s; async scheduling: %s\n' \
+  "$DSV4_EXECUTION_MODE" "$DSV4_ASYNC_SCHEDULING"
 command -v setsid >/dev/null
 command -v curl >/dev/null
 python scripts/check_dsv4_checkpoint.py "$MODEL"
@@ -80,11 +93,13 @@ setsid env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" \
   python scripts/launch_vllm.py "$MODEL" \
     --dsv4 \
+    --dsv4-execution-mode "$DSV4_EXECUTION_MODE" \
     --hidden-states-path "$HS_PATH" \
     --target-layer-ids 1 11 21 30 40 \
     -- \
     "${target_quantization_args[@]}" \
     "${target_eval_args[@]}" \
+    "${target_scheduling_args[@]}" \
     --tensor-parallel-size "$TP_SIZE" \
     --data-parallel-size "$DP_SIZE" \
     --data-parallel-size-local "$DP_SIZE" \

@@ -86,7 +86,9 @@ def runtime_config():
         ),
         quant_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
-        scheduler_config=SimpleNamespace(enable_chunked_prefill=False),
+        scheduler_config=SimpleNamespace(
+            enable_chunked_prefill=False, async_scheduling=False
+        ),
         speculative_config=SimpleNamespace(method="extract_hidden_states"),
         parallel_config=SimpleNamespace(
             tensor_parallel_size=1,
@@ -98,7 +100,7 @@ def runtime_config():
             decode_context_parallel_size=1,
         ),
         compilation_config=SimpleNamespace(
-            pass_config=SimpleNamespace(enable_sp=False)
+            pass_config=SimpleNamespace(enable_sp=False), mode=0, cudagraph_mode="NONE"
         ),
     )
 
@@ -136,6 +138,9 @@ class RuntimeTests(unittest.TestCase):
         binding = patch.object(self.module, "install_worker_cache_compatibility")
         self.binding = binding.start()
         self.addCleanup(binding.stop)
+        graph_binding = patch.object(self.module, "install_worker_graph_compatibility")
+        self.graph_binding = graph_binding.start()
+        self.addCleanup(graph_binding.stop)
 
     def make_model(self, config=None):
         return self.module.SpeculatorsDeepseekV4ForCausalLM(
@@ -145,6 +150,7 @@ class RuntimeTests(unittest.TestCase):
     def test_teacher_capture_does_not_mutate_target_or_auxiliary(self):
         model = self.make_model()
         self.binding.assert_called_once_with()
+        self.graph_binding.assert_not_called()
         model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
         normalized, auxiliary = model.forward(None, None)
         self.assertIs(normalized, model.normalized)
@@ -176,6 +182,40 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(output[1][-1].value, 7)
         self.assertEqual(model.auxiliary[-1].value, 43)
         self.assertIsNone(model._teacher_pre_norm)
+
+    def test_graph_async_policy_retains_teacher_lifetime_and_auxiliary_contract(self):
+        # Ordinary Python forwards only: actual ACL capture/replay needs an NPU.
+        config = runtime_config()
+        config.model_config.enforce_eager = False
+        config.compilation_config.cudagraph_mode = "FULL_DECODE_ONLY"
+        config.scheduler_config.async_scheduling = True
+        model = self.make_model(config)
+        self.graph_binding.assert_called_once_with()
+        model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
+        retained = []
+        for length, value in ((4, 7), (1, 8), (0, 9), (3, 10)):
+            model.test_shape, model.test_teacher = (length, 4096), value
+            normalized, auxiliary = model.forward(None, None)
+            self.assertIs(normalized, model.normalized)
+            self.assertEqual(auxiliary[-1].shape, (length, 4096))
+            self.assertEqual(auxiliary[-1].value, value)
+            self.assertIsNone(model._teacher_pre_norm)
+            retained.append(auxiliary[-1])
+        self.assertEqual([teacher.value for teacher in retained], [7, 8, 9, 10])
+
+    def test_block_export_rejects_graph_and_async(self):
+        for graph, asynchronous in ((True, False), (False, True), (True, True)):
+            config = runtime_config()
+            config.kv_transfer_config = SimpleNamespace(kv_connector=BLOCK_CONNECTOR)
+            config.scheduler_config.async_scheduling = asynchronous
+            if graph:
+                config.model_config.enforce_eager = False
+                config.compilation_config.cudagraph_mode = "FULL_DECODE_ONLY"
+            with (
+                self.subTest(graph=graph, asynchronous=asynchronous),
+                self.assertRaisesRegex(ValueError, "block verification"),
+            ):
+                self.make_model(config)
 
     def test_quantized_target_config_is_passed_to_native_backend(self):
         config = runtime_config()
@@ -314,7 +354,7 @@ class LauncherTests(unittest.TestCase):
                 "dsv4_test_launcher", ROOT / "scripts/launch_vllm.py"
             )
 
-    def launch_dsv4(self, flag="--dsv4", extra=(), *, block=False):
+    def launch_dsv4(self, flag="--dsv4", extra=(), *, block=False, execution=None):
         argv = [
             "launch_vllm.py",
             "fixture",
@@ -322,6 +362,7 @@ class LauncherTests(unittest.TestCase):
             "--hidden-states-path",
             "fixture-hs",
             *(["--dsv4-block-verify"] if block else []),
+            *(["--dsv4-execution-mode", execution] if execution else []),
             "--",
             *extra,
         ]
@@ -377,6 +418,71 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(
             self.manifest_call.kwargs["runtime_quantization"], {"method": None}
         )
+
+    def test_graph_mode_and_async_are_independent_opt_ins(self):
+        for mode in ("eager", "full-decode-only"):
+            for asynchronous in (False, True):
+                with self.subTest(mode=mode, asynchronous=asynchronous):
+                    cmd = self.launch_dsv4(
+                        execution=mode,
+                        extra=[
+                            "--async-scheduling"
+                            if asynchronous
+                            else "--no-async-scheduling",
+                        ],
+                    )
+                    compilation = json.loads(cmd[cmd.index("--compilation-config") + 1])
+                    self.assertEqual(compilation["mode"], 0)
+                    self.assertEqual(
+                        compilation["cudagraph_mode"],
+                        "NONE" if mode == "eager" else "FULL_DECODE_ONLY",
+                    )
+                    self.assertEqual("--enforce-eager" in cmd, mode == "eager")
+                    self.assertEqual("--async-scheduling" in cmd, asynchronous)
+                    connector = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])
+                    self.assertEqual(
+                        connector["kv_connector"], "ExampleHiddenStatesConnector"
+                    )
+                    speculative = json.loads(cmd[cmd.index("--speculative_config") + 1])
+                    self.assertEqual(speculative["method"], "extract_hidden_states")
+
+    def test_block_graph_and_async_fail_before_checkpoint_inspection(self):
+        for extra in (
+            ["--dsv4-execution-mode", "full-decode-only"],
+            ["--async-scheduling"],
+        ):
+            with (
+                patch.object(
+                    sys,
+                    "argv",
+                    [
+                        "launch_vllm.py",
+                        "fixture",
+                        "--dsv4",
+                        "--dsv4-block-verify",
+                        *extra,
+                    ],
+                ),
+                patch("speculators_dsv4.contract.inspect_checkpoint") as inspect,
+                patch("speculators_dsv4.contract.ensure_manifest") as manifest,
+                patch.object(self.launcher.os, "execvp") as execute,
+                self.assertRaisesRegex(ValueError, "block verification"),
+            ):
+                self.launcher.main()
+            inspect.assert_not_called()
+            manifest.assert_not_called()
+            execute.assert_not_called()
+
+    def test_dsv4_execution_selection_cannot_change_qwen(self):
+        with (
+            patch.object(
+                sys,
+                "argv",
+                ["launch_vllm.py", "qwen", "--dsv4-execution-mode", "full-decode-only"],
+            ),
+            self.assertRaisesRegex(ValueError, "requires --dsv4"),
+        ):
+            self.launcher.main()
 
     def test_dp2_launch_uses_two_local_engines_and_original_connector(self):
         extra = [
@@ -548,6 +654,7 @@ class LauncherTests(unittest.TestCase):
             manifest.call_args.args[1]["auxiliary_hs_ids"], [1, 11, 21, 30, 40]
         )
         self.assertIn("--enforce-eager", cmd)
+        self.assertIn("--no-async-scheduling", cmd)
         self.assertIn("--no-enable-prefix-caching", cmd)
         self.assertIn("--no-enable-chunked-prefill", cmd)
 
@@ -575,6 +682,8 @@ class LauncherTests(unittest.TestCase):
         )
         self.assertNotIn("--hf-overrides", cmd)
         self.assertNotIn("--dtype", cmd)
+        self.assertNotIn("--compilation-config", cmd)
+        self.assertNotIn("--no-async-scheduling", cmd)
         self.assertNotIn(KV_CACHE_COMPAT_ENV, os.environ)
 
 

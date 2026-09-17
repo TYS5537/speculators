@@ -54,6 +54,31 @@ class HSCheckTests(unittest.TestCase):
             ):
                 MODULE.check_requests([1], requests, concurrency, Mock())
 
+    def test_decode_probe_uses_greedy_multiple_tokens_and_requires_completion(self):
+        client = Mock()
+        response = SimpleNamespace(usage=SimpleNamespace(completion_tokens=4))
+        client.completions.create.return_value = response
+        self.assertIs(
+            MODULE.request_decode_probe(
+                client, "target", [1, 2], max_tokens=4, timeout=120
+            ),
+            response,
+        )
+        client.completions.create.assert_called_once_with(
+            model="target",
+            prompt=[1, 2],
+            max_tokens=4,
+            temperature=0,
+            extra_body={"return_token_ids": True, "ignore_eos": True},
+            timeout=120,
+        )
+        for invalid in (None, SimpleNamespace(completion_tokens=1)):
+            response.usage = invalid
+            with self.assertRaisesRegex(ValueError, "Decode probe requested"):
+                MODULE.request_decode_probe(
+                    client, "target", [1, 2], max_tokens=4, timeout=120
+                )
+
     def test_payload_checks_tokens_shape_dtype_and_finiteness(self):
         torch = SimpleNamespace(bfloat16="bf16", isfinite=Mock())
         torch.isfinite.return_value.all.return_value.item.return_value = True
