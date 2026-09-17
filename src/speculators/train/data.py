@@ -214,8 +214,17 @@ class ArrowDataset(BaseDataset):
         model: str | None = None,
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
+        pretokenized_text_only: bool = False,
     ):
         self.data = load_from_disk(datapath)
+        if pretokenized_text_only:
+            # External text Arrow may have no saved torch format. Select an
+            # in-memory view without changing token values, masks, or row order.
+            # Excluding messages also prevents HS requests from re-tokenizing
+            # already encoded text through the Chat Completions API.
+            self.data = self.data.with_format(
+                "torch", columns=["input_ids", "loss_mask"], output_all_columns=False
+            )
         self.start_file_idx = 0
         if split_ratio == 1.0:
             pass

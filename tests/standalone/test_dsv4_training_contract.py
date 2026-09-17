@@ -12,6 +12,7 @@ from unittest.mock import Mock, patch
 
 from speculators_dsv4 import HS_FORMAT
 from speculators_dsv4.contract import DEFAULT_LAYERS, MANIFEST, make_manifest
+from speculators_dsv4.preprocessing import DATA_MANIFEST
 from speculators_dsv4.training import prepare_training
 from speculators_dsv4.training_contract import (
     distributed_validation,
@@ -97,6 +98,71 @@ class TrainingContractTests(unittest.TestCase):
         ):
             prepare_training(args)
         self.assertFalse(hasattr(args, "target_training_contract"))
+
+    def external_prepare(self, *, manifest=None, invalid_rows=False, **changes):
+        directory = self.root / "external-arrow"
+        directory.mkdir(exist_ok=True)
+        if manifest is not None:
+            (directory / DATA_MANIFEST).write_text("{}", encoding="utf-8")
+        args = self.args(data_path=str(directory), dsv4_external_arrow=True, **changes)
+        report = {
+            **self.report,
+            "config": {**self.report["config"], "vocab_size": 129280},
+        }
+        checked = {
+            "data_path": str(directory),
+            "row_count": 8,
+            "row_start": 4,
+            "row_stop": 8,
+        }
+        with (
+            patch("speculators_dsv4.training.inspect_checkpoint", return_value=report),
+            patch(
+                "speculators_dsv4.training.validate_data_manifest", side_effect=manifest
+            ) as native_check,
+            patch(
+                "speculators_dsv4.training.validate_external_arrow",
+                return_value=checked,
+                side_effect=ValueError("loss_mask invalid") if invalid_rows else None,
+            ) as external_check,
+        ):
+            if invalid_rows or isinstance(manifest, Exception):
+                with self.assertRaises(ValueError):
+                    prepare_training(args, rank=1, world_size=2)
+                self.assertFalse(hasattr(args, "target_training_contract"))
+            else:
+                prepare_training(args, rank=1, world_size=2)
+                self.assertEqual(args.target_training_contract, self.contract)
+        return args, native_check, external_check
+
+    def test_explicit_external_arrow_missing_manifest_keeps_target_hs_binding(self):
+        args, native_check, external_check = self.external_prepare()
+        native_check.assert_not_called()
+        external_check.assert_called_once_with(
+            args.data_path, 129280, rank=1, world_size=2
+        )
+        self.assertEqual(list(Path(args.data_path).iterdir()), [])
+
+    def test_external_opt_in_cannot_bypass_existing_invalid_manifest(self):
+        _, native_check, external_check = self.external_prepare(
+            manifest=ValueError("foreign tokenizer")
+        )
+        native_check.assert_called_once()
+        external_check.assert_not_called()
+
+    def test_external_opt_in_still_validates_existing_manifest(self):
+        _, native_check, external_check = self.external_prepare(manifest=lambda *_: {})
+        native_check.assert_called_once()
+        external_check.assert_called_once()
+
+    def test_external_bad_rows_abort_before_model_contract_is_set(self):
+        _, native_check, external_check = self.external_prepare(invalid_rows=True)
+        native_check.assert_not_called()
+        external_check.assert_called_once()
+
+    def test_external_mode_still_requires_hs_manifest(self):
+        with self.assertRaisesRegex(ValueError, "start the DSV4 HS server"):
+            self.external_prepare(hidden_states_path=str(self.root / "missing-hs"))
 
     def test_fresh_training_binds_independent_manifest_copy(self):
         args = self.args()

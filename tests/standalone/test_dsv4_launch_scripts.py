@@ -87,6 +87,7 @@ class LaunchScriptTests(unittest.TestCase):
             "NUM_TRAIN_NPUS": "16",
             "TARGET_QUANTIZATION": "",
             "DSV4_EVAL": "0",
+            "DSV4_EXTERNAL_ARROW": "0",
             "TRAINING_SMOKE": "0",
             "MODE": "ready",
             "WAIT_STATUS": "0",
@@ -166,6 +167,7 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.capture.read_text().splitlines()
         self.assertIn("scripts/train.py", args)
+        self.assertNotIn("--dsv4-external-arrow", args)
         self.assertEqual(args[args.index("--epochs") + 1], "10")
         self.assertEqual(
             args[args.index("--vllm-endpoint") + 1], "http://127.0.0.1:9123/v1"
@@ -193,7 +195,45 @@ class LaunchScriptTests(unittest.TestCase):
         args = self.capture.read_text().splitlines()
         self.assertIn("scripts/check_dsv4_training.py", args)
         self.assertNotIn("scripts/train.py", args)
+        self.assertNotIn("--dsv4-external-arrow", args)
         self.assertFalse((self.output / "logs/train.pid").exists())
+
+    def test_external_arrow_opt_in_reaches_normal_and_smoke_training(self):
+        (self.output / "logs").mkdir(parents=True)
+        for smoke in ("0", "1"):
+            with self.subTest(smoke=smoke):
+                result = self.run_script(
+                    "trainer",
+                    DSV4_EXTERNAL_ARROW="1",
+                    TRAINING_SMOKE=smoke,
+                    SMOKE_PHASE="fresh",
+                    SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                )
+                self.assertEqual(
+                    result.returncode, 17 if smoke == "1" else 0, result.stderr
+                )
+                args = self.capture.read_text().splitlines()
+                self.assertEqual(args.count("--dsv4-external-arrow"), 1)
+                if smoke == "1":
+                    self.assertGreater(
+                        args.index("--dsv4-external-arrow"), args.index("--")
+                    )
+
+    def test_invalid_external_arrow_setting_rejected_before_launch(self):
+        for value in ("true", "2", "-1"):
+            for smoke in ("0", "1"):
+                with self.subTest(value=value, smoke=smoke):
+                    result = self.run_script(
+                        "trainer",
+                        DSV4_EXTERNAL_ARROW=value,
+                        TRAINING_SMOKE=smoke,
+                        SMOKE_PHASE="fresh",
+                        SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("DSV4_EXTERNAL_ARROW must be 0 or 1", result.stderr)
+                    self.assertFalse(self.capture.exists())
+                    self.assertFalse(self.output.exists())
 
 
 if __name__ == "__main__":

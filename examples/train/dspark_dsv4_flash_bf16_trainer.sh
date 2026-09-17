@@ -6,12 +6,17 @@ set -euo pipefail
 # This script runs on a DIFFERENT host from the 16-device target server.
 MODEL="${MODEL:-/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 DATA_PATH="${DATA_PATH:-/mnt/nfs/dataset/arrow_0730_77w_dedup}"
+DSV4_EXTERNAL_ARROW="${DSV4_EXTERNAL_ARROW:-0}"
 HS_PATH="${HS_PATH:-/mnt/nfs/dataset/tmp_hs}"
 TRAIN_NPUS="${TRAIN_NPUS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-16}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://80.48.17.187:8001/v1}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_dsv4_flash_bestArch}"
 LOG_DIR="$OUTPUT_DIR/logs"
+case "$DSV4_EXTERNAL_ARROW" in
+  0|1) ;;
+  *) echo "DSV4_EXTERNAL_ARROW must be 0 or 1" >&2; exit 2 ;;
+esac
 TRAIN_ENTRY=(scripts/train.py)
 case "${TRAINING_SMOKE:-0}" in
   0) ;;
@@ -69,6 +74,10 @@ TRAIN_CMD=(env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   --first-error-focal-alpha 0.0 --adaptive-loss none \
   --no-ssal-curriculum --ssal-curriculum-start 0.1 --ssal-curriculum-end 0.6 \
   --on-missing generate --on-generate delete)
+if [[ "$DSV4_EXTERNAL_ARROW" == 1 ]]; then
+  # Declare external Arrow already uses this DSV4 tokenizer/template; no reprocessing.
+  TRAIN_CMD+=(--dsv4-external-arrow)
+fi
 
 # The smoke wrapper must wait for fresh to finish before starting resume.
 if [[ "${TRAINING_SMOKE:-0}" == 1 ]]; then

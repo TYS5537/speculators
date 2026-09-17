@@ -1,5 +1,6 @@
 """Training-side validation, imported only by the explicit DSV4 HS path."""
 
+import logging
 from pathlib import Path
 
 from speculators_dsv4 import HS_FORMAT
@@ -8,20 +9,59 @@ from speculators_dsv4.contract import (
     inspect_checkpoint,
     validate_layers,
 )
-from speculators_dsv4.preprocessing import validate_data_manifest
+from speculators_dsv4.external_data import validate_external_arrow
+from speculators_dsv4.preprocessing import DATA_MANIFEST, validate_data_manifest
 from speculators_dsv4.training_contract import (
     read_training_contract,
     validate_draft_contract,
 )
 
+logger = logging.getLogger(__name__)
 
-def prepare_training(args):
+
+def _validate_training_data(args, report, rank, world_size):
+    external = getattr(args, "dsv4_external_arrow", False)
+    manifest = Path(args.data_path) / DATA_MANIFEST
+    # An explicit external-data opt-in can accept an absent native manifest, but
+    # must never silence a malformed/mismatched manifest that is actually present.
+    if not external or manifest.exists() or manifest.is_symlink():
+        validate_data_manifest(args.data_path, report)
+    if external:
+        logger.info("Checking external DSV4 Arrow on rank %s/%s", rank, world_size)
+        checked = validate_external_arrow(
+            args.data_path,
+            report["config"]["vocab_size"],
+            rank=rank,
+            world_size=world_size,
+        )
+        logger.info(
+            "External Arrow structure checked: %s rows [%s, %s) of %s",
+            checked["data_path"],
+            checked["row_start"],
+            checked["row_stop"],
+            checked["row_count"],
+        )
+        if rank == 0:
+            logger.warning(
+                "External DSV4 Arrow provenance is USER-ASSERTED, not "
+                "tokenizer/template verified. Tokens, masks and row order "
+                "are preserved; no native "
+                "data manifest is created. Source=%s, target=%s, signature=%s. "
+                "The opt-in and paths are recorded in train_command.txt. Keep a "
+                "separate HS directory if this is a different dataset.",
+                checked["data_path"],
+                report["model_path"],
+                report["checkpoint_signature"],
+            )
+
+
+def prepare_training(args, *, rank=0, world_size=1):
     if args.speculator_type != "dspark":
         raise ValueError("The DSV4 target adapter currently supports DSpark only.")
     if args.hidden_states_backend != "file" or args.legacy_data:
         raise ValueError("DSV4 currently requires the file HS backend and Arrow data.")
     report = inspect_checkpoint(args.verifier_name_or_path)
-    validate_data_manifest(args.data_path, report)
+    _validate_training_data(args, report, rank, world_size)
     saved = None
     if args.from_pretrained:
         from transformers import PretrainedConfig  # noqa: PLC0415

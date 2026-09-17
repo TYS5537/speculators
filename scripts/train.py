@@ -593,6 +593,8 @@ def main(args: argparse.Namespace):  # noqa: C901
     target_config = get_verifier_config(args.verifier_name_or_path)
     target_is_dsv4 = getattr(target_config, "model_type", None) == "deepseek_v4"
     use_dsv4_format = args.target_hidden_state_format == "deepseek_v4_mean_hc_head"
+    if getattr(args, "dsv4_external_arrow", False) and not use_dsv4_format:
+        raise ValueError("--dsv4-external-arrow is only supported for DSV4 training")
     if target_is_dsv4 != use_dsv4_format:
         raise ValueError(
             "DSV4 targets require --target-hidden-state-format "
@@ -606,7 +608,13 @@ def main(args: argparse.Namespace):  # noqa: C901
         )
 
         distributed_validation(
-            lambda: prepare_training(args),
+            lambda: prepare_training(
+                args,
+                rank=get_rank(),
+                world_size=torch.distributed.get_world_size()
+                if is_distributed()
+                else 1,
+            ),
             torch.distributed if is_distributed() else None,
         )
 
@@ -688,6 +696,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        pretokenized_text_only=getattr(args, "dsv4_external_arrow", False),
     )
 
     # Get trainer kwargs from model class
@@ -1117,6 +1126,16 @@ def parse_args():
         choices=["standard", "deepseek_v4_mean_hc_head"],
         default="standard",
         help="Opt-in DSV4 auxiliary-mean / post-hc_head teacher HS contract.",
+    )
+    parser.add_argument(
+        "--dsv4-external-arrow",
+        action="store_true",
+        help=(
+            "Accept external tokenized text Arrow without this repo's data manifest. "
+            "You confirm its tokenizer/template/masks match the current "
+            "DSV4 target. Checks all rows structurally, preserves IDs/masks/order, and "
+            "never bypasses an existing manifest or the target HS/checkpoint contract."
+        ),
     )
     parser.add_argument(
         "--token-freq-path",
@@ -1734,6 +1753,14 @@ def parse_args():
     )
 
     args = parser.parse_args()
+    if args.dsv4_external_arrow and (
+        args.target_hidden_state_format != "deepseek_v4_mean_hc_head"
+        or args.speculator_type != "dspark"
+        or args.legacy_data
+    ):
+        parser.error(
+            "--dsv4-external-arrow requires DSV4 DSpark training with Arrow data"
+        )
     args._provided_model_config_dests = explicitly_provided_dests(
         parser, PRETRAINED_MODEL_CONFIG_FLAGS
     )

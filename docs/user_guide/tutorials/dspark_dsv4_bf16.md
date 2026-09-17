@@ -1,167 +1,222 @@
-# DSV4-Flash target / BF16 HS 接入（实验性）
+# DSV4-Flash Target / BF16 Hidden States Integration (Experimental)
 
-这版将 DSV4 target 接到当前 dense DSpark drafter 的训练链路，**不切换到官方
-MoE/mHC drafter，不修改 Qwen 的默认计算路径**。当前状态是可供 A3 实机联调的
-训练/HS 接口和实验性离线接受长度后端，不是已验证的端到端支持。
+This integration connects a DSV4 target to the current dense DSpark drafter's
+training pipeline. **It does not switch to the official MoE/mHC drafter or change
+Qwen's default computation path.** It provides training/hidden-state (HS)
+interfaces and an experimental offline acceptance-length backend for A3 hardware
+testing, not validated end-to-end support.
 
-## 已实现与边界
+## Implemented Features and Limitations
 
-- 独立 vLLM architecture 插件；只有 `--dsv4` 启用，旧 `--dsv4-bf16` 为兼容别名。
-- 分散取层、teacher HS 修正、冻结 target embedding / head / norm 的加载。
-- checkpoint 结构与训练 IO 检查、HS 目录契约检查、单请求 HS 检查脚本。
-- 训练 HS 服务可选单机 DP2，检查 TP×DP 设备数；提供多请求并发 HS 接线检查。
-- vLLM 0.26.0 / Ascend 0.26.0rc1 的默认 V1 runner 缓存兼容：保留原生 C4/C128/SWA 分组与共享，
-  将 HS 独立成缓存组和物理 tensor，并纳入统一 block 池的显存预算及容量检查。
-  `--dsv4` 自动启用；只调整缓存规划及 HS tensor 绑定，不改模型结构、取层或训练计算。
-  此修复未覆盖强制 `VLLM_USE_V2_MODEL_RUNNER=1` 的启动方式。
-- 通用数据入口支持 DSV4 官方服务端编码、已有 token 数据直通及数据来源契约。
-- teacher 概率对照工具；显式加载和自动续训均校验 checkpoint 的 target 身份。
-- 独立输出目录中的短程训练、验证、保存与恢复验收入口；不替代 A3 实测。
-- 保留 `corrGate=0`、Muon + linear、基础 LR `6e-5` 和用户原有特性开关。
-- 允许量化 target backbone，由推理后端加载；导出的 HS 仍为 BF16。
-- **未提供权重反量化/转换器，也未验证量化 target 的 A3 实机运行。**
-- 已实现 opt-in 的 `--target-backend dsv4-vllm` 离线接受长度后端：
-  通过 target 服务全前缀重算，不对 V4 压缩注意力状态使用普通 KV cache 回退。
-  单机入口默认整块验证，保留逐位置 reference 作为显式对照。
-  **尚未进行 A3 实机验证；不用于测量线上吞吐或加速比。**
-- 新增单机单入口评估：自动启动本地 target、等待就绪、运行 eval 并回收自己启动的
-  子进程；可以分卡，也可在显式授权及设置 target 内存预算后共卡。
-- 尚未在真实 A3 上验证启动、HS 导出、teacher logits 或训练收敛。
+- A separate vLLM architecture plugin, enabled only by `--dsv4`;
+  `--dsv4-bf16` remains a compatibility alias.
+- Spaced layer selection, corrected teacher HS, and loading of frozen
+  target embeddings, LM head, and final norm.
+- Checkpoint structure and training IO checks, HS directory contract validation,
+  and a single-request HS check script.
+- Optional single-host DP2 for the training HS service, TP x DP device-count
+  validation, and concurrent multi-request HS integration checks.
+- Cache compatibility for the default V1 runner in vLLM 0.26.0 / Ascend 0.26.0rc1:
+  native C4/C128/SWA grouping and sharing are preserved. HS gets its own cache
+  group and physical tensor, included in the shared block pool's memory budget
+  and capacity checks. `--dsv4` enables this automatically. Only cache planning
+  and HS tensor binding change, not model structure, layer selection, or training
+  computation. This fix does not cover forced `VLLM_USE_V2_MODEL_RUNNER=1` runs.
+- A shared data entry point supporting DSV4's official server-side encoding,
+  pre-tokenized inputs, and data provenance contracts.
+- Teacher probability comparison tools; explicit checkpoint loading and automatic
+  resume both validate the checkpoint's target identity.
+- Short training, validation, save, and resume checks in isolated output
+  directories. These do not replace A3 hardware testing.
+- The existing `corrGate=0`, Muon + linear schedule, base LR `6e-5`, and feature
+  flags are preserved.
+- Quantized target backbones are allowed and loaded by the inference backend;
+  exported HS remain BF16.
+- **No weight dequantizer/converter is provided, and quantized-target execution
+  on A3 hardware has not been validated.**
+- An opt-in `--target-backend dsv4-vllm` offline acceptance-length backend that
+  recomputes the full prefix through the target service instead of using ordinary
+  KV cache rollback on V4's compressed attention state. The single-host launcher
+  defaults to block verification, with per-position reference verification
+  available explicitly. **This has not been validated on A3 hardware and is not
+  intended to measure online throughput or speedup.**
+- A single-command, single-host evaluation launcher that starts the local target,
+  waits for readiness, runs evaluation, and cleans up its own child processes.
+  It supports separate devices, or explicitly authorized device sharing with a
+  target memory budget.
+- Startup, HS export, teacher logits, and training convergence have not yet been
+  validated on real A3 hardware.
 
-更新此兼容补丁后，应在 **target 的 vLLM 环境**安装当前 checkout
-（`pip install -e . --no-deps`）并重启服务；现有 TP/DP 和训练启动参数无需因此修改。
-预算包含 HS 缓存数据；后端的 tensor 对齐开销仍沿用原生处理。
-显式 `--num-gpu-blocks-override` 仍继承 vLLM 的强制容量语义，可能超过真实显存，
-通常应省略此调试选项，交由显存 profiling 决定容量。
+After updating this compatibility patch, install the current checkout in the
+**target's vLLM environment** (`pip install -e . --no-deps`) and restart the
+service. Existing TP/DP and training launch arguments do not need to change for
+this fix. The budget includes HS cache data; tensor alignment overhead retains
+the backend's native handling. Explicit `--num-gpu-blocks-override` still uses
+vLLM's forced-capacity semantics and may exceed physical device memory. Normally,
+omit this debugging option and let memory profiling determine cache capacity.
 
-## 权重：`torch_dtype=bf16` 不等于全量 BF16
+## Weights: `torch_dtype=bf16` Does Not Mean All Weights Are BF16
 
-Preview 或 0731 必须使用各自匹配的 checkpoint、回答、token 数据和 HS，
-不混用不同版本或量化方案的 HS，也不复用 Qwen 的缓存。
+Use matching checkpoints, responses, token data, and HS for Preview or 0731.
+Do not mix HS across versions or quantization schemes, or reuse Qwen caches.
 
-官方 Preview `deepseek-ai/DeepSeek-V4-Flash` 发布的是 FP4 + FP8 混合权重；
-其配置同时包含 `torch_dtype=bfloat16`、`expert_dtype=fp4` 和 FP8 量化配置。
-这里不再要求全量 checkpoint 转为 BF16：target 的量化计算由兼容的推理后端负责，
-`--dtype bfloat16` 约束运行/HS 路径，不会把磁盘上的 FP4/FP8 权重自动变成全量 BF16。
-[官方 Preview 配置](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json)
+The official Preview `deepseek-ai/DeepSeek-V4-Flash` release uses mixed FP4 + FP8
+weights. Its configuration includes `torch_dtype=bfloat16`, `expert_dtype=fp4`,
+and FP8 quantization settings. Converting the entire checkpoint to BF16 is no
+longer required here: a compatible inference backend handles quantized target
+computation. `--dtype bfloat16` controls the runtime/HS path; it does not
+automatically convert FP4/FP8 weights on disk into an all-BF16 checkpoint.
+[Official Preview configuration](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/config.json)
 
-训练端只读取并冻结 target 的 embedding、LM head 和最终 norm；这三个模块必须是
-可直接加载的未量化浮点权重。若它们自身被量化，仍会明确报错，需要单独处理这些
-权重及其 scale；本补丁不包含局部转换器。不能仅删除量化元数据来通过检查。
+The trainer reads and freezes only the target's embeddings, LM head, and final
+norm. These three modules must contain directly loadable, unquantized
+floating-point weights. If they are quantized, loading fails explicitly and
+their weights and scales must be handled separately. This patch does not include
+a converter for those modules. Removing quantization metadata is not a valid
+way to pass the checks.
 
-vllm-ascend `0.26.0rc1` 的 A3 文档已有 Preview 衍生 W8A8 部署示例；这不等于
-官方原始 FP4/FP8 在 A3 上可直接加载。后者仍需后端能力确认与实机验证。
-不支持的量化格式将由后端拒绝，不会通过本补丁增加硬件算子支持。
-[A3 部署教程](https://docs.vllm.ai/projects/ascend/en/v0.26.0rc1/tutorials/models/DeepSeek-V4-Flash.html)
+The vllm-ascend `0.26.0rc1` A3 documentation includes a deployment example for a
+Preview-derived W8A8 checkpoint. This does not establish that the original
+official FP4/FP8 weights load directly on A3; backend support and hardware
+validation are still required. The backend rejects unsupported quantization
+formats. This patch does not add hardware operator support.
+[A3 deployment tutorial](https://docs.vllm.ai/projects/ascend/en/v0.26.0rc1/tutorials/models/DeepSeek-V4-Flash.html)
 
 ```bash
 python scripts/check_dsv4_checkpoint.py /shared/models/dsv4-flash-target
 ```
 
-检查器只读取 safetensors 头，不加载整个模型，检查：
+The checker reads safetensors headers without loading the whole model. It checks:
 
-- Flash 几何参数：43 层、hidden 4096、4 路 HC、vocab 129280。
-- shard 索引、张量头结构以及 target embedding/head/final norm 的精确键和尺寸。
-- 训练所需的上述 IO 权重为未量化浮点；backbone 允许量化权重与 scale。
+- Flash geometry: 43 layers, hidden size 4096, four HC streams, vocabulary 129280.
+- Shard indices, tensor header structure, and the exact keys and shapes of the
+  target embeddings, LM head, and final norm.
+- Unquantized floating-point IO weights for training; quantized backbone weights
+  and scales are allowed.
 
-**通过检查不代表量化后端支持、scale 使用正确、整个模型权重完整或 A3 算子可用**；
-还需完整加载和数值对照。需要主动审计全 BF16 checkpoint 时，仍可使用严格检查器
-`python scripts/check_dsv4_bf16.py /path/to/bf16-checkpoint`，但这不是服务和训练的前提。
-如另行转换权重，应保留原 checkpoint，在新目录输出并记录来源 revision 与工具版本；
-反量化不能恢复量化前丢失的精度。
+**Passing does not establish quantization-backend support, correct scale usage,
+complete model weights, or working A3 operators.** Full loading and numerical
+comparison are still required. To audit an all-BF16 checkpoint explicitly, use
+`python scripts/check_dsv4_bf16.py /path/to/bf16-checkpoint`; that stricter check
+is not a prerequisite for serving or training. If converting weights separately,
+keep the original checkpoint, write to a new directory, and record the source
+revision and tool versions. Dequantization cannot recover precision already lost
+during quantization.
 
-## HS 约定
+## Hidden-State Contract
 
-训练参数 `--target-layer-ids 1 11 21 30 40` 使用 **HS slot 编号**，对应
-0-based decoder block `[0, 10, 20, 29, 39]` 的输出，不是 decoder block 本身编号。
-这是本次分散取层实验的选择，不是官方推荐的最优层组合。
+The training option `--target-layer-ids 1 11 21 30 40` uses **HS slot indices**,
+corresponding to outputs of zero-based decoder blocks `[0, 10, 20, 29, 39]`, not
+the decoder block indices themselves. This is the selection used for the current
+spread-layer experiment, not an officially recommended optimal combination.
 
-每个中间层的四路 residual 在 HC 维上取均值，得到 `[tokens, 4096]`。
-最后额外加入 slot 43，专门用于 teacher：
+At each selected intermediate layer, the four residual streams are averaged
+over the HC dimension, producing `[tokens, 4096]`. Slot 43 is appended separately
+for the teacher:
 
 ```text
-中间层四路 residual -> mean(HC) -> 5 个 drafter 输入槽位
-最终四路 residual   -> hc_head -> 第 6 个槽位（final norm 之前）
-                                      |
-                         trainer: frozen norm -> frozen lm_head
+Intermediate four-stream residuals -> mean(HC) -> 5 drafter input slots
+Final four-stream residuals        -> hc_head -> slot 6 (before final norm)
+                                                    |
+                                      trainer: frozen norm -> frozen lm_head
 ```
 
-不能把最终四路均值当成 teacher；native Ascend 的 auxiliary 输出是均值，而 target
-实际输出还经过 `hc_head`。插件保留原 target 的 normalized 输出，只替换导出列表的
-最后一项，并在 norm 前复制，避免原地运算污染捕获值。
-[对应 Ascend 实现](https://github.com/vllm-project/vllm-ascend/blob/v0.26.0rc1/vllm_ascend/models/deepseek_v4.py)
+Do not use the final four-stream mean as the teacher. Native Ascend auxiliary
+outputs are means, while the actual target output also passes through `hc_head`.
+The plugin preserves the target's normalized output and replaces only the last
+exported entry. It clones that entry before norm to prevent in-place operations
+from corrupting the captured value.
+[Corresponding Ascend implementation](https://github.com/vllm-project/vllm-ascend/blob/v0.26.0rc1/vllm_ascend/models/deepseek_v4.py)
 
-传输形状是 `[seq_len, 6, 4096]`，存储 dtype 为 BF16；训练器将前五项展平为 context，第六项送入
-已有的 TV loss / correction hidden supervision 路径。
-BF16 HS 仍受 target 量化计算的数值影响，不代表与全 BF16 target 的 HS 一致。
-训练数据、HS 生成和后续在线部署应保持相同的 target checkpoint 与量化方案。
+The transfer shape is `[seq_len, 6, 4096]`, stored as BF16. The trainer flattens
+the first five entries into context and sends the sixth through the existing TV
+loss / correction hidden-supervision path. BF16 HS still reflect the numerical
+effects of target quantization; they are not necessarily equal to HS from an
+all-BF16 target. Keep the same target checkpoint and quantization scheme across
+training data, HS generation, and subsequent online deployment.
 
-HS 目录必须是新的空目录。启动器创建 `dspark_dsv4_hs.json`，训练器核对 target
-路径、结构签名、HS 层号和格式。不允许将旧 HS 文件补一个新标签后继续使用。
-签名基于 config / 量化元数据、张量头、文件大小和修改时间，**不是全量权重内容哈希**。
-服务端还记录显式 `--quantization`（或未指定、由后端自动识别），重启时改变该选项
-会拒绝复用原 HS 目录。旧版未记录此运行选项的目录也需更换；训练端无需重复传该选项。
-两端使用相同的共享绝对路径，训练期间不得改动 checkpoint。
-manifest 的存在仅表示启动约定已记录，不代表服务已经成功就绪。
+Start with a new, empty HS directory. The launcher creates `dspark_dsv4_hs.json`,
+and the trainer checks the target path, structural signature, HS layer indices,
+and format. Do not relabel old HS files to reuse them. The signature covers
+configuration/quantization metadata, tensor headers, file sizes, and modification
+times; **it is not a hash of all weight contents**. The server also records an
+explicit `--quantization` setting, or backend auto-detection when unspecified.
+Changing that setting on restart prevents reuse of the HS directory. Directories
+from older versions that did not record it must also be replaced; the trainer
+does not need to repeat the option. Both sides must use the same shared absolute
+paths, and the checkpoint must not change during training. A manifest only
+records the launch contract; its existence does not mean the service is ready.
 
-## Drafter 配方
+## Drafter Recipe
 
-配置：`examples/train/dsv4_flash_dense_config.json`。
+Configuration: `examples/train/dsv4_flash_dense_config.json`.
 
-保留 5 层 dense Qwen3-style decoder、32 Q / 8 KV heads、head_dim 128、FFN 9728、
-SWA 2048、RoPE theta 1e6，以及原有 correction、dynamic conv、selector 等选项。
-因当前实现要求 draft/target IO hidden width 一致，hidden 从 Qwen3-4B 的 2560
-改为 4096，vocab 改为 129280；**这不是参数量完全相同的模型，也不支持直接复用
-Qwen draft 权重**。不把 V4 的 MLA / 压缩注意力几何参数复制给 dense draft。
+The recipe retains a five-layer dense Qwen3-style decoder, 32 Q / 8 KV heads,
+head dimension 128, FFN size 9728, SWA 2048, RoPE theta 1e6, and the existing
+correction, dynamic convolution, selector, and other options. The current
+implementation requires matching draft/target IO hidden widths, so hidden size
+changes from Qwen3-4B's 2560 to 4096, and vocabulary size becomes 129280.
+**The parameter count is therefore not identical, and Qwen draft weights cannot
+be reused directly.** V4's MLA / compressed-attention geometry is not copied
+into the dense draft.
 
-训练脚本固定 `epochs=10`、`seq_len=3072`、`block_size=7`、`max_anchors=512`、
-`correction_gate_bias=0`、`correction_markov_gate_bias=-2`。
-优化器保持 Muon + linear，`--lr 6e-5` 对应 AdamW 部分基础 LR；未单独设置时
-Muon 基础 LR 为 `6e-4`。这沿用当前实验，不冒充官方 DeepSpec 的 AdamW + cosine。
+The training script pins `epochs=10`, `seq_len=3072`, `block_size=7`,
+`max_anchors=512`, `correction_gate_bias=0`, and `correction_markov_gate_bias=-2`.
+It retains Muon + linear scheduling. `--lr 6e-5` is the base LR for the AdamW
+portion; without a separate override, Muon's base LR is `6e-4`. This preserves
+the current experiment, not the official DeepSpec AdamW + cosine recipe.
 
-## A3 启动和实机检查
+## A3 Startup and Hardware Checks
 
-接口按 vLLM `0.26.0` / vllm-ascend `0.26.0rc1` 编写，并在初始化时校验版本。
-镜像 tar 文件名不能证明其内部软件版本；先在容器内核对。
+The interfaces target vLLM `0.26.0` / vllm-ascend `0.26.0rc1` and validate
+versions during initialization. An image tar filename does not establish its
+installed software versions; check them inside the container first.
 
-限制：eager、file HS backend、PP=1、PCP=DCP=1，关闭 prefix cache、
-chunked prefill、FlashComm1 / SP、DSA-CP。训练 HS 服务支持单机 DP=1 或 2，
-底层启动器默认仍为 DP1，当前 server 示例预置为 TP8×DP2；DP2 要求开启 EP、
-两个 DP engine 全部位于本机、使用 mp 后端和
-内部请求分发。多机 DP、DP>2 和外部负载均衡未开放。整块验证及自动离线评估入口
-仍为 DP1。真实 A3 拓扑、HS 导出和数值一致性尚待验证。
-不覆盖已有 vLLM/Ascend 安装，也不修改 native V4 / Qwen 注册。
+Requirements: eager execution, file HS backend, PP=1, PCP=DCP=1, and disabled
+prefix caching, chunked prefill, FlashComm1 / SP, and DSA-CP. The training HS
+service supports single-host DP=1 or 2. The underlying launcher still defaults
+to DP1; the current server example uses TP8 x DP2. DP2 requires EP, both DP
+engines on the same host, the mp backend, and internal request dispatch.
+Multi-host DP, DP>2, and external load balancing are not enabled. Block
+verification and the automated offline evaluation launcher remain DP1-only.
+Real A3 topology, HS export, and numerical agreement still require validation.
+The integration does not overwrite an existing vLLM/Ascend installation or
+change native V4 / Qwen registration.
 
-在服务端和训练端的既有环境中安装本 checkout（不要顺带升级 torch/vLLM）：
+Install this checkout in the existing server and trainer environments without
+upgrading torch/vLLM as a side effect:
 
 ```bash
 pip install -e . --no-deps
 pip install -e hs_connectors --no-deps
 ```
 
-如设置了 `VLLM_PLUGINS` 白名单，需要加入 `speculators_dsv4`，并保留 Ascend
-需要的其他插件。不设置白名单时由 vLLM 自动发现。
+If `VLLM_PLUGINS` is set as an allowlist, add `speculators_dsv4` while preserving
+other plugins required by Ascend. Otherwise vLLM discovers plugins automatically.
 
-所有脚本都从仓库根目录运行。两个启动脚本已预置当前双机实验的 checkpoint、
-数据/HS 路径、16 个设备及 target 地址 `80.48.17.187:8001`，环境变量可覆盖。
-target 与 trainer 必须分别运行在两台机器上，不能直接把两个默认脚本放在同一台。
-服务端路径与设备不同时，显式设置以下变量：
-脚本与本文保留历史文件名中的 `bf16`，其含义是 BF16 HS 接口，不再要求全量 BF16 权重。
+Run all scripts from the repository root. Both launch scripts are preconfigured
+with the current two-host experiment's checkpoint, data/HS paths, 16 devices,
+and target address `80.48.17.187:8001`; environment variables can override them.
+The target and trainer must run on separate hosts with these defaults. Do not
+run both default scripts on one host. Set the following variables explicitly
+when server paths or devices differ. Historical filenames retain `bf16`, which
+now refers to the BF16 HS interface, not a requirement for all-BF16 weights.
 
 ```bash
 export MODEL=/shared/models/dsv4-flash-target
 export HS_PATH=/shared/hs/dsv4-flash-target-spread-v1
-# 按实际设备与内存填写，不在这里假定每台机器的卡数。
+# Set these for the actual devices and memory; no device count per host is assumed.
 export VLLM_NPUS='<target device IDs>'
 export TP_SIZE='<target tensor parallel size>'
-export DP_SIZE=1  # 可选 2；VLLM_NPUS 的设备数必须等于 TP_SIZE * DP_SIZE。
+export DP_SIZE=1  # Or 2; the VLLM_NPUS device count must equal TP_SIZE * DP_SIZE.
 export VLLM_HOST='<target host internal IP; use 127.0.0.1 for local-only testing>'
-# 默认不设置，由后端识别 checkpoint；仅在匹配的 Ascend 量化格式要求时设置：
+# Leave unset for backend detection; set only when the matching Ascend format requires it:
 # export TARGET_QUANTIZATION=ascend
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
-单台 A3 **确实暴露 16 个逻辑设备**时，可选择 `TP8 × DP2 / EP16`：
+If one A3 host **actually exposes 16 logical devices**, you can use
+`TP8 x DP2 / EP16`:
 
 ```bash
 export VLLM_NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
@@ -171,35 +226,49 @@ export HS_PATH=/shared/hs/dsv4-flash-target-spread-dp2-v1
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
-这里 DP2 在 target **同一台机器内部**，不是两台机器各一个 DP；另一台机器仍
-运行 trainer。启动器设置 `--data-parallel-size-local 2`，保留 EP，并在启动前检查
-可见设备编号唯一、`设备数=TP×DP`。直接使用 `scripts/launch_vllm.py --dsv4` 时，
-也会检查这些条件；DP2 必须显式设置 `ASCEND_RT_VISIBLE_DEVICES`，不能指定
-`--headless`、外部 DP rank、Ray 或多机布局。插件在各 worker 中再次检查实际配置。
-PP/CP 仍为 1，MoE 的 EP 组大小在此为 TP×DP；EP 不额外乘一遍设备数。
-[vLLM 0.26 并行配置](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/config/parallel.py)
+Here DP2 runs **within the target host**, not as one DP replica on each of two
+hosts. The other host still runs the trainer. The launcher sets
+`--data-parallel-size-local 2`, retains EP, and checks that visible device IDs
+are unique and `device count = TP x DP` before startup. Direct use of
+`scripts/launch_vllm.py --dsv4` performs the same checks. DP2 requires an explicit
+`ASCEND_RT_VISIBLE_DEVICES`; `--headless`, external DP ranks, Ray, and multi-host
+layouts are not allowed. The plugin rechecks the actual configuration in every
+worker. PP/CP remain 1, and the MoE EP group size here is TP x DP; EP does not
+multiply the device requirement again.
+[vLLM 0.26 parallel configuration](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/config/parallel.py)
 
-HS 继续使用上游 `ExampleHiddenStatesConnector`：各 DP engine 的 TP rank 0
-写出自己调度的请求，通过响应返回文件路径。没有增加第二套 HS 文件格式，teacher
-仍是 final norm 前，trainer 参数、drafter 架构和 loss 不变。训练端的多卡 DDP 与
-server DP 独立，不需要把 `NUM_TRAIN_NPUS` 改成 2。
+HS still use upstream `ExampleHiddenStatesConnector`. TP rank 0 of each DP
+engine writes the requests scheduled by that engine and returns the file path
+in the response. No second HS file format is introduced. The teacher remains
+pre-final-norm, and trainer arguments, drafter architecture, and loss are
+unchanged. Trainer-side multi-device DDP is independent of server DP; there is
+no need to change `NUM_TRAIN_NPUS` to 2.
 
-更换 TP/DP 布局可能改变浮点计算与显存预算，首次验证建议使用新的 HS 目录，
-避免读到旧拓扑缓存。现有 manifest **不绑定 TP/DP 拓扑**；它通过不代表数值或
-显存验收通过。上述 16 设备示例也不保证当前量化 checkpoint 一定装得下。
+Changing TP/DP topology may affect floating-point computation and memory
+budgets. Use a fresh HS directory for initial validation to avoid reading
+caches from the old topology. The current manifest **does not bind TP/DP
+topology**; passing its checks does not validate numerical behavior or memory
+capacity. The 16-device example above does not guarantee that the current
+quantized checkpoint fits.
 
-`TARGET_QUANTIZATION` 如非空会原样作为一个 `--quantization` 参数传给后端；
-不设置时不添加该参数。`ascend` 不是将任意官方 FP4/FP8 文件转成 Ascend W8A8 的开关。
+If nonempty, `TARGET_QUANTIZATION` is forwarded unchanged as a single
+`--quantization` argument; when unset, no such argument is added. `ascend` is
+not a switch that converts arbitrary official FP4/FP8 files to Ascend W8A8.
 
-两台 Atlas A3 可考虑一台 target、一台 trainer，但先按实际量化格式确认单台是否装得下
-target 权重与运行时开销；Flash 是 284B 总参数，不能用 13B 激活参数估算权重内存。
-脚本没有假定跨机 TP 可用；跨机 TP/EP 需要另行核对通信环境。
-[官方模型规模](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
+With two Atlas A3 hosts, one can run the target and the other the trainer, but
+first confirm that the actual quantization format allows the target weights
+and runtime overhead to fit on one host. Flash has 284B total parameters;
+13B active parameters must not be used to estimate weight memory. The scripts
+do not assume cross-host TP is available; cross-host TP/EP requires separate
+communication-environment checks.
+[Official model size](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 
-两台机器必须共享 MODEL 和 HS_PATH 的相同绝对路径。将服务端口限制在可信内部网络，
-不要直接向公网开放。训练端的 `VLLM_ENDPOINT` 改为 target 主机的内部地址。
+Both hosts must share the same absolute MODEL and HS_PATH paths. Restrict the
+service port to a trusted internal network, not the public internet. Point the
+trainer's `VLLM_ENDPOINT` at the target host's internal address.
 
-服务就绪后，先跑小请求；下面 token IDs 仅为传输测试，不是评估 prompt：
+Once the service is ready, run a small request first. The token IDs below are
+only a transport probe, not an evaluation prompt:
 
 ```bash
 python scripts/check_dsv4_hs.py \
@@ -208,17 +277,23 @@ python scripts/check_dsv4_hs.py \
   --input-ids 100 200 300 400
 ```
 
-该脚本检查 token 对齐、`[4,6,4096]` 形状、BF16 和有限值，并保留 HS 文件。
-它**不检查 teacher-logit 一致性**。正式训练前还应固定一批 prompt：
+The script checks token alignment, shape `[4,6,4096]`, BF16 dtype, and finite
+values, and retains the HS file. It **does not check teacher-logit agreement**.
+Before full training, also use a fixed set of prompts to:
 
-1. 对照匹配 checkpoint / 量化方案的可靠参考实现确认 target 输出；如做过转换，
-   额外检查转换前后的数值差异。
-2. 比较导出的 teacher 经 frozen norm/head 重建的 logits 与服务原始 logits，
-   检查 token 对齐和数值差异，而不仅仅看 argmax。
-3. 用少量 DSV4 数据跑训练/验证，确认有限 loss、有效梯度和恢复 checkpoint。
-4. 用下方实验性离线后端验证接受长度和停止边界，再扩大到完整训练。
+1. Compare target outputs with a reliable reference implementation using the
+   same checkpoint and quantization scheme. If weights were converted, also
+   check numerical differences before and after conversion.
+2. Compare logits reconstructed from exported teacher HS through frozen norm/head
+   with the service's raw logits. Check token alignment and numerical differences,
+   not just argmax agreement.
+3. Run training/validation on a small DSV4 dataset and check finite loss, valid
+   gradients, and checkpoint restoration.
+4. Validate acceptance length and stopping boundaries with the experimental
+   offline backend below before scaling up to full training.
 
-DP2 服务还应在单请求检查后运行不同长度的并发请求：
+After the single-request check, DP2 services should also run concurrent requests
+with different lengths:
 
 ```bash
 python scripts/check_dsv4_hs.py \
@@ -227,17 +302,23 @@ python scripts/check_dsv4_hs.py \
   --input-ids 100 200 300 400 --requests 8 --concurrency 2
 ```
 
-检查器循环使用原输入及其较短前缀，逐请求检查 token、HS 形状、BF16/有限值和
-输出文件唯一性，保留所有生成文件。**并发请求通过不证明两个 DP engine 都收到
-请求**，还需看服务端各 engine 的请求指标/日志；初始化日志中的 DP rank 0/1
-仅证明两个副本初始化，不证明它们都处理过请求。实机要覆盖只有一个副本有任务、
-两副本输入长度不同及持续并发，检查 dummy forward、EP 通信和文件写入失败。
-这些检查不替代 teacher 概率对照或 DP1/DP2 数值比较，也不是吞吐基准。
+The checker cycles through the original input and shorter prefixes. It checks
+tokens, HS shape, BF16/finite values, and unique output filenames per request,
+retaining all generated files. **Successful concurrent probes do not prove that
+both DP engines received requests.** Check per-engine request metrics/logs on
+the server. Initialization logs for DP ranks 0/1 only show that both replicas
+initialized, not that both processed requests. Hardware testing should cover
+work assigned to only one replica, different input lengths on the two replicas,
+and sustained concurrency. Check dummy forwards, EP communication, and file
+write failures. These checks do not replace teacher probability comparisons or
+DP1/DP2 numerical comparisons, and they are not throughput benchmarks.
 
-`DSV4_EVAL=1` 的普通 HS/reference 服务仍可开启 full-logprob 诊断；自动离线
-launcher 和专用 `--dsv4-block-verify` 继续限定 DP1，不随 `DP_SIZE=2` 自动放开。
+The ordinary HS/reference service can still enable full-logprob diagnostics
+with `DSV4_EVAL=1`. The automated offline launcher and dedicated
+`--dsv4-block-verify` service remain DP1-only; `DP_SIZE=2` does not enable DP2
+for them.
 
-训练端：
+On the trainer host:
 
 ```bash
 export DATA_PATH=/shared/data/dsv4-flash-target-arrow
@@ -248,34 +329,94 @@ export VLLM_ENDPOINT=http://TARGET_INTERNAL_IP:8001/v1
 bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
 ```
 
-普通训练通过 nohup 后台运行，输出日志和 PID 写到 `$OUTPUT_DIR/logs`；
-TensorBoard 写到 `$OUTPUT_DIR/logs/tensorboard`，脚本打印对应查看/停止命令。
-脚本返回只表示已提交后台进程，需要查看日志确认初始化成功；`TRAINING_SMOKE=1`
-仍前台运行并传回退出码，以保证 fresh/resume 按顺序执行。
-server 脚本前台等待就绪并保持运行，启动超时默认 1800 秒（`VLLM_STARTUP_TIMEOUT`
-可覆盖），提前退出会报错；Ctrl+C/退出时仅清理自己创建的进程组。
-server 需要 Linux `setsid` 和 `curl`。服务端口应限制在可信网络，保持共享路径一致。
+Normal training runs in the background through nohup, with logs and PID under
+`$OUTPUT_DIR/logs`. TensorBoard writes to `$OUTPUT_DIR/logs/tensorboard`; the
+script prints commands for viewing output and stopping training. A successful
+script return only means the background process was launched: inspect the log
+to confirm initialization. `TRAINING_SMOKE=1` still runs in the foreground and
+propagates its exit code so fresh/resume stages execute sequentially.
+The server script waits for readiness and stays in the foreground. Its default
+startup timeout is 1800 seconds, overridable with `VLLM_STARTUP_TIMEOUT`; early
+exit is an error. On Ctrl+C/exit, it cleans up only process groups it created.
+The server requires Linux `setsid` and `curl`. Restrict its port to a trusted
+network and keep shared paths consistent.
 
-不设置 `OUTPUT_DIR` 时默认使用 `./output/dspark_dsv4_flash_bestArch`；
-切换 checkpoint / 量化方案时应使用独立输出目录，不直接续训另一版本的实验。
+If `OUTPUT_DIR` is unset, the default is `./output/dspark_dsv4_flash_bestArch`.
+Use a separate output directory when changing checkpoints or quantization
+schemes; do not resume an experiment from another version directly.
 
-DATA_PATH 必须是 DSV4 自己的 token IDs/loss masks 和数据 manifest；不能复用 Qwen
-Arrow、token_freq 或 vocab mappings。下面的数据入口负责编码已有回答，不生成或
-重新采样回答。[官方编码说明](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/README.md#chat-template)
+DATA_PATH must contain token IDs/loss masks matching DSV4. Default strict mode
+also requires a data manifest; Arrow prepared by external scripts can use the
+explicit compatibility entry point below. Do not reuse Qwen Arrow, token_freq,
+or vocabulary mappings. The preprocessing entry point below encodes existing
+responses; it does not generate or resample responses.
+[Official encoding documentation](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash/blob/main/README.md#chat-template)
 
-恢复 DSV4 draft 时仍显式提供 `--target-hidden-state-format deepseek_v4_mean_hc_head`；
-target checkpoint 和取层不能更换。Qwen 训练无需提供该参数，默认 `standard`。
+When restoring a DSV4 draft, still specify
+`--target-hidden-state-format deepseek_v4_mean_hc_head`. The target checkpoint
+and selected layers must not change. Qwen training does not need this option;
+its default is `standard`.
 
-## 训练数据预处理
+## Training data preprocessing
 
-仍使用 `scripts/prepare_data.py`，显式加 `--dsv4` 才进入新路径。原始数据可为
-`messages` 或 ShareGPT `conversations` 格式；目前只支持文本及可选起始 system，
-随后交替 user/assistant。工具调用、多模态和歧义字段会报错，不会猜测 mask。
+### Use Arrow data prepared by an external script
 
-原始消息通过已启动 target 的 `/tokenize` 使用 vLLM 0.26.0 官方 V4 renderer。
-检查服务版本、model root、tokenizer class、HS/checkpoint 契约，并以本地
-`tokenizer.json` 对照原始 token 探针；不执行 checkpoint Python 或套用 Qwen 模板。
-训练服务脚本已打开只读 `--enable-tokenizer-info-endpoint`。服务仅对可信内网开放。
+If your data was already encoded with the tokenizer, conversation template, and
+supervision masks appropriate for the current DSV4 target, but was not produced
+by this repository, explicitly add `--dsv4-external-arrow` to the training command.
+With the current launcher:
+
+```bash
+DSV4_EXTERNAL_ARROW=1 \
+DATA_PATH=/mnt/nfs/dataset/arrow_0730_77w_dedup \
+bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
+```
+
+This path reads an existing Hugging Face `Dataset.save_to_disk` directory, not a
+single `.arrow` file or a `DatasetDict`. The `input_ids`, `loss_mask`, and `seq_len`
+columns are required. It does not re-tokenize, generate answers, rewrite Arrow,
+reorder or filter samples, or fabricate a `dspark_dsv4_data.json` manifest. It
+creates only an in-memory tensor view of the IDs and masks for training, excluding
+other columns (including messages). Original text stored alongside the tokens
+does not trigger another template application. The existing train/validation
+split, sampler, truncation, and row-index-based HS lookup remain unchanged.
+
+Before training starts, all rows are validated in batches. In multi-device runs,
+each rank checks a contiguous range of rows. IDs must be integers within the
+vocabulary; masks must have the same length and contain only booleans or numeric
+0/1 values (no nulls or NaN/Inf). `seq_len` must be a positive integer equal to the
+actual token count. Masks may cover multiple answer spans; a single assistant
+suffix is not required. The validator does not change the first mask value or
+filter samples whose masks are all zero.
+
+**This flag is your explicit assertion that the external data matches the current
+DSV4 target. It does not prove that the tokenizer or supervision semantics are
+correct.** Token-range checks cannot identify every dataset encoded for Qwen or
+another model. Logs label this mode `USER-ASSERTED`; the launch command and paths
+are recorded in the existing `train_command.txt`. The flag is disabled by default,
+so the repository's data contract remains required. Even when enabled, a
+conflicting existing data contract is rejected, and checks on the HS directory
+and target checkpoint are not relaxed.
+Use a separate HS directory for each dataset; do not reuse caches from a different
+row order or target. Long source samples are still sent to the target in full, so
+the server's `max-model-len` must accommodate them. This flag does not shorten
+them to the training `total-seq-len`.
+
+### Prepare the repository's data format from raw messages
+
+Continue to use `scripts/prepare_data.py`; the new path requires an explicit
+`--dsv4`. Raw data may use `messages` or ShareGPT `conversations` format. Currently,
+only text is supported, with an optional initial system message followed by
+alternating user/assistant messages. Tool calls, multimodal content, and ambiguous
+fields raise errors rather than producing guessed masks.
+
+Raw messages are encoded through the running target's `/tokenize` endpoint using
+the official V4 renderer in vLLM 0.26.0. The process checks the server version,
+model root, tokenizer class, and HS/checkpoint contracts, and compares raw-token
+probes against the local `tokenizer.json`. It neither executes checkpoint Python
+code nor applies a Qwen template. The training server script enables the read-only
+`--enable-tokenizer-info-endpoint`. Expose this service only on a trusted internal
+network.
 
 ```bash
 python scripts/prepare_data.py \
@@ -289,26 +430,37 @@ python scripts/prepare_data.py \
   --dsv4-hs-manifest "$HS_PATH"
 ```
 
-tokenizer 地址是服务根 URL，**不带 `/v1`**。自定义了 served-model 别名时，填写
-实际别名。若配置鉴权，预处理读取 `OPENAI_API_KEY` 或 `VLLM_API_KEY`。
+The tokenizer endpoint is the server's root URL, **without `/v1`**. If you set a
+served-model alias, provide that exact alias. When authentication is configured,
+preprocessing reads `OPENAI_API_KEY` or `VLLM_API_KEY`.
 
-多轮会按**每个 assistant 回答拆成一个样本**，历史仅作上下文，只监督当前回答的
-续写部分（含完整回答的 EOS）。官方 encoder 会移除历史 reasoning；因此每个样本
-都严格比较“生成前缀”与“带回答完整序列”的 token 前缀，拒绝不稳定边界，而不是
-在整个多轮文本上用正则拼接 mask。超过 `--seq-length` 会截断，截断后没有监督 token
-的样本会过滤，所以 `max-samples` 与原始对话数、输出样本数不一定相等。
+Multi-turn conversations are split into **one sample per assistant answer**.
+History is context only; supervision covers the current answer's continuation,
+including EOS for a complete answer. The official encoder removes historical
+reasoning, so each sample strictly compares the token prefix of the generation
+prompt with that of the full sequence containing the answer. Unstable boundaries
+are rejected instead of constructing masks with regular expressions over the
+entire conversation. Samples exceeding `--seq-length` are truncated, and samples
+with no supervised tokens after truncation are filtered out. As a result,
+`max-samples`, the original conversation count, and the output sample count may
+differ.
 
-思考数据使用 `--enable-thinking`，assistant 的思考内容放在独立的 `reasoning`
-字段（也识别一致的 `reasoning_content` / `thinking`）。不接受 content 中混入
-`<think>` 标签，需先整理到结构化字段；非思考模式遇到非空 reasoning 会报错，
-避免静默丢失。没有显式开关时，新 DSV4 原始消息路径默认非思考模式。
+For thinking data, use `--enable-thinking` and put assistant reasoning in a
+separate `reasoning` field (consistent `reasoning_content` / `thinking` fields are
+also recognized). `<think>` tags embedded in content are rejected; first move
+them into structured fields. Non-thinking mode rejects nonempty reasoning to
+avoid silently discarding it. Without an explicit flag, the new DSV4 raw-message
+path defaults to non-thinking mode.
 
-输出为普通训练 Arrow：`input_ids`、`loss_mask`、`seq_len`，另外写入
-`token_freq.pt` 与 `dspark_dsv4_data.json`。manifest 记录 checkpoint 身份、tokenizer
-资产哈希、encoding、thinking、mask 策略及截断配置，训练前会核对。它是数据编码
-来源记录，**不是证明回答由 target 生成的凭证，也不是每个 Arrow 内容的完整哈希**。
+The output is standard training Arrow with `input_ids`, `loss_mask`, and
+`seq_len`, plus `token_freq.pt` and `dspark_dsv4_data.json`. The manifest records
+checkpoint identity, tokenizer asset hashes, encoding, thinking mode, mask policy,
+and truncation settings, which are checked before training. It records data
+encoding provenance; **it is neither proof that the target generated the answers
+nor a complete hash of every Arrow file's contents**.
 
-已由该流程生成的 token 数据可无服务端重打包，不加载普通 chat template：
+Tokenized data produced by this workflow can be repackaged without a server or
+loading a conventional chat template:
 
 ```bash
 python scripts/prepare_data.py --dsv4 --model "$MODEL" \
@@ -317,17 +469,24 @@ python scripts/prepare_data.py --dsv4 --model "$MODEL" \
   --seq-length 3072 --max-samples 64 --num-preprocessing-workers 1
 ```
 
-默认从输入目录读来源 manifest；独立 token 文件可用 `--dsv4-source-manifest` 指定
-它原有的来源契约。**不要给旧 Qwen/来源不明的 token 数据手工补当前 manifest**。
-旧 DSV4 Arrow 若没有可审计的来源契约，应回到原始 messages 重编码；这不要求重生成
-回答。通用非 DSV4 的预 token 化入口也已修复：已有 IDs/mask 时不再强制加载 processor
-或检查 chat template；Qwen 原始消息处理路径保持不变。
+By default, the source manifest is read from the input directory. For standalone
+token files, use `--dsv4-source-manifest` to point to their existing provenance
+contract. **Do not manually attach the current manifest to old Qwen tokens or
+tokens of unknown provenance.** If existing DSV4 Arrow data lacks this
+repository's contract but its external encoding has been confirmed correct, use
+the external Arrow training entry point above. If its provenance is uncertain,
+return to the raw messages and re-encode them; regenerating the answers is not
+required. The generic non-DSV4 pretokenized entry point has also been fixed: when
+IDs and masks already exist, it no longer requires loading a processor or
+checking a chat template. Qwen raw-message processing remains unchanged.
 
-## Teacher 概率数值对照
+## Teacher probability comparison
 
-`check_dsv4_hs.py` 只验证 HS 形状/有限值；真正检查训练 teacher 的入口是
-`scripts/check_dsv4_teacher.py`。先在启动训练服务时设置 `DSV4_EVAL=1`，允许返回
-完整词表的原始 log-probability。只设置客户端参数不会改变已运行服务的配置。
+`check_dsv4_hs.py` checks only HS shapes and finite values. To check the actual
+training teacher, use `scripts/check_dsv4_teacher.py`. Set `DSV4_EVAL=1` when
+starting the training server to allow it to return raw log-probabilities over the
+full vocabulary. Setting client arguments alone does not reconfigure a running
+server.
 
 ```bash
 python scripts/check_dsv4_teacher.py \
@@ -339,100 +498,152 @@ python scripts/check_dsv4_teacher.py \
   --output-json ./output/dsv4-teacher-check.json
 ```
 
-这里的 IDs 仅作接线测试；验收应换成真实编码 prompt，覆盖不同内容和长度。
-校验器只加载已审计的 frozen norm/head，不加载完整 target 或 draft；逐位置比较
-teacher HS 重建分布与 native target 分布，报告 TV、KL、log-probability 误差及
-argmax 一致率。默认 FP32 norm 与 BF16 投影对齐当前 fresh/config-only 训练的
-BF16 autocast 路径；若显式以 BF16 参数加载 draft，应对应调整 `--norm-dtype`。
-CPU 默认设备仅用于诊断；验证 A3 数值时显式使用 trainer 的 NPU 和 dtype。
+The IDs above are only for a wiring check. For acceptance testing, replace them
+with real encoded prompts covering different content and lengths. The checker
+loads only the audited frozen norm/head, not the full target or draft. It compares
+the distribution reconstructed from teacher HS with the native target
+distribution at each position, reporting TV, KL, log-probability error, and argmax
+agreement. The default FP32 norm and BF16 projection match the BF16 autocast path
+used by current fresh/config-only training. If you explicitly load the draft's
+parameters in BF16, adjust `--norm-dtype` accordingly. The default CPU device is
+for diagnostics only; to validate A3 numerics, explicitly use the trainer's NPU
+and dtype.
 
-`--positions` 可选零基 HS 行号（行 p 预测 p+1），否则默认尾 4 行；每块默认最多
-4 行全词表分布，不物化整个长上下文的 `L × V` 概率张量。`block` 模式可用于已
-启动的专用整块评估服务；两种协议必须显式匹配，不会自动降级。
+Use `--positions` to select zero-based HS row indices (row p predicts p+1).
+Otherwise, the last four rows are checked. By default, each block contains at
+most four full-vocabulary distributions, avoiding materialization of an `L × V`
+probability tensor for the entire long context. `block` mode can use an already
+running dedicated block-evaluation server. The selected protocol must explicitly
+match the server; there is no automatic fallback.
 
-默认阈值 `max-tv=0.02`、`max-logprob-error=0.5`、`min-argmax-agreement=1.0`
-只是初筛，不是所有 dtype/量化内核通用的误差保证。退出码 0 表示通过当前阈值，
-1 表示数值未通过，2 表示配置/服务/协议错误。少量位置通过不等于完整模型或
-量化后端已验收；也不要仅为“通过”而放宽阈值。
+The default thresholds `max-tv=0.02`, `max-logprob-error=0.5`, and
+`min-argmax-agreement=1.0` are an initial screening, not universal error guarantees
+for every dtype or quantization kernel. Exit code 0 means the current thresholds
+passed, 1 means numerical checks failed, and 2 means a configuration, server, or
+protocol error. Passing at a few positions does not validate the entire model or
+quantization backend. Do not loosen thresholds merely to obtain a passing result.
 
-## 保存、恢复与 A3 短程验收
+## Saving, resuming, and A3 smoke testing
 
-新 draft 配置保存 `target_training_contract`，绑定 target 路径/签名、HS 格式、
-aux/teacher slots 和 target runtime quantization。显式 `--from-pretrained` 与
-save-path 自动续训都在加载权重/优化器之前校验；分布式各 rank 汇总校验错误后
-停止。切换 target、取层或量化方案必须开始独立实验。旧缺契约 DSV4 checkpoint
-会被明确拒绝，不自动把当前身份补给旧权重；迁移需要另行审计原始来源。
-DSV4 `--dry-run` 同样需要有效数据和 HS manifest。
+New draft configurations save a `target_training_contract` binding the target
+path/signature, HS format, auxiliary/teacher slots, and target runtime
+quantization. Both explicit `--from-pretrained` loading and automatic resume from
+the save path validate this contract before loading weights or optimizer state.
+Distributed ranks aggregate validation errors before stopping. Changing the
+target, selected layers, or quantization scheme requires a separate experiment.
+Older DSV4 checkpoints without a contract are explicitly rejected; the current
+identity is not automatically attached to old weights. Migration requires a
+separate audit of their original provenance.
+DSV4 `--dry-run` also requires valid data and an HS manifest. A data manifest is
+required by default; explicit `--dsv4-external-arrow` allows it to be absent but
+still performs the external data structure checks.
 
-本次还修复了通用恢复路径中的 LR 问题：scheduler 构造时覆盖了已恢复的 optimizer
-LR；现在读取 scheduler 状态后同步还原其记录的 LR，再进行首个续训更新。
-linear/cosine 公式不变，正常从零训练不受影响。
+The generic resume path also fixes an LR issue: constructing the scheduler
+overwrote the restored optimizer LR. After loading the scheduler state, its
+recorded LR is now restored to the optimizer before the first resumed update.
+The linear/cosine formulas are unchanged, and normal training from scratch is
+unaffected.
 
-先启动**普通训练 HS 服务**，准备足够形成 train/val batch 的 DSV4 数据并设置上文
-`MODEL`、`DATA_PATH`、`HS_PATH`、`TRAIN_NPUS`、`NUM_TRAIN_NPUS`、`VLLM_ENDPOINT`：
+First start the **regular training HS server**, prepare enough DSV4 data to form
+train/validation batches, and set the variables introduced above: `MODEL`,
+`DATA_PATH`, `HS_PATH`, `TRAIN_NPUS`, `NUM_TRAIN_NPUS`, and `VLLM_ENDPOINT`:
 
 ```bash
 export SMOKE_ROOT=/shared/output/dsv4-training-smoke
 bash examples/train/dspark_dsv4_training_smoke.sh
 ```
 
-该入口复用现有 trainer 配方，自动运行两个独立进程阶段：默认训练 2 batch + 验证
-1 batch、保存 epoch 0，然后自动恢复，再训练 2 batch + 验证 1 batch、保存 epoch 1。
-`SMOKE_TRAIN_BATCHES` / `SMOKE_VAL_BATCHES` 可调；不足时受真实 loader 长度限制，
-空 train/val 则报错。两阶段都检查有限 loss、非零且有限的梯度、冻结 IO、有效 LR，
-并比较恢复前后的模型/optimizer 抽样值、scheduler 状态和 global step。
+This entry point reuses the existing trainer recipe and automatically runs two
+stages in separate processes. By default, it trains for two batches, validates on
+one batch, and saves epoch 0. It then resumes automatically, trains for another
+two batches, validates on one batch, and saves epoch 1.
+`SMOKE_TRAIN_BATCHES` / `SMOKE_VAL_BATCHES` are configurable, but the actual loader
+length limits each stage when fewer batches are available. Empty train or
+validation loaders raise an error. Both stages check finite loss, nonzero finite
+gradients, frozen input/output components, and a valid LR. They also compare
+sampled model/optimizer values, scheduler state, and global step across resume.
 
-训练计算、基础 LR、`corrGate=0`、Muon + linear 和 loss 开关保持原配方；验收专用
-覆盖为短程 epoch 数、两阶段共用的 scheduler 总步数、零 warmup、每阶段保存及
-`num_workers=0`（避免为几步验收预取大量无用 HS 请求）。实际覆盖项写入报告，
-不能把短程 loss 当作完整 10-epoch 实验的质量结论。
+Training computation, base LR, `corrGate=0`, Muon + linear, and loss switches
+retain the original recipe. Smoke-test overrides cover the short epoch count,
+shared scheduler total steps across both stages, zero warmup, saving after each
+stage, and `num_workers=0` (to avoid prefetching many unused HS requests for just a
+few test steps). The actual overrides are recorded in the reports. Short-run loss
+is not evidence of quality for the full 10-epoch experiment.
 
-每次创建新的 `run.*` 目录，不使用/覆盖原 `OUTPUT_DIR` 实验；日志、两个 checkpoint
-和 `reports/{fresh,resume}.rank-N.json` 全部保留。张量恢复检查为每个张量前 8 个值的
-BF16 规范化抽样，不保证全张量逐位相同或跨进程 RNG 轨迹等同于连续训练。
-入口要求 NPU，当前验收封装支持单卡/DDP，不覆盖 FSDP；普通训练的 FSDP 功能未改。
-它不自动启动 target，不替代上面的 teacher 数值对照，也不做吞吐/收敛认证。
-**本地 CPU 回归通过不代表这些 A3 阶段已经实际运行。**
+Each run creates a new `run.*` directory without using or overwriting the original
+`OUTPUT_DIR` experiment. Logs, both checkpoints, and
+`reports/{fresh,resume}.rank-N.json` are retained. Tensor restoration checks sample
+the first eight values of each tensor after BF16 normalization; they do not
+guarantee bitwise equality of entire tensors or an RNG trajectory across processes
+identical to uninterrupted training. This entry point requires an NPU. The current
+smoke-test wrapper supports a single device and DDP, but does not cover FSDP;
+regular training's FSDP support is unchanged. It does not start the target
+automatically, replace the teacher numerical comparison above, or certify
+throughput or convergence.
+**Passing local CPU regression tests does not mean these A3 stages have actually
+been run.**
 
-## DSV4 离线接受长度验证（实验性）
+## DSV4 offline acceptance-length validation (experimental)
 
-此路径沿用当前 JSONL 离线 eval 的 draft proposal、拒绝采样及接受长度/位置统计口径，
-但把 target 的执行替换为匹配 checkpoint 的 vLLM Ascend HS 服务。评估卡只加载
-当前 dense drafter 和它需要的 target IO 权重，不再加载整个 284B target。
-Qwen 默认仍使用 `--target-backend hf`，原有本地 target 和缓存路径保持不变。
+This path retains the existing JSONL offline evaluator's draft proposals,
+rejection sampling, and acceptance-length/per-position statistics, while running
+the target through a vLLM Ascend HS service that matches the checkpoint. The
+evaluation device loads only the current dense drafter and its required target IO
+weights, rather than the entire 284B target. Qwen still defaults to
+`--target-backend hf`, with its existing local target and cache paths unchanged.
 
-两种模式都采用完整前缀重算，不对 V4 的压缩注意力状态执行 `DynamicCache.crop`：
+Both modes recompute the full prefix and never apply `DynamicCache.crop` to V4's
+compressed attention state:
 
-- `block`：含 `k` 个 draft token 的 proposal 只发送一次 target 请求、做一次完整
-  前缀前向。专用 connector 从 target 的真实 LM head 取得尾段 `k+1` 行全词表
-  FP32 原始 log-probability，并将所需 BF16 HS 后缀写入同一个 safetensors 文件。
-  概率不通过 HTTP 全词表 JSON 传输，也不计算/导出整个前缀的全词表概率。
-  第一版默认每轮最多导出 128 行 target 分布（含 bonus 行），超出明确报错，
-  防止误配置导出整个长前缀的巨大词表张量。
-- `reference`：保留原来的 `k+1` 次完整前缀请求；每次取最后位置的全词表原始
-  log-probability，最后一次读取辅助 HS。用于整块路径的正确性对照。
+- `block`: A proposal containing `k` draft tokens sends one target request and
+  runs one full-prefix forward pass. A dedicated connector obtains the final
+  `k+1` rows of full-vocabulary FP32 raw log-probabilities from the target's actual
+  LM head and writes the required BF16 HS suffix to the same safetensors file.
+  Probabilities are not transferred as full-vocabulary HTTP JSON, and
+  full-vocabulary probabilities for the entire prefix are neither computed nor
+  exported. The initial implementation exports at most 128 target distribution
+  rows per round by default, including the bonus row. Exceeding this limit raises
+  an error to prevent an accidental export of a huge vocabulary tensor for a long
+  prefix.
+- `reference`: Retains the original `k+1` full-prefix requests. Each request
+  obtains the full-vocabulary raw log-probabilities at its final position, and
+  the last request also reads the auxiliary HS. This serves as a correctness
+  reference for block mode.
 
-两种模式都使用实际运行的量化 target 概率，不用评估端的 frozen norm/head 重建
-概率验收；draft proposal、拒绝采样和位置统计规则不变。整块模式不是增量 KV
-缓存方案，仍每轮重新 prefill，不是线上性能实现。改变前向形状可能改变浮点/
-量化数值，需对照概率、HS 和采样边界，不能宣称与 reference 或线上逐 token
-结果必然逐位相同。模式或服务协议不匹配会报错，不会静默降级为另一种模式。
-服务内部仍使用 `extract_hidden_states` 缓存型 drafter；本次优化的是前向次数与
-尾段文件导出，不宣称消除了全部 HS 缓存开销。
-整块 HS 目录必须支持**同目录 hard-link 原子发布**，推荐本机 POSIX 文件系统。
-服务先写临时文件，再以不覆盖已有文件的 hard link 发布完整数据；目录/共享盘不
-支持该操作时会明确失败，不降级为非原子写入。只由 TP rank 0 发布，写入失败会
-同步通知其他 TP rank，客户端不会在 HTTP 返回前读取半成品。
+Both modes use probabilities from the running quantized target for acceptance,
+not probabilities reconstructed by a frozen norm/head on the evaluation device.
+Draft proposals, rejection sampling, and per-position statistics follow the same
+rules. Block mode still prefills the prefix on every round; it does not provide
+incremental KV caching or an online performance implementation. Changing forward
+pass shapes can change floating-point or quantized results. Compare probabilities,
+HS, and sampling boundaries; bitwise equality with reference mode or online
+token-by-token execution is not guaranteed. A mode or service-protocol mismatch
+raises an error without silently falling back to another mode.
 
-### 单机单入口（推荐先跑少量样本）
+The service still uses the cache-based `extract_hidden_states` drafter internally.
+This optimization reduces forward passes and exports only the required suffix;
+it does not claim to eliminate all HS cache overhead.
+The block HS directory must support **atomic publication using hard links within
+the same directory**; a local POSIX filesystem is recommended. The service writes
+a temporary file, then publishes the complete data through a hard link without
+overwriting an existing file. Unsupported directories or shared filesystems fail
+explicitly, with no fallback to non-atomic writes. Only TP rank 0 publishes files,
+and write failures are synchronized with the other TP ranks. Publication completes
+before the HTTP response, so the client does not read a partially written file.
 
-不需要先手动启动服务，也不需要设置 `VLLM_ENDPOINT`、SSH 或第二台机器。
-入口是 `scripts/evaluate/run_dsv4_offline_eval.py`，下面的 shell 脚本只是把环境变量
-转成参数。它在**同一台主机**启动 target 和 eval 两个子进程，内部通过
-`127.0.0.1` HTTP 通信；不是把 284B target 和 drafter 合并到一个进程。
-仍需事先准备兼容的 target 权重、已训练的 DSV4 draft、插件及两端依赖。
+### Single-host entry point (start with a few samples)
 
-先用不重叠的卡运行；这里不假定每台 A3 的卡数或 target 所需卡数：
+You do not need to start the service manually, set `VLLM_ENDPOINT`, use SSH, or
+provide a second machine. The entry point is
+`scripts/evaluate/run_dsv4_offline_eval.py`; the shell script below simply converts
+environment variables into arguments. It starts separate target and evaluation
+child processes on **the same host**, communicating over HTTP at `127.0.0.1`.
+It does not combine the 284B target and drafter into one process. Compatible target
+weights, a trained DSV4 draft, the plugin, and dependencies for both processes
+must already be available.
+
+Start with separate devices. This example assumes neither a particular device
+count per A3 host nor a particular number of devices required by the target:
 
 ```bash
 export VERIFIER_MODEL=/shared/models/dsv4-flash-target
@@ -442,23 +653,26 @@ export HS_PATH=/shared/hs/dsv4-eval-runs
 export OUTPUT_DIR=/shared/eval/dsv4-single-runs
 export VLLM_NPUS='<comma-separated target physical device IDs>'
 export EVAL_NPU='<one physical device ID outside VLLM_NPUS>'
-# TP_SIZE 默认等于 VLLM_NPUS 中的设备数；显式设置也必须与设备数一致。
+# TP_SIZE defaults to the device count in VLLM_NPUS; an explicit value must match it.
 # export TP_SIZE='<target tensor-parallel size>'
-# 非空时原样传给 target；它不负责把权重转换为另一种量化格式。
+# A nonempty value is passed unchanged to the target; it does not convert weights.
 # export TARGET_QUANTIZATION=ascend
 export MAX_SAMPLES=4
 export MAX_NEW_TOKENS=64
-# 默认 block；设为 reference 会同时切换 target connector 和 eval 客户端。
+# Defaults to block; reference switches both the target connector and eval client.
 export VERIFICATION_MODE=block
 bash examples/evaluate/dspark_dsv4_single_eval.sh
 ```
 
-target 默认内存利用率是 `0.9`，只适用于默认分卡配置的启动预算，并不保证模型
-一定装得下。`VLLM_NPUS` 与 `EVAL_NPU` 均填写同一主机上的物理设备编号；
-eval 子进程会将自己的唯一可见设备作为 `npu:0`。不会把 target TP 组当作 draft
-数据并行组；DP 固定为 1，两端都清理继承的分布式 rank 环境变量。
+The default target memory utilization is `0.9`. This is a startup budget for the
+default configuration with separate devices, not a guarantee that the model fits.
+Both `VLLM_NPUS` and `EVAL_NPU` take physical device IDs on the same host. The
+evaluation process sees its single visible device as `npu:0`. The target TP group
+is not used as a data-parallel group for the draft; DP is fixed at 1, and both
+processes clear inherited distributed rank environment variables.
 
-若确实需要 target 和 drafter 共用一张卡，须同时明确开启共卡和提供内存预算：
+To share a device between the target and drafter, explicitly enable sharing and
+provide a memory budget:
 
 ```bash
 export EVAL_NPU='<one physical device ID included in VLLM_NPUS>'
@@ -467,13 +681,16 @@ export TARGET_MEMORY_UTILIZATION='<explicit target memory fraction between 0 and
 bash examples/evaluate/dspark_dsv4_single_eval.sh
 ```
 
-只设置 `ALLOW_SHARED_DEVICE=1` 不够，重叠设备而不同时提供内存比例会拒绝启动。
-**这是共卡预算开关，不是实机内存安全保证**：target 权重、运行时工作区、KV/压缩
-状态，加上 draft、target IO 权重和 PyTorch/NPU 开销都占内存。必须按实际硬件与
-量化格式估算并从小请求验证；不能把 `1 - TARGET_MEMORY_UTILIZATION` 直接视为
-eval 一定可用的显存，仍可能 OOM 或产生性能干扰。
+Setting only `ALLOW_SHARED_DEVICE=1` is insufficient: overlapping devices without
+an explicit memory fraction are rejected. **This controls the shared-device
+budget; it does not guarantee memory safety on real hardware.** Target weights,
+runtime workspaces, KV/compressed state, the draft, target IO weights, and
+PyTorch/NPU overhead all consume memory. Estimate requirements for the actual
+hardware and quantization format, then validate with small requests. Do not assume
+that `1 - TARGET_MEMORY_UTILIZATION` is guaranteed to be available to evaluation;
+OOM failures or performance interference remain possible.
 
-target 和 eval 可以使用同一主机上不同的 Python 环境：
+The target and evaluator can use different Python environments on the same host:
 
 ```bash
 export TARGET_PYTHON=/path/to/vllm-ascend-env/bin/python
@@ -481,62 +698,82 @@ export EVAL_PYTHON=/path/to/training-env/bin/python
 bash examples/evaluate/dspark_dsv4_single_eval.sh
 ```
 
-控制入口本身只依赖 Python 标准库；两个环境都需按上文安装本 checkout 和相应
-依赖、访问相同的模型和 HS 绝对路径。脚本**不会自动进入容器、安装软件或跨机
-启动进程**；若使用容器，应从已准备好的同一容器/可见文件系统中运行。
+The controller itself uses only the Python standard library. Both environments
+must have this checkout and their dependencies installed as described above, and
+must access the same absolute model and HS paths. The script **does not enter
+containers, install software, or start processes on another host automatically**.
+For containerized use, run it within the same prepared container/filesystem view.
 
-每次运行在 `OUTPUT_DIR` 下创建独立 `run-*` 子目录，在 `HS_PATH` 下创建独立
-`hs-*` 子目录。HS 父目录无需为空，但新建的本次子目录必须隔离；不会复用其他
-训练或评估的 HS。保留运行日志和 manifest，结果路径以入口打印的位置为准。
-target 使用本次独有的 served-model 别名、临时鉴权 token，仅绑定本机回环地址。
+Each run creates a separate `run-*` subdirectory under `OUTPUT_DIR` and an `hs-*`
+subdirectory under `HS_PATH`. The HS parent directory need not be empty, but the
+new subdirectory must be isolated for this run; HS from other training or
+evaluation runs is not reused. Logs and manifests are retained. Use the result
+paths printed by the entry point. The target uses a unique served-model alias and
+a temporary authentication token for this run, and binds only to the local
+loopback address.
 
-入口会等待 target 就绪后才开始评估；target 启动失败、eval 失败、正常结束或
-Ctrl+C 时，会回收**本次创建的进程组**，不会停止已有 target 或其他任务。
-`SIGKILL`、主机故障等无法执行清理的情况不在此保证范围内，可能留下进程或本次
-HS 文件。主动脱离本次进程组的后代也不在进程组清理范围内；A3 实机进程树仍需
-验证。先确认任务已停止再检查遗留数据，不要清空 HS 父目录。
+Evaluation starts only after the target is ready. On target startup failure,
+evaluation failure, normal completion, or Ctrl+C, the controller cleans up **the
+process groups created by this run**, without stopping existing targets or other
+tasks. Cleanup cannot be guaranteed after `SIGKILL`, host failure, or other events
+that prevent cleanup code from running; processes or HS files may remain.
+Descendants that deliberately leave the owned process group are also outside
+this cleanup guarantee. Process-tree behavior still needs validation on real A3
+hardware. Confirm the task has stopped before inspecting leftover data; do not
+empty the HS parent directory.
 
-常用可选变量：`VLLM_PORT=0` 自动选择本地空闲端口，`STARTUP_TIMEOUT=1800`、
-`SHUTDOWN_TIMEOUT=30`、`TARGET_REQUEST_TIMEOUT=120` 均以秒计；
-`DSV4_MAX_MODEL_LEN=4096`，`TEMPERATURE=0.0`、`SEED=980406`、
-`ENABLE_THINKING=false`、`RAW_PROMPT_MODE=auto`、`VERIFICATION_MODE=block`。
-`DATASETS` 可选择子数据集，`KEEP_TARGET_HS=1` 保留本次请求的 HS，
-`SKIP_ARTIFACTS=1` 跳过逐样本 artifacts。`DRY_RUN=1` 仅查看计划，不启动 target
-和 eval。直接使用 Python 入口时，分别对应 `--keep-target-hs`、`--skip-artifacts`
-和 `--dry-run` 等参数。
+Common optional variables include `VLLM_PORT=0` to select a free local port;
+`STARTUP_TIMEOUT=1800`, `SHUTDOWN_TIMEOUT=30`, and `TARGET_REQUEST_TIMEOUT=120`
+(all in seconds); `DSV4_MAX_MODEL_LEN=4096`, `TEMPERATURE=0.0`, `SEED=980406`,
+`ENABLE_THINKING=false`, `RAW_PROMPT_MODE=auto`, and `VERIFICATION_MODE=block`.
+Use `DATASETS` to select subdatasets, `KEEP_TARGET_HS=1` to retain this run's request
+HS, and `SKIP_ARTIFACTS=1` to skip per-sample artifacts. `DRY_RUN=1` displays the
+plan without starting the target or evaluator. When calling the Python entry point
+directly, the corresponding flags include `--keep-target-hs`, `--skip-artifacts`,
+and `--dry-run`.
 
-单入口默认让 target 启用 `--dsv4-block-verify`，客户端启用
-`--dsv4-verification-mode block`；`--max-logprobs 0` 关闭不需要的 HTTP 全词表
-返回额度，文件内原始概率不受影响。服务强制 `max_num_seqs=1`，只接收携带
-整块验证协议且 `max_tokens=1` 的请求，不可混用于训练 HS 采集或普通生成。
-入口参数 `--verification-mode reference`（或 shell 的 `VERIFICATION_MODE=reference`）
-会同时启动原来的 HS connector 和逐位置客户端，并恢复全词表 HTTP 返回额度。
+By default, the single entry point enables `--dsv4-block-verify` on the target and
+`--dsv4-verification-mode block` on the client. `--max-logprobs 0` disables the
+unneeded full-vocabulary HTTP response allowance; raw probabilities in the file
+are unaffected. The service enforces `max_num_seqs=1` and accepts only requests
+using the block-verification protocol with `max_tokens=1`. It cannot also serve
+training HS collection or ordinary generation. Setting
+`--verification-mode reference` (or `VERIFICATION_MODE=reference` in the shell)
+switches both the original HS connector and the per-position client on, and
+restores the full-vocabulary HTTP response allowance.
 
-两种模式都**不改变接受长度统计口径，也不是线上性能评测**。此路径尚未在真实
-A3 完成运行验证，首次运行仍应按本文末尾的检查项核对。建议相同 checkpoint、
-量化方式、数据与 seed 分别跑 `block` / `reference`，检查概率与 HS 对齐后再扩大样本。
+Both modes **preserve the acceptance-length statistics and are not online
+performance benchmarks**. This path has not yet completed runtime validation on
+real A3 hardware; follow the checks at the end of this document on the first run.
+Run `block` and `reference` with the same checkpoint, quantization, data, and seed,
+then check probabilities and HS alignment before increasing the sample count.
 
-### 手动连接已有服务（保留的高级用法）
+### Connecting to an existing service manually (advanced use)
 
-已维护独立 HS 服务或需要两台机器时，可以继续使用下面的原有入口；它不会管理
-服务生命周期，不需要与单机自动入口同时运行。**手动入口默认 `reference`**，
-保持原 HS 服务兼容性；与单机入口默认值不同。
+If you already maintain a separate HS service or need two machines, use the
+existing entry point below. It does not manage the service lifecycle and does not
+need to run alongside the automatic single-host entry point. **The manual entry
+point defaults to `reference`** for compatibility with the original HS service;
+this differs from the single-host default.
 
-先按上文准备模型、共享目录和插件，使用评估选项启动或重启 target 服务：
+Prepare the models, shared directory, and plugin as described above, then start
+or restart the target service with the evaluation options:
 
 ```bash
 export DSV4_EVAL=1
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
-`DSV4_EVAL=1` 额外设置 `--max-logprobs 129280 --logprobs-mode raw_logprobs
---generation-config vllm`；不设置该变量时，训练 HS 服务的启动参数不变。
-Completion 请求实际使用 `logprobs=129280`，而不是 `logprobs=-1`，并要求以 token ID
-返回键，避免解码后的字符串重复导致概率丢失。仍然必须启动本仓库的 `--dsv4`
-HS bridge，普通 V4 serving 实例不能替代它。
-[vLLM Completion 协议](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/entrypoints/openai/completion/protocol.py)
+`DSV4_EVAL=1` additionally sets `--max-logprobs 129280 --logprobs-mode raw_logprobs
+--generation-config vllm`. Without this variable, the training HS service's launch
+arguments are unchanged. Completion requests use `logprobs=129280`, not
+`logprobs=-1`, and require token IDs as response keys so duplicate decoded strings
+cannot cause probabilities to be lost. This repository's `--dsv4` HS bridge is
+still required; an ordinary V4 serving instance cannot replace it.
+[vLLM Completion protocol](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/entrypoints/openai/completion/protocol.py)
 
-在装有训练依赖的评估机器上，先运行少量样本：
+Start with a few samples on the evaluation machine, with training dependencies
+installed:
 
 ```bash
 export VERIFIER_MODEL="$MODEL"
@@ -551,8 +788,9 @@ export VERIFICATION_MODE=reference
 bash examples/evaluate/dspark_dsv4_offline_eval.sh
 ```
 
-若手动运行整块模式，必须另外启动专用服务，在 `--` 前同时提供 `--dsv4` 和
-`--dsv4-block-verify`，不能把已有训练/reference 服务直接当成 block 服务。例如：
+To run block mode manually, start a separate dedicated service with both `--dsv4`
+and `--dsv4-block-verify` before `--`. An existing training/reference service cannot
+be used directly as a block service. For example:
 
 ```bash
 env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
@@ -567,49 +805,65 @@ env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   --additional-config '{"enable_flashcomm1": false, "enable_dsa_cp": false}'
 ```
 
-按实际后端补充 `--quantization`，保持与检查和训练时的量化方案一致，并使用新的
-专用 HS 目录。然后设 `VERIFICATION_MODE=block` 再运行手动评估脚本。该服务不
-返回全词表 HTTP logprobs，不能供 reference 客户端使用；普通训练 HS 服务也不会
-生成整块概率文件，不能供 block 客户端使用。两端必须显式匹配，不自动回退。
+Add `--quantization` as required by the backend, keeping the quantization scheme
+consistent with validation and training, and use a fresh dedicated HS directory.
+Then set `VERIFICATION_MODE=block` and run the manual evaluation script. This
+service does not return full-vocabulary HTTP logprobs and cannot serve a reference
+client. Likewise, an ordinary training HS service does not produce block
+probability files and cannot serve a block client. Both ends must explicitly
+match; there is no automatic fallback.
 
-示例默认 greedy（`TEMPERATURE=0.0`），可显式设置 `TEMPERATURE=1.0` 测随机采样。
-`DSV4_MAX_MODEL_LEN=4096` 必须与服务端实际 `--max-model-len` 对应；评估输入及生成
-预算还需为验证候选和 HS 导出的 1 个输出 token 留出空间，不能依靠服务端截断。
-`TARGET_REQUEST_TIMEOUT` 默认 120 秒；`SERVED_MODEL_NAME` 只在服务使用自定义别名时设置。
-此示例使用一张独立评估卡，不把 target 服务的 TP 卡当作 draft 的数据并行卡。
+The example defaults to greedy decoding (`TEMPERATURE=0.0`). Set
+`TEMPERATURE=1.0` explicitly to test stochastic sampling.
+`DSV4_MAX_MODEL_LEN=4096` must match the service's actual `--max-model-len`.
+The evaluation input and generation budget must also leave room for verification
+candidates and the one output token used for HS export; do not rely on server-side
+truncation. `TARGET_REQUEST_TIMEOUT` defaults to 120 seconds. Set
+`SERVED_MODEL_NAME` only when the service uses a custom alias. This example uses
+one dedicated evaluation device; the target service's TP devices are not used for
+draft data parallelism.
 
-消息类型 JSONL 由 target 服务的 `/tokenize` renderer 完成聊天编码，使用当前模型的
-官方编码方式；无需给 Preview 补造 Jinja 模板。默认 `RAW_PROMPT_MODE=auto`；仅当
-文本已经按对应版本的官方协议完整编码时，才使用 `RAW_PROMPT_MODE=raw`。Preview
-和 0731 的模板、tokenizer 和 checkpoint 不混用。
+For message-based JSONL, the target service's `/tokenize` renderer applies the
+current model's official chat encoding; no invented Jinja template is needed for
+Preview. The default is `RAW_PROMPT_MODE=auto`. Use `RAW_PROMPT_MODE=raw` only when
+the text is already fully encoded using the official protocol for that version.
+Do not mix Preview and 0731 templates, tokenizers, or checkpoints.
 
-结果除既有 `summary.json` / `summary.csv` / artifacts 外，还记录 `eval_backend.json`
-以标明 target 后端及运行约定。**本路径禁止 `--measure-base-speedup`**：耗时包含
-完整前缀 prefill、HTTP 和共享文件 IO（reference 还有 HTTP 全词表传输），不代表线上 speculative decoding 的
-tokens/s 或加速比；不同后端的速度列不能直接比较。
+In addition to the existing `summary.json`, `summary.csv`, and artifacts, results
+include `eval_backend.json` to record the target backend and runtime contract.
+**This path forbids `--measure-base-speedup`.** Elapsed time includes full-prefix
+prefill, HTTP, and shared-file IO, plus full-vocabulary HTTP transfer in reference
+mode. It does not represent online speculative-decoding tokens/s or speedup;
+speed columns from different backends are not directly comparable.
 
-默认只清理本次带独立请求 UUID 的临时 HS，先等异步写入完成，再删除自己的文件；
-不会扫描清空整个共享目录。`KEEP_TARGET_HS=1` 对应 `--keep-target-hs`，便于对照
-检查，但会迅速占用磁盘。超时或中断可能留下本次孤儿文件，应在确认对应请求已结束
-后单独检查；不要删除正在训练或被其他评估使用的 HS。
+By default, cleanup removes only temporary HS files belonging to this run's unique
+request UUIDs, waiting for asynchronous writes to finish before deleting owned
+files. It does not scan and empty the shared directory. `KEEP_TARGET_HS=1`
+corresponds to `--keep-target-hs` and helps with comparison checks, but can consume
+disk space quickly. Timeouts or interruptions may leave orphaned files from this
+run. Inspect them individually only after confirming that the corresponding
+requests have finished; do not delete HS used by training or other evaluations.
 
-该后端的本地控制逻辑测试不能替代 A3 验证。首次运行仍需核对完整词表概率、输入
-token 对齐、HS 槽位及 dtype，并检查 EOS/生成上限处的输出；现阶段不能声称 DSV4
-离线测评已在真实 A3 上跑通。
+Local control-logic tests for this backend do not replace A3 validation. On the
+first run, check full-vocabulary probabilities, input-token alignment, HS slots
+and dtype, and outputs at EOS and generation limits. Successful DSV4 offline
+evaluation on real A3 hardware has not yet been demonstrated.
 
-## 本地测试
+## Local tests
 
-不依赖 torch 的控制逻辑测试：
+Control-logic tests that do not require torch:
 
 ```bash
 PYTHONPATH=src python -m unittest discover -s tests/standalone -v
 ```
 
-包含 checkpoint/manifest/HS 槽位检查、模拟 native runtime 的 hook 和保护条件、
-DSV4 block/reference 启动接线与非法组合拒绝、单机进程管理及 Qwen 启动参数回归。
-模拟后端不验证真实算子或张量计算。
+These cover checkpoint/manifest/HS-slot checks, hooks and guards against a
+simulated native runtime, DSV4 block/reference launch wiring and rejection of
+invalid combinations, single-host process management, and Qwen launch-argument
+regressions. Simulated backends do not validate real operators or tensor
+computation.
 
-有完整训练依赖的环境还应执行：
+Environments with the full training dependencies should also run:
 
 ```bash
 pytest tests/unit/evaluate/test_dspark_offline_eval.py \
@@ -629,14 +883,20 @@ pytest tests/unit/train/test_prepare_data.py \
   tests/unit/train/test_dsv4_training_smoke_integration.py
 ```
 
-离线后端测试使用真实 CPU 张量和模拟服务，覆盖前缀/HS 对齐、拒绝回退、
-greedy/T=1 接受与残差采样、多卡参数传递及请求文件清理；不会启动真实 target。
+Offline-backend tests use real CPU tensors and simulated services. They cover
+prefix/HS alignment, refusal to fall back, greedy/T=1 acceptance and residual
+sampling, multi-device argument forwarding, and request-file cleanup. They do not
+start a real target.
 
-新增 PyTorch 回归覆盖 HS 格式字段不改变 dense backbone 的初始化、context fusion
-输出和输入梯度。本地缺少 PyTorch 时不能将其标为已通过。
+The added PyTorch regression checks that the HS-format field does not change
+dense-backbone initialization, context-fusion outputs, or input gradients. It
+cannot be marked as passed when PyTorch is unavailable locally.
 
-预处理回归实际写读 Arrow/token_freq，但服务 renderer 用模拟客户端，不启动 V4。
-短程集成回归使用 CPU 小模型跑真实 Trainer、Muon/AdamW、linear 和 checkpoint
-读写；只适配设备、tiny 模型注册和 Windows 展示 symlink，不是完整 DSpark/NPU/DDP
-运行验证。Windows 的独立测试进程需处理库导入中的 POSIX `fcntl` 依赖，不应修改
-生产文件锁逻辑或将其解释为平台支持。
+Preprocessing regressions read and write real Arrow/token_freq data, but use a
+simulated client for the service renderer and do not start V4. Short integration
+regressions run the real Trainer, Muon/AdamW, linear scheduling, and checkpoint
+reads/writes with small CPU models. They adapt only device selection, tiny-model
+registration, and the display symlink on Windows; they do not validate a full
+DSpark/NPU/DDP run. Standalone Windows test processes must handle the POSIX `fcntl`
+dependency encountered during library imports. Do not change production file
+locking for these tests or interpret the workaround as platform support.

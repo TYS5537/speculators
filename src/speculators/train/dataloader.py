@@ -82,6 +82,7 @@ def create_train_val_loaders(
     prefetch_factor: int,
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
+    pretokenized_text_only: bool = False,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -94,6 +95,9 @@ def create_train_val_loaders(
 
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
+
+    if legacy_data and pretokenized_text_only:
+        raise ValueError("pretokenized_text_only requires Arrow data, not legacy data")
 
     if legacy_data:
         warnings.warn(
@@ -127,6 +131,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            pretokenized_text_only=pretokenized_text_only,
         )
         val_dataset = ArrowDataset(
             datapath=data_path,
@@ -140,6 +145,7 @@ def create_train_val_loaders(
             hidden_states_dtype=hidden_states_dtype,
             request_timeout=request_timeout,
             max_retries=max_retries,
+            pretokenized_text_only=pretokenized_text_only,
         )
 
     train_loader = _setup_dataloader(
