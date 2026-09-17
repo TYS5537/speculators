@@ -138,6 +138,7 @@ class TrainerConfig(NamedTuple):
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
     fsdp_shard: bool = False
+    activation_checkpointing: bool = False
 
 
 def _resolve_scheduler_steps(
@@ -343,6 +344,21 @@ class Trainer:
     def setup_model(self):
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
+
+        if self.config.activation_checkpointing:
+            enable_checkpointing = getattr(
+                self.model, "set_activation_checkpointing", None
+            )
+            if not callable(enable_checkpointing):
+                raise ValueError(
+                    "--activation-checkpointing is only supported by the "
+                    "DFlash/DSpark dense backbone."
+                )
+            enable_checkpointing(True)
+            root_logger.info(
+                "Activation checkpointing enabled for draft decoder layers only "
+                "(non-reentrant); correction/other heads and loss are unchanged."
+            )
 
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1

@@ -4,6 +4,7 @@ from typing import ClassVar
 import torch
 from torch import nn
 from torch.nn.attention.flex_attention import create_block_mask, create_mask
+from torch.utils.checkpoint import checkpoint
 from transformers import PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3RMSNorm,
@@ -98,6 +99,8 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             else create_mask
         )
         super().__init__(config=config)
+        # Runtime-only training policy: never changes saved architecture or weights.
+        self.activation_checkpointing = False
         self._init_vocab(config)
 
         tl_config = config.transformer_layer_config
@@ -852,6 +855,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return noise_embedding
 
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        """Recompute decoder layers only; leave sampling, heads and loss unchanged."""
+        self.activation_checkpointing = enabled
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
@@ -934,9 +941,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             # shape: [1, num_anchors*block_size, draft_vocab_size]
 
         for layer_idx, layer in enumerate(self.layers):
-            noise_embedding = layer(
-                hidden_states=noise_embedding,
-                target_hidden=fc_output,
+            layer_kwargs = dict(
                 attention_mask=sliding_window_attn_mask
                 if layer_idx in self.sliding_window_indices
                 else full_attn_mask,
@@ -945,6 +950,28 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 position_embeddings=position_embeddings,
                 **kwargs,
             )
+            if (
+                self.activation_checkpointing
+                and self.training
+                and torch.is_grad_enabled()
+            ):
+                # Bind the module and this call's inputs directly (no loop closure).
+                # Positional tensors let checkpoint detect NPU RNG/autocast state.
+                # Call the module, not forward(), to retain FSDP's hooks.
+                noise_embedding = checkpoint(
+                    layer,
+                    fc_output,
+                    noise_embedding,
+                    use_reentrant=False,
+                    preserve_rng_state=True,
+                    **layer_kwargs,
+                )
+            else:
+                noise_embedding = layer(
+                    target_hidden=fc_output,
+                    hidden_states=noise_embedding,
+                    **layer_kwargs,
+                )
 
         hidden = self.norm(noise_embedding)
         logits = self.lm_head(hidden) if project_logits else None

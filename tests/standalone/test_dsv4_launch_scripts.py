@@ -111,6 +111,7 @@ class LaunchScriptTests(unittest.TestCase):
             "TARGET_QUANTIZATION": "",
             "DSV4_EVAL": "0",
             "DSV4_EXTERNAL_ARROW": "0",
+            "RECOMPUTE": "",
             "TRAINING_SMOKE": "0",
             "MODE": "ready",
             "WAIT_STATUS": "0",
@@ -332,6 +333,44 @@ class LaunchScriptTests(unittest.TestCase):
                     )
                     self.assertEqual(result.returncode, 2, result.stderr)
                     self.assertIn("DSV4_EXTERNAL_ARROW must be 0 or 1", result.stderr)
+                    self.assertFalse(self.capture.exists())
+                    self.assertFalse(self.output.exists())
+
+    def test_recompute_default_and_overrides_reach_normal_and_smoke_training(self):
+        (self.output / "logs").mkdir(parents=True)
+        for recompute in ("", "0", "1"):
+            for smoke in ("0", "1"):
+                with self.subTest(recompute=recompute, smoke=smoke):
+                    result = self.run_script(
+                        "trainer",
+                        RECOMPUTE=recompute,
+                        TRAINING_SMOKE=smoke,
+                        SMOKE_PHASE="fresh",
+                        SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                    )
+                    self.assertEqual(
+                        result.returncode, 17 if smoke == "1" else 0, result.stderr
+                    )
+                    args = self.capture.read_text().splitlines()
+                    self.assertEqual(
+                        args.count("--activation-checkpointing"),
+                        0 if recompute == "0" else 1,
+                    )
+                    self.assertNotIn("--fsdp-shard", args)
+                    if smoke == "1" and recompute != "0":
+                        self.assertGreater(
+                            args.index("--activation-checkpointing"), args.index("--")
+                        )
+
+    def test_invalid_recompute_setting_rejected_before_launch(self):
+        for value in ("true", "2", "-1"):
+            for smoke in ("0", "1"):
+                with self.subTest(value=value, smoke=smoke):
+                    result = self.run_script(
+                        "trainer", RECOMPUTE=value, TRAINING_SMOKE=smoke
+                    )
+                    self.assertEqual(result.returncode, 2, result.stderr)
+                    self.assertIn("RECOMPUTE must be 0 or 1", result.stderr)
                     self.assertFalse(self.capture.exists())
                     self.assertFalse(self.output.exists())
 

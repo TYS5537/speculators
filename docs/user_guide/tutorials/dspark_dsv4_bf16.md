@@ -333,6 +333,28 @@ export VLLM_ENDPOINT=http://TARGET_INTERNAL_IP:8001/v1
 bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
 ```
 
+The trainer launcher defaults to `RECOMPUTE=1`, which passes
+`--activation-checkpointing` in both normal and smoke runs. This first version
+checkpoints each dense backbone decoder layer with non-reentrant recomputation;
+it does not checkpoint Correction or change its hidden-feedback recurrence.
+FSDP is not required or enabled by this switch. The existing distributed strategy,
+`corrGate=0`, Muon + linear schedule, learning rates, block size, anchor count,
+sequence length, and loss settings remain unchanged.
+
+To use the previous execution path, disable recomputation explicitly:
+
+```bash
+RECOMPUTE=0 bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
+```
+
+Only `0` and `1` are accepted. When invoking `scripts/train.py` directly, pass
+`--activation-checkpointing` to enable it; the generic CLI remains disabled by
+default. Recomputation trades extra backward computation for fewer saved backbone
+activations. It does not remove the full-vocabulary logits or the instantaneous
+FP32 softmax allocations in TV loss, so it is not a guarantee against OOM.
+Measure peak memory and step time on the actual NPU configuration before scaling
+up; local CPU checks do not establish A3 memory savings.
+
 Normal training runs in the background through nohup, with logs and PID under
 `$OUTPUT_DIR/logs`. TensorBoard writes to `$OUTPUT_DIR/logs/tensorboard`; the
 script prints commands for viewing output and stopping training. A successful

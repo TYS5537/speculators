@@ -726,6 +726,7 @@ def main(args: argparse.Namespace):  # noqa: C901
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
+        activation_checkpointing=args.activation_checkpointing,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
@@ -1686,6 +1687,15 @@ def parse_args():
         action="store_true",
         default=False,
         help="Pointing to checkpoint with lowest validation loss.",
+    )
+
+    parser.add_argument(
+        "--activation-checkpointing",
+        action="store_true",
+        default=False,
+        help="Recompute DFlash/DSpark dense decoder layers during backward to "
+        "save activation memory. Leaves correction/other heads and loss unchanged. "
+        "Training only; independent of --fsdp-shard. Disabled by default.",
     )
 
     # distributed strategy

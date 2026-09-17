@@ -17,6 +17,24 @@ def _parse(monkeypatch, extra: list[str]):
     return parse_args()
 
 
+def test_activation_checkpointing_defaults_off(monkeypatch):
+    args = _parse(monkeypatch, [])
+    assert args.activation_checkpointing is False
+
+
+@pytest.mark.parametrize("fsdp", [False, True])
+def test_activation_checkpointing_independent_of_fsdp(monkeypatch, fsdp):
+    flags = ["--speculator-type", "dspark", "--activation-checkpointing"]
+    if fsdp:
+        flags.append("--fsdp-shard")
+    args = _parse(monkeypatch, flags)
+    assert args.activation_checkpointing is True
+    assert args.fsdp_shard is fsdp
+    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    assert "activation_checkpointing" not in train_kw
+    assert "activation_checkpointing" not in val_kw
+
+
 # ---------------------------------------------------------------------------
 # Ensure CLI args flow correctly through vars(args) into get_trainer_kwargs
 # ---------------------------------------------------------------------------
