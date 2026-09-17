@@ -383,7 +383,11 @@ reorder or filter samples, or fabricate a `dspark_dsv4_data.json` manifest. It
 creates only an in-memory tensor view of the IDs and masks for training, excluding
 other columns (including messages). Original text stored alongside the tokens
 does not trigger another template application. The existing train/validation
-split, sampler, truncation, and row-index-based HS lookup remain unchanged.
+split, sampler, and row-index-based HS lookup remain unchanged. In this explicit
+external-data mode, each row's IDs and loss mask are right-truncated in memory to
+`--total-seq-len` before requesting HS, instead of generating the entire row's HS
+and truncating only during batch collation. The source Arrow files and stored
+`seq_len` values are not modified. The default Qwen data path is unchanged.
 
 Before training starts, all rows are validated in batches. In multi-device runs,
 each rank checks a contiguous range of rows. IDs must be integers within the
@@ -402,9 +406,21 @@ so the repository's data contract remains required. Even when enabled, a
 conflicting existing data contract is rejected, and checks on the HS directory
 and target checkpoint are not relaxed.
 Use a separate HS directory for each dataset; do not reuse caches from a different
-row order or target. Long source samples are still sent to the target in full, so
-the server's `max-model-len` must accommodate them. This flag does not shorten
-them to the training `total-seq-len`.
+row order or target. A longer existing HS cache can be read as a prefix only when
+its token IDs match the required training prefix and its tensor shape/row count
+are valid; the cached file is not rewritten. Too-short or mismatched caches fail
+explicitly instead of silently skipping samples. Use a new HS directory when
+increasing the training length beyond cached prefixes. Fresh HS responses must
+match the requested tokens exactly before being cached or deleted.
+
+The server must still allow the longest requested prefix **plus one output token**
+used by HS extraction. With `--total-seq-len 3072`, a source row of 5188 tokens now
+requests 3072 input tokens plus one output token, fitting `--max-model-len 4096`.
+This preserves the causal training prefix, not bitwise reproducibility: changing
+target forward shapes or the number of training-noise draws can change numerical
+results. If supervision starts beyond the retained prefix, its retained loss mask
+is all zero, just as with the previous collation-time truncation; no new sample
+filtering is introduced.
 
 ### Prepare the repository's data format from raw messages
 

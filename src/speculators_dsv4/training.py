@@ -44,8 +44,9 @@ def _validate_training_data(args, report, rank, world_size):
         if rank == 0:
             logger.warning(
                 "External DSV4 Arrow provenance is USER-ASSERTED, not "
-                "tokenizer/template verified. Tokens, masks and row order "
-                "are preserved; no native "
+                "tokenizer/template verified. Source Arrow and row order are "
+                "preserved; token/mask prefixes are capped at --total-seq-len "
+                "before HS requests. No native "
                 "data manifest is created. Source=%s, target=%s, signature=%s. "
                 "The opt-in and paths are recorded in train_command.txt. Keep a "
                 "separate HS directory if this is a different dataset.",

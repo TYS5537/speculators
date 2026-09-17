@@ -1133,8 +1133,9 @@ def parse_args():
         help=(
             "Accept external tokenized text Arrow without this repo's data manifest. "
             "You confirm its tokenizer/template/masks match the current "
-            "DSV4 target. Checks all rows structurally, preserves IDs/masks/order, and "
-            "never bypasses an existing manifest or the target HS/checkpoint contract."
+            "DSV4 target. Checks all rows structurally and caps token/mask prefixes "
+            "at --total-seq-len before HS requests without rewriting Arrow/order. "
+            "Never bypasses an existing manifest or the target HS/checkpoint contract."
         ),
     )
     parser.add_argument(

@@ -216,6 +216,9 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         pretokenized_text_only: bool = False,
     ):
+        self.pretokenized_text_only = pretokenized_text_only
+        if pretokenized_text_only and max_len < 1:
+            raise ValueError("External Arrow requires a positive training max_len")
         self.data = load_from_disk(datapath)
         if pretokenized_text_only:
             # External text Arrow may have no saved torch format. Select an
@@ -276,11 +279,54 @@ class ArrowDataset(BaseDataset):
         """Get lengths of the dataset samples."""
         return list(self.data.with_format(None)["seq_len"])
 
+    def _get_dataset_item(self, index):
+        item = self.data[index]
+        if self.pretokenized_text_only:
+            # DSpark consumes this prefix during collation anyway. Bound the HS
+            # request too, without rewriting Arrow or changing sampler row IDs.
+            item = {
+                key: item[key][: self.max_len] for key in ("input_ids", "loss_mask")
+            }
+        return item
+
+    def _align_text_hs(self, loaded_hs, input_ids, file_idx, *, allow_prefix):
+        """Validate external text HS before caching or reusing a causal prefix."""
+        tokens = loaded_hs["token_ids"]
+        hidden = loaded_hs["hidden_states"]
+        length = input_ids.shape[0]
+        expected_ndim = 3  # [tokens, auxiliary slots + teacher, hidden width]
+        minimum_slots = 2  # At least one auxiliary slot plus the teacher.
+        if (
+            tokens.ndim != 1
+            or hidden.ndim != expected_ndim
+            or hidden.shape[0] != tokens.shape[0]
+            or hidden.shape[1] < minimum_slots
+            or hidden.shape[2] < 1
+            or tokens.shape[0] < length
+            or (not allow_prefix and tokens.shape[0] != length)
+            or not torch.equal(tokens[:length], input_ids)
+        ):
+            remedy = (
+                "Use a separate HS directory when changing data or increasing "
+                "the training length; existing caches are not overwritten."
+                if allow_prefix
+                else "Check the target HS response's token alignment and shape."
+            )
+            raise ValueError(
+                f"External Arrow HS for row {file_idx} does not match the required "
+                f"{length}-token training prefix (token IDs, length, or shape). "
+                + remedy
+            )
+        # Views only: leave a longer cached file and its loaded tensors intact.
+        prefix = {"token_ids": tokens[:length], "hidden_states": hidden[:length]}
+        check_hidden_states(prefix, input_ids.tolist())
+        return prefix
+
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if not self.client:
             self._setup_client()
 
-        dataset_item = self.data[index]
+        dataset_item = self._get_dataset_item(index)
         client_item = build_client_item(dataset_item)
 
         try:
@@ -296,16 +342,23 @@ class ArrowDataset(BaseDataset):
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
-            check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
-
             file_idx = self._map_to_file_idx(index)
+            if self.pretokenized_text_only:
+                loaded_hs = self._align_text_hs(
+                    loaded_hs, dataset_item["input_ids"], file_idx, allow_prefix=False
+                )
+            else:
+                check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+
             match self.on_generate:
                 case "cache":
                     self.transfer.cache(handle, file_idx)
                 case "delete":
                     self.transfer.delete(handle)
         except Exception as e:
-            if isinstance(e, ValueError) and "NaN" in str(e):
+            if isinstance(e, ValueError) and (
+                self.pretokenized_text_only or "NaN" in str(e)
+            ):
                 raise
             warnings.warn(
                 f"Failed to load/cache hidden states for sample {index}: {e}",
@@ -318,6 +371,7 @@ class ArrowDataset(BaseDataset):
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
         loaded_hs = self.transfer.get_cached(file_idx)
+        cached = loaded_hs is not None
 
         if loaded_hs is None:
             match self.on_missing:
@@ -339,15 +393,21 @@ class ArrowDataset(BaseDataset):
         if loaded_hs is None:
             return loaded_hs
 
+        dataset_item = self._get_dataset_item(index)
+        if cached and self.pretokenized_text_only:
+            loaded_hs = self._align_text_hs(
+                loaded_hs, dataset_item["input_ids"], file_idx, allow_prefix=True
+            )
+
         # loaded_hs structure: {
         #   "hidden_states": [seq_len, num_layers, hidden_size]
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], self.data[index]["input_ids"]):
+        if not torch.equal(loaded_hs["token_ids"], dataset_item["input_ids"]):
             warnings.warn(
                 f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
-                f"match input ids {self.data[index]['input_ids']}",
+                f"match input ids {dataset_item['input_ids']}",
                 stacklevel=1,
             )
             return None
@@ -360,7 +420,7 @@ class ArrowDataset(BaseDataset):
             "verifier_last_hidden_states": loaded_hs["hidden_states"][
                 :, -1
             ],  # [seq_len, hidden_size]
-            "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
+            "loss_mask": dataset_item["loss_mask"],  # [seq_len]
         }
 
 
