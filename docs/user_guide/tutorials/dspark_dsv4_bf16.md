@@ -13,9 +13,9 @@ testing, not validated end-to-end support.
 - Spaced layer selection, corrected teacher HS, and loading of frozen
   target embeddings, LM head, and final norm.
 - Checkpoint structure and training IO checks, HS directory contract validation,
-  and a single-request HS check script.
-- Optional single-host DP2 for the training HS service, TP x DP device-count
-  validation, and concurrent multi-request HS integration checks.
+  and single-request, concurrent, or rank-pinned HS probes.
+- Optional single-host DP2 or two-target-host DP4 for the training HS service,
+  TP x local-DP device-count validation, and concurrent multi-request HS checks.
 - Cache compatibility for the default V1 runner in vLLM 0.26.0 / Ascend 0.26.0rc1:
   native C4/C128/SWA grouping and sharing are preserved. HS gets its own cache
   group and physical tensor, included in the shared block pool's memory budget
@@ -175,11 +175,12 @@ installed software versions; check them inside the container first.
 The default baseline uses eager execution and synchronous scheduling. Training
 HS performance opt-ins are described below; they do not change the requirements
 for file HS backend, PP=1, PCP=DCP=1, and disabled prefix caching, chunked
-prefill, FlashComm1 / SP, and DSA-CP. The training HS
-service supports single-host DP=1 or 2. The underlying launcher still defaults
-to DP1; the current server example uses TP8 x DP2. DP2 requires EP, both DP
-engines on the same host, the mp backend, and internal request dispatch.
-Multi-host DP, DP>2, and external load balancing are not enabled. Block
+prefill, FlashComm1 / SP, and DSA-CP. The training HS service supports single-host
+DP=1 or 2, plus exactly two target hosts with global DP=4 and local DP=2 on each.
+The underlying launcher still defaults to DP1; the server example defaults to
+TP8 x single-host DP2. DP2/DP4 require EP, the mp backend, and internal request
+dispatch. Other multi-host layouts, cross-host TP, Ray, and external load
+balancing are not enabled. Block
 verification and the automated offline evaluation launcher remain DP1-only.
 Real A3 topology, HS export, and numerical agreement still require validation.
 The integration does not overwrite an existing vLLM/Ascend installation or
@@ -197,8 +198,14 @@ If `VLLM_PLUGINS` is set as an allowlist, add `speculators_dsv4` while preservin
 other plugins required by Ascend. Otherwise vLLM discovers plugins automatically.
 
 Run all scripts from the repository root. Both launch scripts are preconfigured
-with the current two-host experiment's checkpoint, data/HS paths, 16 devices,
-and target address `80.48.17.187:8001`; environment variables can override them.
+with the experiment's checkpoint, data/HS paths, 16 devices, and target master
+address `80.48.17.186:8001`; environment variables can override them.
+Both scripts default `TARGET_MASTER_IP` to `80.48.17.186`. The server derives its
+default `VLLM_HOST` from that value, and the trainer derives its default
+`VLLM_ENDPOINT` as `http://$TARGET_MASTER_IP:8001/v1`. Explicit `VLLM_HOST` and
+`VLLM_ENDPOINT` overrides still take precedence.
+The server also defaults `TARGET_WORKER_IP` to `80.48.17.187` and
+`TARGET_IFNAME` to the confirmed interface `enp48s3u1u1` on both target hosts.
 The target and trainer must run on separate hosts with these defaults. Do not
 run both default scripts on one host. Set the following variables explicitly
 when server paths or devices differ. Historical filenames retain `bf16`, which
@@ -210,7 +217,8 @@ export HS_PATH=/shared/hs/dsv4-flash-target-spread-v1
 # Set these for the actual devices and memory; no device count per host is assumed.
 export VLLM_NPUS='<target device IDs>'
 export TP_SIZE='<target tensor parallel size>'
-export DP_SIZE=1  # Or 2; the VLLM_NPUS device count must equal TP_SIZE * DP_SIZE.
+export DP_SIZE=1  # Or 2; device count must equal TP_SIZE * DP_SIZE_LOCAL.
+# DP_SIZE_LOCAL defaults to DP_SIZE for a single target host.
 export VLLM_HOST='<target host internal IP; use 127.0.0.1 for local-only testing>'
 # Leave unset for backend detection; set only when the matching Ascend format requires it:
 # export TARGET_QUANTIZATION=ascend
@@ -233,8 +241,9 @@ hosts. The other host still runs the trainer. The launcher sets
 `--data-parallel-size-local 2`, retains EP, and checks that visible device IDs
 are unique and `device count = TP x DP` before startup. Direct use of
 `scripts/launch_vllm.py --dsv4` performs the same checks. DP2 requires an explicit
-`ASCEND_RT_VISIBLE_DEVICES`; `--headless`, external DP ranks, Ray, and multi-host
-layouts are not allowed. The plugin rechecks the actual configuration in every
+`ASCEND_RT_VISIBLE_DEVICES`; DP2 does not allow `--headless` or explicit DP ranks.
+The separate two-target-host DP4 layout is described below. The plugin rechecks
+the actual configuration in every
 worker. PP/CP remain 1, and the MoE EP group size here is TP x DP; EP does not
 multiply the device requirement again.
 [vLLM 0.26 parallel configuration](https://github.com/vllm-project/vllm/blob/v0.26.0/vllm/config/parallel.py)
@@ -252,6 +261,166 @@ caches from the old topology. The current manifest **does not bind TP/DP
 topology**; passing its checks does not validate numerical behavior or memory
 capacity. The 16-device example above does not guarantee that the current
 quantized checkpoint fits.
+
+### Two target hosts and one draft-training host
+
+This layout uses **three A3 hosts in total**. With 16 visible devices on each
+target host, set TP=8, global DP=4, and local DP=2. Target host 0 owns DP ranks
+0/1 and the HTTP API; target host 1 owns DP ranks 2/3 and runs headless. TP groups
+remain local, but the **EP group spans all 32 target devices**, so both target
+hosts require working cross-host HCCL communication. The third host runs the
+unchanged single-host 16-device draft DDP job; it does not join target EP.
+[vLLM multi-node internal load balancing](https://docs.vllm.ai/en/v0.26.0/serving/data_parallel_deployment/#internal-load-balancing)
+
+Install the same checkout and supported vLLM/Ascend versions on both target
+hosts. All three hosts must see the **same checkpoint at the same absolute
+`MODEL` path**, and the **same shared filesystem at the same absolute `HS_PATH`**.
+Separate local directories with identical names are not sufficient. Use a fresh
+HS directory for initial topology validation; do not reuse another live run's
+directory. The shared filesystem must support cross-host `flock` for the native
+HS connector and atomic hard-link publication for the manifest. Check file
+permissions for the actual users on all three hosts; successful local tests do
+not certify NFS lock behavior. Match quantization, layer IDs, and execution
+settings on both target hosts. The launcher checks the shared manifest, but a
+matching manifest alone does not establish a matching runtime or a healthy cluster.
+
+Run this common setup in a separate shell on **each target host**. The network
+values shown below are already the script defaults for the confirmed deployment;
+their exports can be omitted. Override paths or network values only when the
+actual deployment differs:
+
+```bash
+export MODEL=/shared/models/dsv4-flash-target
+export HS_PATH=/shared/hs/dsv4-flash-target-spread-dp4-v1
+export VLLM_NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export TP_SIZE=8 DP_SIZE=4 DP_SIZE_LOCAL=2
+export TARGET_MASTER_IP=80.48.17.186
+export TARGET_WORKER_IP=80.48.17.187
+export TARGET_IFNAME=enp48s3u1u1
+# For DP4, DP_ADDRESS defaults to TARGET_MASTER_IP. Override only if necessary.
+# export DP_ADDRESS='<target host 0 reachable communication IP>'
+export DP_RPC_PORT=13345
+export DSV4_EXECUTION_MODE=eager DSV4_ASYNC_SCHEDULING=0
+# Normally omit TARGET_LOCAL_IP: the script selects it from DP_START_RANK.
+# Override separately on each host only if its communication IP differs.
+# export TARGET_LOCAL_IP='<this target host communication IP>'
+```
+
+The server script's top-level configuration includes these variables. When
+`TARGET_LOCAL_IP` is unset, `DP_START_RANK=0` selects `TARGET_MASTER_IP`
+(`80.48.17.186`), and `DP_START_RANK=2` selects `TARGET_WORKER_IP`
+(`80.48.17.187`). Do not export the same `TARGET_LOCAL_IP` on both hosts.
+The script uses the resolved local IP as the fallback for `HCCL_IF_IP`, and
+`TARGET_IFNAME` as the fallback for `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and
+`HCCL_SOCKET_IFNAME`.
+An existing, nonempty native variable is preserved; set the native variables
+individually if the backends use different interfaces. For example:
+
+```bash
+# Optional backend-specific overrides; normally TARGET_IFNAME is sufficient.
+# export HCCL_IF_IP='<this target host HCCL IP>'
+# export GLOO_SOCKET_IFNAME='<this target host Gloo interface>'
+# export TP_SOCKET_IFNAME='<this target host TP interface>'
+# export HCCL_SOCKET_IFNAME='<this target host HCCL interface>'
+```
+
+DP4 requires all four native communication variables to resolve to nonempty
+values before launch. The script uses the configured IPs and confirmed interface,
+not NIC auto-detection, and never substitutes the master's IP for the headless
+worker's local IP. For single-host DP1/DP2, explicitly set `TARGET_LOCAL_IP=''`
+and `TARGET_IFNAME=''` to disable these defaults and retain backend interface
+selection; previously exported native communication variables must also be unset
+if backend selection is intended. Empty native variables alone do not disable
+nonempty `TARGET_*` fallbacks.
+Passing this configuration check does **not** validate the interface, IP, or
+cross-host HCCL connectivity on A3; test communication before starting the
+service. HTTP/NFS access is not a substitute. Allow the RPC and backend
+communication traffic between the target hosts, and expose the HTTP port only
+on a trusted network. Both targets use the same `DP_ADDRESS` and `DP_RPC_PORT`;
+those are separate from the HTTP bind address and port. Rank selection here is
+`DP_START_RANK`, not `node_rank` or `LOCAL_RANK`.
+
+With the configured paths and these deployment defaults, only `DP_SIZE=4` and
+the host's `DP_START_RANK` need to be selected at launch. On **target host 0
+(`80.48.17.186`)**, start the API and its two local engines:
+
+```bash
+DP_SIZE=4 DP_START_RANK=0 \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+On **target host 1 (`80.48.17.187`)**, start the two headless engines:
+
+```bash
+DP_SIZE=4 DP_START_RANK=2 \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+The second command forwards `--headless --data-parallel-start-rank 2`, does not
+start/poll a local HTTP API, and waits for its owned worker process. Its
+"process launched" message is **not cluster readiness**. Target host 0 creates
+the shared HS manifest; the headless host only waits for and validates it,
+without creating its own HS directory. Startup in either order is allowed within
+`DSV4_MANIFEST_TIMEOUT` (default 300 seconds). This timeout is separate from the
+API's `VLLM_STARTUP_TIMEOUT` (default 1800 seconds); increase both when needed.
+Both target launchers stay in the foreground and clean up only their own local
+process group. There is no automatic SSH launch or remote cleanup: stop both
+target scripts when ending the service, and inspect both logs after a failure.
+
+Wait for host 0's API readiness, then run a concurrent probe **from the third
+(trainer) host** before training. If that shell uses an HTTP proxy, add host 0's
+API IP/hostname to both `NO_PROXY` and `no_proxy` before the direct probe. The
+trainer script handles this automatically for its own child processes, not for
+commands launched earlier in your shell:
+
+```bash
+export MODEL=/shared/models/dsv4-flash-target
+export HS_PATH=/shared/hs/dsv4-flash-target-spread-dp4-v1
+export TARGET_MASTER_IP=80.48.17.186
+export VLLM_ENDPOINT="http://${TARGET_MASTER_IP}:8001/v1"
+python scripts/check_dsv4_hs.py \
+  --model "$MODEL" --hidden-states-path "$HS_PATH" \
+  --vllm-endpoint "$VLLM_ENDPOINT" \
+  --input-ids 100 200 300 400 --requests 16 --concurrency 4
+
+# Explicitly verify every engine, including HS written on the remote target host.
+for rank in 0 1 2 3; do
+  python scripts/check_dsv4_hs.py \
+    --model "$MODEL" --hidden-states-path "$HS_PATH" \
+    --vllm-endpoint "$VLLM_ENDPOINT" --data-parallel-rank "$rank" \
+    --input-ids 100 200 300 400 --requests 2 --concurrency 1 || break
+done
+```
+
+Only after all probes have passed, start the draft trainer on this third host:
+
+```bash
+export DATA_PATH=/shared/data/dsv4-flash-target-arrow
+export OUTPUT_DIR=/shared/output/dsv4-flash-target-dp4-corrGate0
+export TRAIN_NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
+export NUM_TRAIN_NPUS=16
+bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
+```
+
+The untargeted concurrent probe does not prove every engine received work. The
+per-rank probes use vLLM's `X-data-parallel-rank` header to request each engine
+explicitly and validate its exported files from the trainer host; they do not
+establish numerical parity. Confirm all four per-rank probes passed, inspect
+per-engine request logs/metrics, and perform the teacher-logit checks below
+before a full run. The trainer endpoint
+still points only to host 0; do not set its process count to 32 or 48. A three-host
+setup is not a three-host training process group. This change does not alter the
+draft architecture, loss, optimizer, learning rate, or `corrGate=0` recipe.
+
+**A3 multi-host startup, HS numerical agreement, and throughput have not been
+validated by the local regressions.** Begin with eager/synchronous execution;
+compare graph and asynchronous scheduling separately only after that baseline
+passes. EP now communicates across hosts, so more devices do not guarantee lower
+HS latency or higher end-to-end training throughput. Existing request batch
+limits are unchanged. Block verification and automatic offline evaluation
+remain single-host DP1.
+
+### Optional execution and scheduling modes
 
 The training HS server exposes two independent, experimental performance options:
 
@@ -351,7 +520,8 @@ do not assume cross-host TP is available; cross-host TP/EP requires separate
 communication-environment checks.
 [Official model size](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash)
 
-Both hosts must share the same absolute MODEL and HS_PATH paths. Restrict the
+All target and trainer hosts must share the same absolute MODEL and HS_PATH
+paths. Restrict the
 service port to a trusted internal network, not the public internet. Point the
 trainer's `VLLM_ENDPOINT` at the target host's internal address.
 The trainer script adds that endpoint's hostname/IP and local loopback hosts to
@@ -384,8 +554,8 @@ Before full training, also use a fixed set of prompts to:
 4. Validate acceptance length and stopping boundaries with the experimental
    offline backend below before scaling up to full training.
 
-After the single-request check, DP2 services should also run concurrent requests
-with different lengths:
+After the single-request check, DP2/DP4 services should also run concurrent
+requests with different lengths (use concurrency 4 for DP4):
 
 ```bash
 python scripts/check_dsv4_hs.py \
@@ -397,18 +567,18 @@ python scripts/check_dsv4_hs.py \
 The checker cycles through the original input and shorter prefixes. It checks
 tokens, HS shape, BF16/finite values, and unique output filenames per request,
 retaining all generated files. **Successful concurrent probes do not prove that
-both DP engines received requests.** Check per-engine request metrics/logs on
-the server. Initialization logs for DP ranks 0/1 only show that both replicas
-initialized, not that both processed requests. Hardware testing should cover
-work assigned to only one replica, different input lengths on the two replicas,
+all DP engines received requests.** Check per-engine request metrics/logs on
+both target hosts for DP4. Initialization logs for DP ranks 0/1 (and 2/3 for DP4)
+only show that replicas initialized, not that all processed requests. Hardware
+testing should cover work assigned to only one replica, different input lengths,
 and sustained concurrency. Check dummy forwards, EP communication, and file
 write failures. These checks do not replace teacher probability comparisons or
-DP1/DP2 numerical comparisons, and they are not throughput benchmarks.
+DP1/DP2/DP4 numerical comparisons, and they are not throughput benchmarks.
 
 The ordinary HS/reference service can still enable full-logprob diagnostics
 with `DSV4_EVAL=1`. The automated offline launcher and dedicated
-`--dsv4-block-verify` service remain DP1-only; `DP_SIZE=2` does not enable DP2
-for them.
+`--dsv4-block-verify` service remain DP1-only; setting `DP_SIZE=2` or `4` does not
+enable these layouts for them.
 
 On the trainer host:
 
@@ -449,10 +619,12 @@ script prints commands for viewing output and stopping training. A successful
 script return only means the background process was launched: inspect the log
 to confirm initialization. `TRAINING_SMOKE=1` still runs in the foreground and
 propagates its exit code so fresh/resume stages execute sequentially.
-The server script waits for readiness and stays in the foreground. Its default
+The API-host server script waits for readiness and stays in the foreground. Its default
 startup timeout is 1800 seconds, overridable with `VLLM_STARTUP_TIMEOUT`; early
 exit is an error. On Ctrl+C/exit, it cleans up only process groups it created.
-The server requires Linux `setsid` and `curl`. Restrict its port to a trusted
+The server requires Linux `setsid`, and the API host also requires `curl`. A DP4
+headless host only supervises its local process, not cluster readiness.
+Restrict its port to a trusted
 network and keep shared paths consistent.
 
 If `OUTPUT_DIR` is unset, the default is `./output/dspark_dsv4_flash_bestArch`.
@@ -989,7 +1161,7 @@ PYTHONPATH=src python -m unittest discover -s tests/standalone -v
 
 These cover checkpoint/manifest/HS-slot checks, hooks and guards against a
 simulated native runtime, DSV4 block/reference launch wiring and rejection of
-invalid combinations, single-host process management, and Qwen launch-argument
+invalid combinations, API/headless process management, and Qwen launch-argument
 regressions. Simulated backends do not validate real operators or tensor
 computation.
 

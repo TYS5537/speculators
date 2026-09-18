@@ -8,7 +8,10 @@ do NOT validate quantization kernels or numerical parity with target logits.
 import hashlib
 import json
 import math
+import os
 import struct
+import time
+import uuid
 from pathlib import Path
 
 from speculators_dsv4 import HS_FORMAT
@@ -291,8 +294,51 @@ def ensure_manifest(directory, expected, *, create=False, runtime_quantization=N
             "Refusing to label existing HS files as DSV4. Use a new empty directory."
         )
     directory.mkdir(parents=True, exist_ok=True)
-    with path.open("x", encoding="utf-8") as stream:
-        json.dump(expected, stream, indent=2)
+    # A second host may already be waiting for this file. Publish complete JSON
+    # atomically without replacing an existing contract (also on shared NFS).
+    temporary = None
+    try:
+        candidate = directory / f".{MANIFEST}.{uuid.uuid4().hex}.tmp"
+        # Keep normal umask-controlled permissions, like the old direct write;
+        # NamedTemporaryFile's 0600 mode would block other target/trainer users.
+        with candidate.open("x", encoding="utf-8") as stream:
+            temporary = candidate
+            json.dump(expected, stream, indent=2)
+            stream.flush()
+            os.fsync(stream.fileno())
+        try:
+            os.link(temporary, path)
+        except FileExistsError:
+            if json.loads(path.read_text(encoding="utf-8")) != expected:
+                raise ValueError(
+                    f"DSV4 HS contract/target mismatch: {path}. "
+                    "Use a fresh HS directory."
+                ) from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def wait_for_manifest(directory, expected, *, runtime_quantization, timeout=300):
+    """Secondary target nodes only read the head node's published contract.
+
+    This validates matching metadata, not cross-host filesystem identity or NPU
+    readiness. Shared-file/lock visibility still needs an actual HS probe.
+    """
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("DSV4 manifest timeout must be finite and positive.")
+    path = Path(directory) / MANIFEST
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise TimeoutError(
+                f"Timed out waiting for DSV4 HS manifest: {path}. Start the target "
+                "head node and mount the same shared HS directory at the same "
+                "absolute path on all target/trainer hosts."
+            )
+        time.sleep(min(1, remaining))
+    ensure_manifest(directory, expected, runtime_quantization=runtime_quantization)
 
 
 def replace_teacher_hidden(output, teacher, count):

@@ -74,7 +74,7 @@ def request_decode_probe(client, model, input_ids, *, max_tokens, timeout):
     return response
 
 
-def main():
+def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, help="Shared DSV4 checkpoint path")
     parser.add_argument("--hidden-states-path", required=True)
@@ -84,6 +84,15 @@ def main():
         "--target-layer-ids", nargs="+", type=int, default=DEFAULT_LAYERS
     )
     parser.add_argument("--timeout", type=float, default=120.0)
+    parser.add_argument(
+        "--data-parallel-rank",
+        type=int,
+        help=(
+            "Pin probes to one global DP rank via the native vLLM header. "
+            "Must be nonnegative; the server validates its DP range. "
+            "Omit to keep normal load balancing."
+        ),
+    )
     parser.add_argument(
         "--probe-max-tokens",
         type=int,
@@ -103,13 +112,20 @@ def main():
         "--concurrency",
         type=int,
         default=1,
-        help="Concurrent HS requests (use 2 or more to exercise DP2 load balancing)",
+        help="Concurrent HS requests (use 2 or more to exercise DP load balancing)",
     )
     args = parser.parse_args()
     if args.requests < 1 or args.concurrency < 1 or args.probe_max_tokens < 1:
         parser.error(
             "--requests, --concurrency and --probe-max-tokens must be positive"
         )
+    if args.data_parallel_rank is not None and args.data_parallel_rank < 0:
+        parser.error("--data-parallel-rank must be nonnegative")
+    return args
+
+
+def main():
+    args = parse_args()
 
     import openai  # noqa: PLC0415
     import torch  # noqa: PLC0415
@@ -128,6 +144,11 @@ def main():
         token < 0 or token >= report["config"]["vocab_size"] for token in args.input_ids
     ):
         raise ValueError("Input token ID outside target vocabulary.")
+    client_options = {}
+    if args.data_parallel_rank is not None:
+        client_options["default_headers"] = {
+            "X-data-parallel-rank": str(args.data_parallel_rank)
+        }
 
     def check_one(input_ids):
         # Each thread owns its client; the producer uses a fresh request ID.
@@ -135,6 +156,7 @@ def main():
             base_url=args.vllm_endpoint,
             api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
             max_retries=0,
+            **client_options,
         ) as client:
             if args.probe_max_tokens == 1:
                 handle = generate_hidden_states(
@@ -161,7 +183,7 @@ def main():
         hidden = validate_payload(
             payload, input_ids, len(args.target_layer_ids) + 1, torch
         )
-        return {
+        result = {
             "hidden_states_file": str(Path(handle).resolve()),
             "shape": list(hidden.shape),
             "dtype": str(hidden.dtype),
@@ -170,6 +192,9 @@ def main():
             "probe_max_tokens": args.probe_max_tokens,
             "per_slot_rms": hidden.float().square().mean(dim=(0, 2)).sqrt().tolist(),
         }
+        if args.data_parallel_rank is not None:
+            result["requested_data_parallel_rank"] = args.data_parallel_rank
+        return result
 
     results = check_requests(args.input_ids, args.requests, args.concurrency, check_one)
     print(
@@ -180,9 +205,15 @@ def main():
             indent=2,
         )
     )
-    if args.requests > 1:
+    if args.data_parallel_rank is not None:
         print(
-            "Concurrent probes do NOT prove both DP engines were used; "
+            f"Probes requested DP rank {args.data_parallel_rank}; "
+            "check server per-engine logs to confirm routing. "
+            "All HS files are retained."
+        )
+    elif args.requests > 1:
+        print(
+            "Concurrent probes do NOT prove all DP engines were used; "
             "check server per-engine request metrics/logs. All HS files are retained."
         )
     if args.probe_max_tokens > 1:

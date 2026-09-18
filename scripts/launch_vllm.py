@@ -1,8 +1,10 @@
 import argparse
 import json
+import math
 import os
 import sys
 import warnings
+from pathlib import Path
 
 try:
     from hs_connectors import HiddenStatesBackend
@@ -115,6 +117,15 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--dsv4-manifest-timeout",
+        type=float,
+        default=None,
+        help=(
+            "Seconds for a secondary DSV4 target to wait for the shared HS "
+            "manifest (default: 300)."
+        ),
+    )
+    parser.add_argument(
         "--dry-run",
         action="store_true",
         help="Print the command that would be executed without running it",
@@ -130,8 +141,17 @@ def main():  # noqa: C901
         raise ValueError("--dsv4-block-verify requires --dsv4.")
     if args.dsv4_execution_mode is not None and not args.dsv4:
         raise ValueError("--dsv4-execution-mode requires --dsv4.")
+    if args.dsv4_manifest_timeout is not None:
+        if not args.dsv4:
+            raise ValueError("--dsv4-manifest-timeout requires --dsv4.")
+        if (
+            not math.isfinite(args.dsv4_manifest_timeout)
+            or args.dsv4_manifest_timeout <= 0
+        ):
+            raise ValueError("DSV4 manifest timeout must be finite and positive.")
 
     dsv4_manifest = None
+    dsv4_parallel = None
     dsv4_runtime_quantization = None
     if args.dsv4:
         from importlib.metadata import entry_points  # noqa: PLC0415
@@ -143,18 +163,29 @@ def main():  # noqa: C901
             inspect_checkpoint,
             make_manifest,
             validate_layers,
+            wait_for_manifest,
         )
         from speculators_dsv4.execution import configure_execution_args  # noqa: PLC0415
-        from speculators_dsv4.parallel import configure_parallel_args  # noqa: PLC0415
+        from speculators_dsv4.parallel import (  # noqa: PLC0415
+            DP4_SIZE,
+            configure_parallel_args,
+        )
 
         configure_execution_args(
             vllm_args,
             args.dsv4_execution_mode or "eager",
             block_verify=args.dsv4_block_verify,
         )
-        configure_parallel_args(
+        dsv4_parallel = configure_parallel_args(
             vllm_args, os.environ, block_verify=args.dsv4_block_verify
         )
+        if (
+            dsv4_parallel.data_parallel_size == DP4_SIZE
+            and not Path(args.hidden_states_path).is_absolute()
+        ):
+            raise ValueError(
+                "DSV4 multi-host HS export requires an absolute shared HS path."
+            )
         report = inspect_checkpoint(args.model)
         num_hidden_layers = report["config"]["num_hidden_layers"]
         if args.hidden_states_backend != "file" or not args.include_last_layer:
@@ -298,12 +329,24 @@ def main():  # noqa: C901
 
     if not args.dry_run:
         if dsv4_manifest is not None:
-            ensure_manifest(
-                args.hidden_states_path,
-                dsv4_manifest,
-                create=True,
-                runtime_quantization=dsv4_runtime_quantization,
-            )
+            if dsv4_parallel.data_parallel_size == DP4_SIZE and dsv4_parallel.headless:
+                print(
+                    "Waiting for the target head node's shared DSV4 HS manifest...",
+                    flush=True,
+                )
+                wait_for_manifest(
+                    args.hidden_states_path,
+                    dsv4_manifest,
+                    runtime_quantization=dsv4_runtime_quantization,
+                    timeout=args.dsv4_manifest_timeout or 300,
+                )
+            else:
+                ensure_manifest(
+                    args.hidden_states_path,
+                    dsv4_manifest,
+                    create=True,
+                    runtime_quantization=dsv4_runtime_quantization,
+                )
             # Inherited by EngineCore/worker children. The general plugin must
             # patch KV planning before initialization, not at model construction.
             os.environ[KV_CACHE_COMPAT_ENV] = "1"

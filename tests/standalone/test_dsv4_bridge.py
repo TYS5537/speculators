@@ -275,6 +275,41 @@ class RuntimeTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "block verification"):
             self.make_model(config)
 
+    def test_dp4_workers_keep_independent_teacher_captures(self):
+        # Four Python model instances, not real HCCL/HS-file integration.
+        replicas = []
+        for rank in range(4):
+            config = runtime_config()
+            parallel = config.parallel_config
+            parallel.data_parallel_size = 4
+            parallel.data_parallel_size_local = 2
+            parallel.data_parallel_rank = rank
+            parallel.data_parallel_rank_local = rank % 2
+            parallel.data_parallel_master_ip = "192.0.2.10"
+            parallel.data_parallel_rpc_port = 13345
+            parallel.enable_expert_parallel = True
+            model = self.make_model(config)
+            model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
+            replicas.append(model)
+        retained = []
+        for rank, length, teacher in (
+            (0, 4, 7),
+            (2, 0, 8),
+            (3, 3, 9),
+            (1, 1, 10),
+            (2, 5, 11),
+        ):
+            model = replicas[rank]
+            model.test_shape, model.test_teacher = (length, 4096), teacher
+            _, auxiliary = model.forward(None, None)
+            self.assertEqual(auxiliary[-1].shape, (length, 4096))
+            self.assertEqual(auxiliary[-1].value, teacher)
+            self.assertTrue(
+                all(replica._teacher_pre_norm is None for replica in replicas)
+            )
+            retained.append(auxiliary[-1])
+        self.assertEqual([value.value for value in retained], [7, 8, 9, 10, 11])
+
     def test_explicit_layer_setup_is_required(self):
         model = self.make_model()
         with self.assertRaisesRegex(RuntimeError, "not configured"):
@@ -354,15 +389,25 @@ class LauncherTests(unittest.TestCase):
                 "dsv4_test_launcher", ROOT / "scripts/launch_vllm.py"
             )
 
-    def launch_dsv4(self, flag="--dsv4", extra=(), *, block=False, execution=None):
+    def launch_dsv4(
+        self,
+        flag="--dsv4",
+        extra=(),
+        *,
+        block=False,
+        execution=None,
+        hs_path="fixture-hs",
+        launcher_extra=(),
+    ):
         argv = [
             "launch_vllm.py",
             "fixture",
             flag,
             "--hidden-states-path",
-            "fixture-hs",
+            hs_path,
             *(["--dsv4-block-verify"] if block else []),
             *(["--dsv4-execution-mode", execution] if execution else []),
+            *launcher_extra,
             "--",
             *extra,
         ]
@@ -377,6 +422,7 @@ class LauncherTests(unittest.TestCase):
                 "speculators_dsv4.contract.inspect_checkpoint", return_value=report
             ) as inspect,
             patch("speculators_dsv4.contract.ensure_manifest") as manifest,
+            patch("speculators_dsv4.contract.wait_for_manifest") as wait_manifest,
             patch(
                 "importlib.metadata.entry_points",
                 return_value=[SimpleNamespace(name="speculators_dsv4")],
@@ -388,10 +434,12 @@ class LauncherTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             self.launcher.main()
-            self.assertEqual(os.environ.get(KV_CACHE_COMPAT_ENV), "1")
+            if execute.called:
+                self.assertEqual(os.environ.get(KV_CACHE_COMPAT_ENV), "1")
         inspect.assert_called_once_with("fixture")
         self.manifest_call = manifest.call_args
-        return execute.call_args.args[1]
+        self.wait_manifest_call = wait_manifest.call_args
+        return execute.call_args.args[1] if execute.called else None
 
     def test_dsv4_primary_flag_and_legacy_alias_are_equivalent(self):
         self.assertEqual(self.launch_dsv4(), self.launch_dsv4("--dsv4-bf16"))
@@ -517,6 +565,179 @@ class LauncherTests(unittest.TestCase):
         manifest.assert_not_called()
         inspect.assert_not_called()
         execute.assert_not_called()
+
+    def test_dp4_head_and_worker_share_connector_but_only_head_creates_manifest(self):
+        shared = str((ROOT / "fixture-shared-hs").resolve())
+        common = [
+            "-tp",
+            "8",
+            "-dp",
+            "4",
+            "-dpl",
+            "2",
+            "-ep",
+            "-dpa",
+            "192.0.2.10",
+            "-dpp",
+            "13345",
+        ]
+        with patch.dict(
+            os.environ, {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16)))}
+        ):
+            head = self.launch_dsv4(extra=common, hs_path=shared)
+            head_manifest = self.manifest_call
+            self.assertTrue(head_manifest.kwargs["create"])
+            self.assertIsNone(self.wait_manifest_call)
+            worker = self.launch_dsv4(
+                extra=[*common, "--headless", "-dpr", "2"],
+                hs_path=shared,
+                launcher_extra=["--dsv4-manifest-timeout", "17"],
+            )
+        self.assertIsNone(self.manifest_call)
+        self.assertEqual(self.wait_manifest_call.args, head_manifest.args)
+        self.assertEqual(
+            self.wait_manifest_call.kwargs,
+            {
+                "timeout": 17,
+                "runtime_quantization": {"method": None},
+            },
+        )
+        for flag in ("--speculative_config", "--kv_transfer_config", "--hf-overrides"):
+            self.assertEqual(head[head.index(flag) + 1], worker[worker.index(flag) + 1])
+        self.assertNotIn("--dsv4-manifest-timeout", worker)
+
+    def test_dp4_worker_dry_run_neither_waits_nor_writes(self):
+        with patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1"}):
+            result = self.launch_dsv4(
+                extra=[
+                    "-dp",
+                    "4",
+                    "-dpl",
+                    "2",
+                    "-ep",
+                    "-dpa",
+                    "192.0.2.10",
+                    "-dpp",
+                    "13345",
+                    "--headless",
+                    "-dpr",
+                    "2",
+                ],
+                hs_path=str((ROOT / "fixture-shared-hs").resolve()),
+                launcher_extra=["--dry-run"],
+            )
+        self.assertIsNone(result)
+        self.assertIsNone(self.manifest_call)
+        self.assertIsNone(self.wait_manifest_call)
+
+    def test_dp4_rejects_relative_hs_path_before_checkpoint_or_manifest(self):
+        argv = [
+            "launch_vllm.py",
+            "fixture",
+            "--dsv4",
+            "--hidden-states-path",
+            "relative-hs",
+            "--",
+            "-dp",
+            "4",
+            "-dpl",
+            "2",
+            "-ep",
+            "-dpa",
+            "192.0.2.10",
+            "-dpp",
+            "13345",
+        ]
+        with (
+            patch.object(sys, "argv", argv),
+            patch.dict(os.environ, {"ASCEND_RT_VISIBLE_DEVICES": "0,1"}),
+            patch("speculators_dsv4.contract.inspect_checkpoint") as inspect,
+            patch("speculators_dsv4.contract.ensure_manifest") as manifest,
+            patch.object(self.launcher.os, "execvp") as execute,
+            self.assertRaisesRegex(ValueError, "absolute shared HS path"),
+        ):
+            self.launcher.main()
+        inspect.assert_not_called()
+        manifest.assert_not_called()
+        execute.assert_not_called()
+
+    def test_manifest_timeout_rejects_invalid_values_and_qwen_use(self):
+        for flags in (
+            ["--dsv4-manifest-timeout", "1"],
+            ["--dsv4", "--dsv4-manifest-timeout", "0"],
+            ["--dsv4", "--dsv4-manifest-timeout", "-1"],
+            ["--dsv4", "--dsv4-manifest-timeout", "nan"],
+            ["--dsv4", "--dsv4-manifest-timeout", "inf"],
+        ):
+            with (
+                self.subTest(flags=flags),
+                patch.object(sys, "argv", ["launch_vllm.py", "fixture", *flags]),
+                patch("speculators_dsv4.contract.inspect_checkpoint") as inspect,
+                patch.object(self.launcher.os, "execvp") as execute,
+                self.assertRaises(ValueError),
+            ):
+                self.launcher.main()
+            inspect.assert_not_called()
+            execute.assert_not_called()
+
+    def test_dp4_worker_contract_failure_never_launches_engine(self):
+        argv = [
+            "launch_vllm.py",
+            "fixture",
+            "--dsv4",
+            "--hidden-states-path",
+            str((ROOT / "fixture-shared-hs").resolve()),
+            "--",
+            "-dp",
+            "4",
+            "-dpl",
+            "2",
+            "-ep",
+            "-dpa",
+            "192.0.2.10",
+            "-dpp",
+            "13345",
+            "--headless",
+            "-dpr",
+            "2",
+        ]
+        report = {
+            "config": valid_config(),
+            "model_path": "fixture",
+            "checkpoint_signature": "fixture",
+        }
+        for error in (
+            ValueError("contract mismatch"),
+            TimeoutError("manifest timeout"),
+        ):
+            with (
+                self.subTest(error=error),
+                patch.object(sys, "argv", argv),
+                patch.dict(
+                    os.environ,
+                    {
+                        "ASCEND_RT_VISIBLE_DEVICES": "0,1",
+                        "VLLM_PLUGINS": "ascend,speculators_dsv4",
+                    },
+                ),
+                patch(
+                    "speculators_dsv4.contract.inspect_checkpoint", return_value=report
+                ),
+                patch("speculators_dsv4.contract.ensure_manifest") as manifest,
+                patch("speculators_dsv4.contract.wait_for_manifest", side_effect=error),
+                patch(
+                    "importlib.metadata.entry_points",
+                    return_value=[
+                        SimpleNamespace(name="speculators_dsv4"),
+                    ],
+                ),
+                patch.object(self.launcher.os, "execvp") as execute,
+                redirect_stdout(io.StringIO()),
+                self.assertRaises(type(error)),
+            ):
+                self.launcher.main()
+            manifest.assert_not_called()
+            execute.assert_not_called()
 
     def test_block_verification_selects_dedicated_connector_and_single_sequence(self):
         cmd = self.launch_dsv4(block=True)
@@ -722,7 +943,7 @@ class RecipeTests(unittest.TestCase):
         for name, value in {
             "--tensor-parallel-size": "$TP_SIZE",
             "--data-parallel-size": "$DP_SIZE",
-            "--data-parallel-size-local": "$DP_SIZE",
+            "--data-parallel-size-local": "$DP_SIZE_LOCAL",
             "--distributed-executor-backend": "mp",
             "--pipeline-parallel-size": "1",
         }.items():

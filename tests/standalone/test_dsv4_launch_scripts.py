@@ -18,9 +18,18 @@ else:
 
 SERVER_STUBS = r"""
 python() { printf '%s\n' "$@" >> "$CHECKPOINT_CAPTURE"; }
-setsid() { printf '%s\n' "$@" > "$CAPTURE"; }
+setsid() {
+  printf '%s\n' "$@" > "$CAPTURE"
+  env | while IFS='=' read -r name value; do
+    case "$name" in
+      HCCL_IF_IP|GLOO_SOCKET_IFNAME|TP_SOCKET_IFNAME|HCCL_SOCKET_IFNAME)
+        printf '%s=%s\n' "$name" "$value" ;;
+    esac
+  done > "$ENV_CAPTURE"
+}
 curl_calls=0
 curl() {
+  printf '%s\n' "$*" >> "$CURL_CAPTURE"
   curl_calls=$((curl_calls + 1))
   case "$MODE" in
     occupied) return 0 ;;
@@ -85,6 +94,7 @@ class LaunchScriptTests(unittest.TestCase):
         self.capture = self.root / "arguments"
         self.checkpoint_capture = self.root / "checkpoint-arguments"
         self.environment_capture = self.root / "proxy-environment"
+        self.curl_capture = self.root / "curl-arguments"
         self.signals = self.root / "signals"
         self.output = self.root / "output with spaces"
 
@@ -94,6 +104,7 @@ class LaunchScriptTests(unittest.TestCase):
             "CAPTURE": self.capture.as_posix(),
             "CHECKPOINT_CAPTURE": self.checkpoint_capture.as_posix(),
             "ENV_CAPTURE": self.environment_capture.as_posix(),
+            "CURL_CAPTURE": self.curl_capture.as_posix(),
             "FIXTURE_NO_PROXY_UPPER": "",
             "FIXTURE_NO_PROXY_LOWER": "",
             "SIGNALS": self.signals.as_posix(),
@@ -107,6 +118,19 @@ class LaunchScriptTests(unittest.TestCase):
             "VLLM_STARTUP_TIMEOUT": "1",
             "TP_SIZE": "8",
             "DP_SIZE": "2",
+            "DP_SIZE_LOCAL": "",
+            "DP_START_RANK": "",
+            "DP_ADDRESS": "",
+            "DP_RPC_PORT": "",
+            "TARGET_MASTER_IP": "",
+            "TARGET_WORKER_IP": "",
+            "TARGET_LOCAL_IP": "10.0.0.10",
+            "TARGET_IFNAME": "eth-fixture",
+            "HCCL_IF_IP": "",
+            "GLOO_SOCKET_IFNAME": "",
+            "TP_SOCKET_IFNAME": "",
+            "HCCL_SOCKET_IFNAME": "",
+            "DSV4_MANIFEST_TIMEOUT": "",
             "VLLM_NPUS": ",".join(map(str, range(16))),
             "TRAIN_NPUS": ",".join(map(str, range(16))),
             "NUM_TRAIN_NPUS": "16",
@@ -120,6 +144,9 @@ class LaunchScriptTests(unittest.TestCase):
             "MODE": "ready",
             "WAIT_STATUS": "0",
             **overrides,
+        }
+        environment = {
+            key: value for key, value in environment.items() if value is not None
         }
         source = f"source examples/train/dspark_dsv4_flash_bf16_{kind}.sh\n"
         stubs = SERVER_STUBS if kind == "server" else TRAINER_STUBS
@@ -155,6 +182,10 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertIn("server ready", result.stdout)
         args = self.capture.read_text().splitlines()
         self.assertEqual(args[args.index("--data-parallel-size") + 1], "2")
+        self.assertEqual(args[args.index("--data-parallel-size-local") + 1], "2")
+        self.assertNotIn("--headless", args)
+        self.assertNotIn("--data-parallel-address", args)
+        self.assertNotIn("--data-parallel-start-rank", args)
         self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
         self.assertEqual(args[args.index("--port") + 1], "9123")
         self.assertEqual(args[args.index("--dsv4-execution-mode") + 1], "eager")
@@ -163,6 +194,265 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertNotIn("--async-scheduling", args)
         self.assertIn("execution mode: eager; async scheduling: 0", result.stdout)
         self.assertRegex(self.signals.read_text(), r"^-TERM -- -[1-9][0-9]*\n$")
+
+    def test_two_host_head_starts_local_engines_and_keeps_http_readiness(self):
+        result = self.run_script("server", DP_SIZE="4", DP_ADDRESS="10.0.0.10")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("server ready", result.stdout)
+        args = self.capture.read_text().splitlines()
+        for flag, expected in (
+            ("--tensor-parallel-size", "8"),
+            ("--data-parallel-size", "4"),
+            ("--data-parallel-size-local", "2"),
+            ("--data-parallel-start-rank", "0"),
+            ("--data-parallel-address", "10.0.0.10"),
+            ("--data-parallel-rpc-port", "13345"),
+            ("--data-parallel-backend", "mp"),
+            ("--dsv4-manifest-timeout", "300"),
+        ):
+            self.assertEqual(args[args.index(flag) + 1], expected)
+        self.assertLess(args.index("--dsv4-manifest-timeout"), args.index("--"))
+        self.assertNotIn("--headless", args)
+        self.assertIn("--enable-tokenizer-info-endpoint", args)
+        self.assertIn("--host", args)
+        self.assertIn("--port", args)
+        self.assertEqual(len(self.curl_capture.read_text().splitlines()), 2)
+        for name in (
+            "VLLM_DP_SIZE",
+            "VLLM_DP_RANK",
+            "VLLM_DP_RANK_LOCAL",
+            "VLLM_DP_MASTER_IP",
+            "VLLM_DP_MASTER_PORT",
+        ):
+            self.assertEqual(args[args.index(name) - 1], "-u")
+
+    def test_two_host_communication_environment_is_not_overridden(self):
+        communication = {
+            "HCCL_IF_IP": "10.0.0.20",
+            "GLOO_SOCKET_IFNAME": "gloo-fixture",
+            "TP_SOCKET_IFNAME": "tp-fixture",
+            "HCCL_SOCKET_IFNAME": "hccl-fixture",
+        }
+        result = self.run_script(
+            "server",
+            DP_SIZE="4",
+            DP_START_RANK="2",
+            DP_ADDRESS="10.0.0.10",
+            TARGET_LOCAL_IP="",
+            TARGET_IFNAME="",
+            **communication,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.proxy_environment(), communication)
+
+    def test_master_defaults_to_186_for_api_and_dp_rendezvous(self):
+        result = self.run_script(
+            "server", DP_SIZE="4", VLLM_HOST="", TARGET_LOCAL_IP="80.48.17.186"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        for flag in ("--host", "--data-parallel-address"):
+            self.assertEqual(args[args.index(flag) + 1], "80.48.17.186")
+        self.assertEqual(
+            self.proxy_environment(),
+            {
+                "HCCL_IF_IP": "80.48.17.186",
+                "GLOO_SOCKET_IFNAME": "eth-fixture",
+                "TP_SOCKET_IFNAME": "eth-fixture",
+                "HCCL_SOCKET_IFNAME": "eth-fixture",
+            },
+        )
+
+    def test_user_network_defaults_select_local_ip_by_start_rank(self):
+        for rank, local_ip in (("0", "80.48.17.186"), ("2", "80.48.17.187")):
+            with self.subTest(rank=rank):
+                result = self.run_script(
+                    "server",
+                    DP_SIZE="4",
+                    DP_START_RANK=rank,
+                    VLLM_HOST="",
+                    TARGET_LOCAL_IP=None,
+                    TARGET_IFNAME=None,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.capture.read_text().splitlines()
+                self.assertEqual(
+                    args[args.index("--data-parallel-address") + 1], "80.48.17.186"
+                )
+                self.assertEqual(
+                    self.proxy_environment(),
+                    {
+                        "HCCL_IF_IP": local_ip,
+                        "GLOO_SOCKET_IFNAME": "enp48s3u1u1",
+                        "TP_SOCKET_IFNAME": "enp48s3u1u1",
+                        "HCCL_SOCKET_IFNAME": "enp48s3u1u1",
+                    },
+                )
+
+    def test_custom_worker_ip_is_used_only_for_worker_local_interface(self):
+        result = self.run_script(
+            "server",
+            DP_SIZE="4",
+            DP_START_RANK="2",
+            TARGET_WORKER_IP="10.0.0.88",
+            TARGET_LOCAL_IP=None,
+            TARGET_IFNAME=None,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(
+            args[args.index("--data-parallel-address") + 1], "80.48.17.186"
+        )
+        self.assertEqual(self.proxy_environment()["HCCL_IF_IP"], "10.0.0.88")
+
+    def test_worker_uses_own_local_ip_and_common_nic_not_master_ip(self):
+        result = self.run_script(
+            "server",
+            DP_SIZE="4",
+            DP_START_RANK="2",
+            TARGET_LOCAL_IP="80.48.17.187",
+            TARGET_IFNAME="worker-nic",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(
+            args[args.index("--data-parallel-address") + 1], "80.48.17.186"
+        )
+        self.assertEqual(
+            self.proxy_environment(),
+            {
+                "HCCL_IF_IP": "80.48.17.187",
+                "GLOO_SOCKET_IFNAME": "worker-nic",
+                "TP_SOCKET_IFNAME": "worker-nic",
+                "HCCL_SOCKET_IFNAME": "worker-nic",
+            },
+        )
+        self.assertIn(
+            "master=80.48.17.186:13345, local HCCL IP=80.48.17.187", result.stdout
+        )
+
+    def test_native_network_overrides_take_precedence_over_common_defaults(self):
+        result = self.run_script(
+            "server",
+            DP_SIZE="4",
+            TARGET_LOCAL_IP="10.0.0.20",
+            TARGET_IFNAME="fallback-nic",
+            HCCL_IF_IP="10.0.0.21",
+            GLOO_SOCKET_IFNAME="gloo-override",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.proxy_environment(),
+            {
+                "HCCL_IF_IP": "10.0.0.21",
+                "GLOO_SOCKET_IFNAME": "gloo-override",
+                "TP_SOCKET_IFNAME": "fallback-nic",
+                "HCCL_SOCKET_IFNAME": "fallback-nic",
+            },
+        )
+
+    def test_custom_master_ip_updates_api_and_dp_address(self):
+        result = self.run_script(
+            "server", DP_SIZE="4", TARGET_MASTER_IP="10.0.0.99", VLLM_HOST=""
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        for flag in ("--host", "--data-parallel-address"):
+            self.assertEqual(args[args.index(flag) + 1], "10.0.0.99")
+        self.assertEqual(self.proxy_environment()["HCCL_IF_IP"], "10.0.0.10")
+
+    def test_single_host_network_can_remain_unconfigured(self):
+        result = self.run_script("server", TARGET_LOCAL_IP="", TARGET_IFNAME="")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(all(not value for value in self.proxy_environment().values()))
+
+    def test_trainer_default_endpoint_tracks_master_and_no_proxy(self):
+        (self.output / "logs").mkdir(parents=True)
+        for master, expected in (("", "80.48.17.186"), ("10.0.0.99", "10.0.0.99")):
+            with self.subTest(master=master):
+                result = self.run_script(
+                    "trainer", VLLM_ENDPOINT="", TARGET_MASTER_IP=master
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.capture.read_text().splitlines()
+                self.assertEqual(
+                    args[args.index("--vllm-endpoint") + 1],
+                    f"http://{expected}:8001/v1",
+                )
+                self.assertIn(expected, self.proxy_environment()["NO_PROXY"].split(","))
+
+    def test_single_host_dp1_local_size_still_defaults_to_one(self):
+        result = self.run_script("server", DP_SIZE="1", VLLM_NPUS="0,1,2,3,4,5,6,7")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(args[args.index("--data-parallel-size") + 1], "1")
+        self.assertEqual(args[args.index("--data-parallel-size-local") + 1], "1")
+        self.assertNotIn("--data-parallel-address", args)
+        self.assertNotIn("--data-parallel-start-rank", args)
+        self.assertNotIn("--headless", args)
+
+    def test_headless_host_never_checks_http_or_claims_cluster_readiness(self):
+        result = self.run_script(
+            "server",
+            DP_SIZE="4",
+            DP_SIZE_LOCAL="2",
+            DP_START_RANK="2",
+            DP_ADDRESS="10.0.0.10",
+            DP_RPC_PORT="24455",
+            DSV4_MANIFEST_TIMEOUT="600",
+            MODE="occupied",  # Would reject an API launch; headless never calls curl.
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("NOT cluster readiness", result.stdout)
+        self.assertNotIn("server ready", result.stdout)
+        self.assertFalse(self.curl_capture.exists())
+        args = self.capture.read_text().splitlines()
+        self.assertIn("--headless", args)
+        self.assertEqual(args[args.index("--data-parallel-start-rank") + 1], "2")
+        self.assertEqual(args[args.index("--data-parallel-rpc-port") + 1], "24455")
+        self.assertEqual(args[args.index("--dsv4-manifest-timeout") + 1], "600")
+        for flag in ("--host", "--port", "--enable-tokenizer-info-endpoint"):
+            self.assertNotIn(flag, args)
+        self.assertRegex(self.signals.read_text(), r"^-TERM -- -[1-9][0-9]*\n$")
+
+    def test_headless_host_propagates_worker_failure_and_cleans_owned_group(self):
+        result = self.run_script(
+            "server",
+            DP_SIZE="4",
+            DP_START_RANK="2",
+            DP_ADDRESS="10.0.0.10",
+            WAIT_STATUS="7",
+        )
+        self.assertEqual(result.returncode, 7, result.stderr)
+        self.assertFalse(self.curl_capture.exists())
+        self.assertTrue(self.signals.exists())
+
+    def test_invalid_parallel_settings_fail_before_checkpoint_or_process_launch(self):
+        for settings in (
+            {"DP_SIZE": "3"},
+            {"DP_SIZE": "8"},
+            {"DP_SIZE": "4", "TARGET_LOCAL_IP": ""},
+            {"DP_SIZE": "4", "TARGET_IFNAME": ""},
+            {"DP_SIZE": "4", "TARGET_IFNAME": "", "GLOO_SOCKET_IFNAME": "gloo-only"},
+            {"DP_SIZE": "4", "DP_ADDRESS": "10.0.0.10", "DP_SIZE_LOCAL": "4"},
+            {"DP_SIZE": "4", "DP_ADDRESS": "10.0.0.10", "DP_START_RANK": "1"},
+            {"DP_SIZE": "4", "DP_ADDRESS": "10.0.0.10", "DP_START_RANK": "4"},
+            {"DP_SIZE": "4", "DP_ADDRESS": "10.0.0.10", "DP_RPC_PORT": "65536"},
+            {"DP_SIZE": "4", "DP_ADDRESS": "10.0.0.10", "DP_RPC_PORT": "abc"},
+            {"DP_SIZE": "4", "DP_ADDRESS": "10.0.0.10", "HS_PATH": "relative/hs"},
+            {"DP_SIZE": "2", "DP_SIZE_LOCAL": "1"},
+            {"DP_SIZE": "2", "DP_START_RANK": "2"},
+            {"DP_SIZE": "1", "DP_ADDRESS": "10.0.0.10"},
+            {"DSV4_MANIFEST_TIMEOUT": "0"},
+            {"DSV4_MANIFEST_TIMEOUT": "nan"},
+        ):
+            with self.subTest(settings=settings):
+                result = self.run_script("server", **settings)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertFalse(self.checkpoint_capture.exists())
+                self.assertFalse(self.capture.exists())
+                self.assertFalse(self.curl_capture.exists())
+                self.assertFalse(self.signals.exists())
 
     def test_server_execution_mode_and_async_scheduling_are_independent(self):
         for execution_mode in ("eager", "full-decode-only"):

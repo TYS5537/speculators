@@ -3,11 +3,16 @@
 # ruff: noqa: PT009, PT027 -- Keep the suite runnable without pytest/torch.
 
 import importlib.util
+import io
+import json
+import sys
+import tempfile
 import threading
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import MagicMock, Mock, patch
 
 SPEC = importlib.util.spec_from_file_location(
     "dsv4_hs_check", Path(__file__).resolve().parents[2] / "scripts/check_dsv4_hs.py"
@@ -102,6 +107,127 @@ class HSCheckTests(unittest.TestCase):
         torch.isfinite.return_value.all.return_value.item.return_value = False
         with self.assertRaisesRegex(ValueError, "finite BF16"):
             MODULE.validate_payload(payload, [1, 2], 6, torch)
+
+    def test_rank_header_reaches_normal_and_decode_clients_and_is_reported(self):
+        # Exercise main with fake dependencies, not a live engine/DP setup.
+        for rank in (None, 0, 2, 3, 9):
+            for max_tokens in (1, 4):
+                with (
+                    self.subTest(rank=rank, max_tokens=max_tokens),
+                    tempfile.TemporaryDirectory() as directory,
+                ):
+                    handle = str(Path(directory) / "hs.safetensors")
+                    client = Mock()
+                    client.completions.create.return_value = SimpleNamespace(
+                        usage=SimpleNamespace(completion_tokens=max_tokens)
+                    )
+                    context = MagicMock()
+                    context.__enter__.return_value = client
+                    openai = SimpleNamespace(OpenAI=Mock(return_value=context))
+                    torch = SimpleNamespace(bfloat16="bf16", isfinite=Mock())
+                    torch.isfinite.return_value.all.return_value.item.return_value = (
+                        True
+                    )
+                    hidden = Mock(shape=(2, 6, 4096), dtype="bf16")
+                    mean = hidden.float.return_value.square.return_value.mean
+                    mean.return_value.sqrt.return_value.tolist.return_value = [1.0] * 6
+                    tokens = Mock()
+                    tokens.tolist.return_value = [1, 2]
+                    transfer = Mock()
+                    transfer.get_generated.return_value = {
+                        "token_ids": tokens,
+                        "hidden_states": hidden,
+                    }
+                    generator = Mock(return_value=handle)
+                    extract = Mock(return_value=handle)
+                    modules = {
+                        "openai": openai,
+                        "torch": torch,
+                        "hs_connectors": SimpleNamespace(
+                            FileTransfer=Mock(return_value=transfer)
+                        ),
+                        "speculators.data_generation.vllm_client": SimpleNamespace(
+                            generate_hidden_states=generator, extract_output=extract
+                        ),
+                    }
+                    arguments = [
+                        "check_dsv4_hs.py",
+                        "--model",
+                        "target",
+                        "--hidden-states-path",
+                        directory,
+                        "--input-ids",
+                        "1",
+                        "2",
+                        "--probe-max-tokens",
+                        str(max_tokens),
+                    ]
+                    if rank is not None:
+                        arguments += ["--data-parallel-rank", str(rank)]
+                    output = io.StringIO()
+                    with (
+                        patch.dict(sys.modules, modules),
+                        patch.object(sys, "argv", arguments),
+                        patch.object(
+                            MODULE,
+                            "inspect_checkpoint",
+                            return_value={"config": {"vocab_size": 1000}},
+                        ),
+                        patch.object(MODULE, "make_manifest", return_value={}),
+                        patch.object(MODULE, "ensure_manifest"),
+                        redirect_stdout(output),
+                    ):
+                        MODULE.main()
+                    options = openai.OpenAI.call_args.kwargs
+                    result, _ = json.JSONDecoder().raw_decode(output.getvalue())
+                    if rank is None:
+                        self.assertNotIn("default_headers", options)
+                        self.assertNotIn("requested_data_parallel_rank", result)
+                    else:
+                        self.assertEqual(
+                            options["default_headers"],
+                            {"X-data-parallel-rank": str(rank)},
+                        )
+                        self.assertEqual(result["requested_data_parallel_rank"], rank)
+                    if max_tokens == 1:
+                        generator.assert_called_once_with(
+                            client,
+                            "target",
+                            {"input_ids": [1, 2]},
+                            timeout=120,
+                            max_retries=0,
+                        )
+                        client.completions.create.assert_not_called()
+                    else:
+                        generator.assert_not_called()
+                        client.completions.create.assert_called_once()
+                        extract.assert_called_once_with(
+                            client.completions.create.return_value, [1, 2]
+                        )
+
+    def test_negative_rank_rejected_before_loading_dependencies(self):
+        arguments = [
+            "check_dsv4_hs.py",
+            "--model",
+            "target",
+            "--hidden-states-path",
+            "/shared/hs",
+            "--input-ids",
+            "1",
+            "--data-parallel-rank",
+            "-1",
+        ]
+        error = io.StringIO()
+        with (
+            patch.object(sys, "argv", arguments),
+            patch.object(MODULE, "inspect_checkpoint") as inspect,
+            redirect_stderr(error),
+            self.assertRaises(SystemExit) as raised,
+        ):
+            MODULE.main()
+        self.assertEqual(raised.exception.code, 2)
+        self.assertIn("--data-parallel-rank must be nonnegative", error.getvalue())
+        inspect.assert_not_called()
 
 
 if __name__ == "__main__":
