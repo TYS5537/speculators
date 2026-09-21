@@ -1,12 +1,12 @@
 #!/bin/bash
-# Online DSpark Training Script for Qwen3-8B on Ascend NPU
+# Online DSpark/MUSE Trainer for Qwen3-8B on Ascend NPU
 #
-# Runs the full online DSpark training pipeline on Ascend: data preparation,
-# vLLM server launch, and training with hidden states generated on-the-fly.
-# DSpark extends DFlash with a sequential correction and confidence head.
+# Trains against prepared Arrow data and an already-running vLLM server.
+# DSpark uses the baseline Markov/confidence heads; MUSE supports the extensions.
 #
 # Usage: Copy this script, modify the configuration variables below, then run:
-#   bash examples/train/dspark_qwen3_8b_sharegpt_online_ascend.sh
+#   bash examples/train/dspark_qwen3_8b_trainer.sh
+#   SPECULATOR_TYPE=muse bash examples/train/dspark_qwen3_8b_trainer.sh
 #
 # Note: This assumes your environment has torch_npu and an Ascend-compatible
 # vLLM installation that supports hidden-state extraction.
@@ -28,7 +28,7 @@ LR=6e-4
 LOGGER="tensorboard"
 
 # DSpark-specific parameters
-SPECULATOR_TYPE="dspark"
+SPECULATOR_TYPE="${SPECULATOR_TYPE:-dspark}"
 BLOCK_SIZE=7
 MAX_ANCHORS=512
 NUM_LAYERS=5
@@ -38,7 +38,7 @@ DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 
 # ---- Sequential head selection ------------------------------------------------
 # The paper baseline uses the Markov head. Set this to
-# (--enable-correction-head) only for an explicit Correction experiment.
+# (--enable-correction-head) and SPECULATOR_TYPE=muse for a Correction experiment.
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 CORRECTION_HEAD_ARGS=()
@@ -101,7 +101,8 @@ SSAL_CURRICULUM_START=0.1
 SSAL_CURRICULUM_END=0.6
 
 # ---- DFlash backbone experiments ---------------------------------------------
-# Optional DFlash backbone experiments. All are disabled to preserve the baseline.
+# Optional MUSE backbone experiments. Set SPECULATOR_TYPE=muse to enable them.
+# All are disabled here to preserve the DSpark baseline.
 DFLASH_CONTEXT_RESIDUAL_ARGS=(--no-dflash-context-residual)
 DFLASH_BLOCK_POSITION_ARGS=(--no-dflash-block-position-embedding)
 DFLASH_GATED_LAYER_FUSION_ARGS=(--no-dflash-gated-layer-fusion)
@@ -117,24 +118,60 @@ DFLASH2_SELECTOR_TOP_K=16
 DFLASH2_SELECTOR_SEARCH_MODE=greedy
 DFLASH2_SELECTOR_LOSS_WEIGHT=1.0
 
-case "$DFLASH2_SELECTOR_SEARCH_MODE" in
-    greedy|global) ;;
-    *)
-        echo "DFLASH2_SELECTOR_SEARCH_MODE must be greedy or global" >&2
-        exit 2
-        ;;
-esac
+# Do not pass even disabled/default MUSE options to the baseline CLI: explicit
+# architecture options belong to MUSE, independently of their values.
+MUSE_ARGS=()
+if [[ "$SPECULATOR_TYPE" == muse ]]; then
+    case "$DFLASH2_SELECTOR_SEARCH_MODE" in
+        greedy|global) ;;
+        *)
+            echo "DFLASH2_SELECTOR_SEARCH_MODE must be greedy or global" >&2
+            exit 2
+            ;;
+    esac
 
-case "$SELECTOR_CORRECTION_FEEDBACK" in
-    static|corrected) ;;
-    *)
-        echo "SELECTOR_CORRECTION_FEEDBACK must be static or corrected" >&2
+    case "$SELECTOR_CORRECTION_FEEDBACK" in
+        static|corrected) ;;
+        *)
+            echo "SELECTOR_CORRECTION_FEEDBACK must be static or corrected" >&2
+            exit 2
+            ;;
+    esac
+    if [[ "$SELECTOR_CORRECTION_FEEDBACK" == corrected && "$DFLASH2_SELECTOR_SEARCH_MODE" != greedy ]]; then
+        echo "corrected Selector feedback requires greedy search" >&2
         exit 2
-        ;;
-esac
-if [[ "$SELECTOR_CORRECTION_FEEDBACK" == corrected && "$DFLASH2_SELECTOR_SEARCH_MODE" != greedy ]]; then
-    echo "corrected Selector feedback requires greedy search" >&2
-    exit 2
+    fi
+
+    MUSE_ARGS=(
+        "${CORRECTION_HEAD_ARGS[@]}"
+        --correction-output-mode "$CORRECTION_OUTPUT_MODE"
+        --correction-hidden-size "$CORRECTION_HIDDEN_SIZE"
+        --correction-rank "$CORRECTION_RANK"
+        "${CORRECTION_LM_HEAD_FUSION_ARGS[@]}"
+        --correction-num-layers "$CORRECTION_NUM_LAYERS"
+        --correction-num-heads "$CORRECTION_NUM_HEADS"
+        --correction-gate-bias "$CORRECTION_GATE_BIAS"
+        "${CORRECTION_HIDDEN_AUX_ARGS[@]}"
+        --correction-hidden-aux-weight "$CORRECTION_HIDDEN_AUX_WEIGHT"
+        "${CORRECTION_HIDDEN_FEEDBACK_ARGS[@]}"
+        --selector-correction-feedback "$SELECTOR_CORRECTION_FEEDBACK"
+        "${CORRECTION_PROJECT_HIDDEN_ARGS[@]}"
+        "${CORRECTION_COLLABORATION_ARGS[@]}"
+        --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS"
+        "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}"
+        "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}"
+        "${DFLASH_CONTEXT_RESIDUAL_ARGS[@]}"
+        "${DFLASH_BLOCK_POSITION_ARGS[@]}"
+        "${DFLASH_GATED_LAYER_FUSION_ARGS[@]}"
+        "${DFLASH2_DYNAMIC_CONV_ARGS[@]}"
+        --dflash2-conv-kernel-size "$DFLASH2_CONV_KERNEL_SIZE"
+        --dflash2-conv-group-size "$DFLASH2_CONV_GROUP_SIZE"
+        "${DFLASH2_CANDIDATE_SELECTOR_ARGS[@]}"
+        --dflash2-selector-rank "$DFLASH2_SELECTOR_RANK"
+        --dflash2-selector-top-k "$DFLASH2_SELECTOR_TOP_K"
+        "--dflash2-selector-${DFLASH2_SELECTOR_SEARCH_MODE}"
+        --dflash2-selector-loss-weight "$DFLASH2_SELECTOR_LOSS_WEIGHT"
+    )
 fi
 
 # Ascend NPU assignments (online training needs separate devices for vLLM/training)
@@ -157,7 +194,7 @@ echo "=== Step 1: Preparing data ==="
 #     --seq-length "$SEQ_LENGTH" \
 #     --disable-thinking
 
-# Step 3: Train DSpark against the live vLLM server
+# Step 3: Train the selected architecture against the live vLLM server
 LOG_DIR="$OUTPUT_DIR/logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
@@ -186,34 +223,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --target-layer-ids $TARGET_LAYER_IDS \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
-    "${CORRECTION_HEAD_ARGS[@]}" \
-    --correction-output-mode "$CORRECTION_OUTPUT_MODE" \
-    --correction-hidden-size "$CORRECTION_HIDDEN_SIZE" \
-    --correction-rank "$CORRECTION_RANK" \
-    "${CORRECTION_LM_HEAD_FUSION_ARGS[@]}" \
-    --correction-num-layers "$CORRECTION_NUM_LAYERS" \
-    --correction-num-heads "$CORRECTION_NUM_HEADS" \
-    --correction-gate-bias "$CORRECTION_GATE_BIAS" \
-    "${CORRECTION_HIDDEN_AUX_ARGS[@]}" \
-    --correction-hidden-aux-weight "$CORRECTION_HIDDEN_AUX_WEIGHT" \
-    "${CORRECTION_HIDDEN_FEEDBACK_ARGS[@]}" \
-    --selector-correction-feedback "$SELECTOR_CORRECTION_FEEDBACK" \
-    "${CORRECTION_PROJECT_HIDDEN_ARGS[@]}" \
-    "${CORRECTION_COLLABORATION_ARGS[@]}" \
-    --correction-markov-gate-bias "$CORRECTION_MARKOV_GATE_BIAS" \
-    "${CORRECTION_ROLLOUT_METRICS_ARGS[@]}" \
-    "${CORRECTION_BASE_DIAGNOSTICS_ARGS[@]}" \
-    "${DFLASH_CONTEXT_RESIDUAL_ARGS[@]}" \
-    "${DFLASH_BLOCK_POSITION_ARGS[@]}" \
-    "${DFLASH_GATED_LAYER_FUSION_ARGS[@]}" \
-    "${DFLASH2_DYNAMIC_CONV_ARGS[@]}" \
-    --dflash2-conv-kernel-size "$DFLASH2_CONV_KERNEL_SIZE" \
-    --dflash2-conv-group-size "$DFLASH2_CONV_GROUP_SIZE" \
-    "${DFLASH2_CANDIDATE_SELECTOR_ARGS[@]}" \
-    --dflash2-selector-rank "$DFLASH2_SELECTOR_RANK" \
-    --dflash2-selector-top-k "$DFLASH2_SELECTOR_TOP_K" \
-    "--dflash2-selector-${DFLASH2_SELECTOR_SEARCH_MODE}" \
-    --dflash2-selector-loss-weight "$DFLASH2_SELECTOR_LOSS_WEIGHT" \
+    "${MUSE_ARGS[@]}" \
     "${CONFIDENCE_HEAD_ARGS[@]}" \
     "${CONFIDENCE_SEQUENTIAL_FEATURE_ARGS[@]}" \
     --loss-fn "$LOSS_FN" \

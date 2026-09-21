@@ -7,6 +7,7 @@ from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
 from speculators.models.metrics import ce_loss, kl_div_loss, tv_loss_fused_or_eager
+from speculators.models.muse.core import MuseDraftModel
 from speculators.models.peagle.core import PEagleDraftModel
 
 
@@ -226,12 +227,12 @@ def test_dspark_adaptive_and_confidence_cli(monkeypatch):
     assert val_kw["ssal_decay_weight"] == 0.0
 
 
-def test_dspark_preprojection_correction_head_cli(monkeypatch):
+def test_muse_preprojection_correction_head_cli(monkeypatch):
     args = _parse(
         monkeypatch,
         [
             "--speculator-type",
-            "dspark",
+            "muse",
             "--enable-correction-head",
             "--correction-hidden-size",
             "96",
@@ -261,16 +262,16 @@ def test_dspark_preprojection_correction_head_cli(monkeypatch):
     assert args.correction_base_diagnostics is True
     assert args.confidence_detach_features is True
 
-    train_kw, val_kw = DSparkDraftModel.get_trainer_kwargs(**vars(args))
+    train_kw, val_kw = MuseDraftModel.get_trainer_kwargs(**vars(args))
     assert train_kw == val_kw
 
 
-def test_dspark_logit_residual_correction_head_cli(monkeypatch):
+def test_muse_logit_residual_correction_head_cli(monkeypatch):
     args = _parse(
         monkeypatch,
         [
             "--speculator-type",
-            "dspark",
+            "muse",
             "--enable-correction-head",
             "--correction-output-mode",
             "logits",
@@ -280,13 +281,13 @@ def test_dspark_logit_residual_correction_head_cli(monkeypatch):
     assert args.correction_output_mode == "logits"
 
 
-def test_dspark_lm_head_fusion_rejects_logit_mode_without_dual_projection(monkeypatch):
+def test_muse_lm_head_fusion_rejects_logit_mode_without_dual_projection(monkeypatch):
     with pytest.raises(SystemExit):
         _parse(
             monkeypatch,
             [
                 "--speculator-type",
-                "dspark",
+                "muse",
                 "--enable-correction-head",
                 "--correction-output-mode",
                 "logits",
@@ -295,12 +296,12 @@ def test_dspark_lm_head_fusion_rejects_logit_mode_without_dual_projection(monkey
         )
 
 
-def test_dspark_lm_head_fusion_accepts_logit_mode_with_dual_projection(monkeypatch):
+def test_muse_lm_head_fusion_accepts_logit_mode_with_dual_projection(monkeypatch):
     args = _parse(
         monkeypatch,
         [
             "--speculator-type",
-            "dspark",
+            "muse",
             "--enable-correction-head",
             "--correction-output-mode",
             "logits",
@@ -313,12 +314,12 @@ def test_dspark_lm_head_fusion_accepts_logit_mode_with_dual_projection(monkeypat
     assert args.correction_lm_head_fusion is True
 
 
-def test_dspark_correction_hidden_auxiliary_features_cli(monkeypatch):
+def test_muse_correction_hidden_auxiliary_features_cli(monkeypatch):
     args = _parse(
         monkeypatch,
         [
             "--speculator-type",
-            "dspark",
+            "muse",
             "--enable-correction-head",
             "--correction-hidden-aux-loss",
             "--correction-hidden-aux-weight",
@@ -340,7 +341,7 @@ def test_corrected_selector_feedback_cli(monkeypatch):
         monkeypatch,
         [
             "--speculator-type",
-            "dspark",
+            "muse",
             "--enable-correction-head",
             "--dflash2-candidate-selector",
             "--selector-correction-feedback",
@@ -356,7 +357,7 @@ def test_corrected_selector_feedback_rejects_global_search(monkeypatch):
             monkeypatch,
             [
                 "--speculator-type",
-                "dspark",
+                "muse",
                 "--enable-correction-head",
                 "--dflash2-candidate-selector",
                 "--dflash2-selector-global",
@@ -374,12 +375,12 @@ def test_retained_dflash_and_collaboration_features_default_off(monkeypatch):
     assert args.dflash_gated_layer_fusion is False
 
 
-def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
+def test_muse_collaboration_and_dflash_feature_cli(monkeypatch):
     args = _parse(
         monkeypatch,
         [
             "--speculator-type",
-            "dspark",
+            "muse",
             "--enable-correction-head",
             "--correction-with-markov",
             "--correction-markov-gate-bias",
@@ -415,6 +416,38 @@ def test_dspark_collaboration_and_dflash_feature_cli(monkeypatch):
     assert args.dflash2_selector_top_k == 4
     assert args.dflash2_selector_search_mode == "global"
     assert args.dflash2_selector_loss_weight == 0.5
+
+
+def test_muse_defaults_preserve_dspark_recipe_without_enabling_extensions(monkeypatch):
+    baseline = _parse(monkeypatch, ["--speculator-type", "dspark"])
+    args = _parse(monkeypatch, ["--speculator-type", "muse"])
+    for field in (
+        "block_size",
+        "dflash_decay_gamma",
+        "num_layers",
+        "epochs",
+        "loss_fn",
+    ):
+        assert getattr(args, field) == getattr(baseline, field)
+    assert not args.enable_correction_head
+    assert not args.dflash2_candidate_selector
+    assert not args.dflash_gated_layer_fusion
+
+
+@pytest.mark.parametrize("model_type", ["dflash", "dspark"])
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--enable-correction-head",
+        "--dflash-gated-layer-fusion",
+        "--dflash2-candidate-selector",
+        "--dflash2-dynamic-conv",
+    ],
+)
+def test_baselines_reject_muse_feature_flags(monkeypatch, capsys, model_type, flag):
+    with pytest.raises(SystemExit):
+        _parse(monkeypatch, ["--speculator-type", model_type, flag])
+    assert "--speculator-type muse" in capsys.readouterr().err
 
 
 # ---------------------------------------------------------------------------

@@ -90,7 +90,7 @@ def load_draft(loader_code, *, target_dtype, checkpoint_dtype, backend="hf"):
 
     namespace = {
         "torch": torch,
-        "DSparkDraftModel": TinyDraft,
+        "SpeculatorModel": TinyDraft,
         "args": SimpleNamespace(draft_model="local-checkpoint", dtype="auto"),
         "draft_config": object(),
         "target_backend": backend,
@@ -147,7 +147,7 @@ def test_bf16_correction_still_computes_previous_softmax_in_fp32(
     )
     definitions = load_module(
         "dspark_dtype_head_test",
-        ROOT / "src/speculators/models/dspark/model_definitions.py",
+        ROOT / "src/speculators/models/muse/correction.py",
     )
     head = definitions.CausalCorrectionHead(
         input_hidden_size=4,

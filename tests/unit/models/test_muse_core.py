@@ -1,12 +1,12 @@
-"""Focused unit tests for DSpark correction integration helpers."""
+"""Focused unit tests for Muse correction integration helpers."""
 
 from types import SimpleNamespace
 
 import torch
 from torch import nn
 
-from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.dspark.model_definitions import MarkovHead
+from speculators.models.muse.core import MuseDraftModel
 
 
 class _RecordingCorrectionHead(nn.Module):
@@ -19,7 +19,7 @@ class _RecordingCorrectionHead(nn.Module):
         self.previous_logits: list[torch.Tensor] = []
         self.previous_logits_masks: list[torch.Tensor] = []
 
-    def forward(
+    def forward(  # noqa: PLR0917
         self,
         previous_embeddings,
         dflash_hidden,
@@ -73,7 +73,7 @@ class _RecordingLogitCorrectionHead(nn.Module):
         self.previous_logits: list[torch.Tensor] = []
         self.previous_logits_masks: list[torch.Tensor] = []
 
-    def forward(
+    def forward(  # noqa: PLR0917
         self,
         previous_embeddings,
         dflash_hidden,
@@ -128,8 +128,7 @@ class _RecordingLogitCorrectionHead(nn.Module):
         source = previous_logits if previous_logits is not None else candidate_logits
         assert source is not None
         rank = source.new_zeros(*source.shape[:-1], 1)
-        rank = rank * previous_logits_mask.to(rank.dtype).unsqueeze(-1)
-        return rank
+        return rank * previous_logits_mask.to(rank.dtype).unsqueeze(-1)
 
 
 class _RecordingHiddenFeedbackCorrectionHead(nn.Module):
@@ -140,7 +139,7 @@ class _RecordingHiddenFeedbackCorrectionHead(nn.Module):
         self.previous_corrected_hidden: list[torch.Tensor] = []
         self.previous_corrected_hidden_masks: list[torch.Tensor] = []
 
-    def forward(
+    def forward(  # noqa: PLR0917
         self,
         previous_embeddings,
         dflash_hidden,
@@ -170,26 +169,31 @@ class _RecordingHiddenFeedbackCorrectionHead(nn.Module):
 
 class _RolloutHarness:
     candidate_selector = None
-    _draft_ids_to_verifier = DSparkDraftModel._draft_ids_to_verifier
-    _dflash2_proposal_logits = DSparkDraftModel._dflash2_proposal_logits
-    dflash2_select_candidates = DSparkDraftModel.dflash2_select_candidates
+    _draft_ids_to_verifier = MuseDraftModel._draft_ids_to_verifier
+    _dflash2_proposal_logits = MuseDraftModel._dflash2_proposal_logits
+    dflash2_select_candidates = MuseDraftModel.dflash2_select_candidates
     _replace_compact_feature_position = staticmethod(
-        DSparkDraftModel._replace_compact_feature_position
+        MuseDraftModel._replace_compact_feature_position
     )
-    _selector_correction_inputs = DSparkDraftModel._selector_correction_inputs
-    _rollout_correction_steps = DSparkDraftModel._rollout_correction_steps
-    rollout_correction = DSparkDraftModel.rollout_correction
+    _selector_correction_inputs = MuseDraftModel._selector_correction_inputs
+    _validate_rollout_inputs = MuseDraftModel._validate_rollout_inputs
+    _initial_rollout_logit_feedback = MuseDraftModel._initial_rollout_logit_feedback
+    _rollout_correction_steps = MuseDraftModel._rollout_correction_steps
+    rollout_correction = MuseDraftModel.rollout_correction
 
 
 class _CollaborationHarness:
-    _apply_collaborative_markov = DSparkDraftModel._apply_collaborative_markov
+    _apply_collaborative_markov = MuseDraftModel._apply_collaborative_markov
 
 
 class _CollaborativeRolloutHarness:
     candidate_selector = None
-    _apply_collaborative_markov = DSparkDraftModel._apply_collaborative_markov
-    _rollout_correction_steps = DSparkDraftModel._rollout_correction_steps
-    rollout_correction = DSparkDraftModel.rollout_correction
+    _draft_ids_to_verifier = MuseDraftModel._draft_ids_to_verifier
+    _apply_collaborative_markov = MuseDraftModel._apply_collaborative_markov
+    _validate_rollout_inputs = MuseDraftModel._validate_rollout_inputs
+    _initial_rollout_logit_feedback = MuseDraftModel._initial_rollout_logit_feedback
+    _rollout_correction_steps = MuseDraftModel._rollout_correction_steps
+    rollout_correction = MuseDraftModel.rollout_correction
 
 
 class _CountingLinear(nn.Linear):
@@ -482,9 +486,7 @@ def test_logit_dual_lm_head_fusion_projects_base_block_once():
         correction_project_corrected_hidden=True,
         correction_lm_head_fusion=True,
     )
-    harness.correction_head = _RecordingLogitCorrectionHead(
-        harness.draft_vocab_size
-    )
+    harness.correction_head = _RecordingLogitCorrectionHead(harness.draft_vocab_size)
     harness.embed_tokens = nn.Embedding(8, 4)
     harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
     harness.d2t = None
@@ -513,9 +515,7 @@ def test_logit_dual_lm_head_fusion_reuses_base_for_reserved_anchor_slot():
         correction_project_corrected_hidden=True,
         correction_lm_head_fusion=True,
     )
-    harness.correction_head = _RecordingLogitCorrectionHead(
-        harness.draft_vocab_size
-    )
+    harness.correction_head = _RecordingLogitCorrectionHead(harness.draft_vocab_size)
     harness.embed_tokens = nn.Embedding(8, 4)
     harness.lm_head = _CountingLinear(4, harness.draft_vocab_size)
     harness.d2t = None
@@ -564,12 +564,12 @@ def test_confidence_feature_detach_switch_controls_both_inputs():
     hidden = torch.randn(2, 3, 4, requires_grad=True)
     sequential = torch.randn(2, 3, 2, requires_grad=True)
 
-    coupled = DSparkDraftModel._confidence_features(hidden, sequential, detach=False)
+    coupled = MuseDraftModel._confidence_features(hidden, sequential, detach=False)
     coupled.sum().backward()
     assert hidden.grad is not None
     assert sequential.grad is not None
 
-    detached = DSparkDraftModel._confidence_features(hidden, sequential, detach=True)
+    detached = MuseDraftModel._confidence_features(hidden, sequential, detach=True)
     assert not detached.requires_grad
     assert torch.equal(detached[..., :4], hidden.detach())
     assert torch.equal(detached[..., 4:], sequential.detach())
@@ -580,7 +580,7 @@ def test_hidden_alignment_loss_is_masked_and_zero_for_matching_states():
     verifier = torch.tensor([[[1.0, 2.0], [0.0, 0.0]]])
     mask = torch.tensor([[1.0, 0.0]])
 
-    loss = DSparkDraftModel._hidden_alignment_loss(corrected, verifier, mask)
+    loss = MuseDraftModel._hidden_alignment_loss(corrected, verifier, mask)
 
     assert torch.equal(loss, torch.zeros_like(loss))
 

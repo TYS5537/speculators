@@ -57,8 +57,8 @@ def _validate_training_data(args, report, rank, world_size):
 
 
 def prepare_training(args, *, rank=0, world_size=1):
-    if args.speculator_type != "dspark":
-        raise ValueError("The DSV4 target adapter currently supports DSpark only.")
+    if args.speculator_type not in {"dspark", "muse"}:
+        raise ValueError("The DSV4 target adapter supports DSpark and MUSE only.")
     if args.hidden_states_backend != "file" or args.legacy_data:
         raise ValueError("DSV4 currently requires the file HS backend and Arrow data.")
     report = inspect_checkpoint(args.verifier_name_or_path)

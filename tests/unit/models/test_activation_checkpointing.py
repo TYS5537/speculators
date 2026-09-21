@@ -12,8 +12,8 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash import core as dflash_core
 from speculators.models.dflash.core import DFlashDraftModel
-from speculators.models.dspark import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
+from speculators.models.muse import MuseDraftModel, MuseSpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
@@ -38,12 +38,25 @@ def _make_model(
         layer_types=["full_attention", "full_attention"],
     )
     transformer_config._attn_implementation = attention_impl
-    algorithm = "dspark" if correction else "dflash"
-    config_class = DSparkSpeculatorConfig if correction else DFlashSpeculatorConfig
-    correction_kwargs = (
+    enhanced = features or correction
+    algorithm = "muse" if enhanced else "dflash"
+    config_class = MuseSpeculatorConfig if enhanced else DFlashSpeculatorConfig
+    feature_kwargs = (
         {
             "markov_rank": 0,
             "enable_confidence_head": False,
+            "sample_from_anchor": correction,
+            "dflash_gated_layer_fusion": features,
+            "dflash_context_residual": features,
+            "dflash_block_position_embedding": features,
+            "dflash2_dynamic_conv": features,
+            "dflash2_conv_group_size": 4,
+        }
+        if enhanced
+        else {}
+    )
+    correction_kwargs = (
+        {
             "enable_correction_head": True,
             "correction_hidden_size": 16,
             "correction_rank": 4,
@@ -60,11 +73,6 @@ def _make_model(
         block_size=3,
         aux_hidden_state_layer_ids=[0, 1],
         mask_token_id=0,
-        dflash_gated_layer_fusion=features,
-        dflash_context_residual=features,
-        dflash_block_position_embedding=features,
-        dflash2_dynamic_conv=features,
-        dflash2_conv_group_size=4,
         speculators_config=SpeculatorsConfig(
             algorithm=algorithm,
             proposal_methods=[
@@ -75,9 +83,10 @@ def _make_model(
                 name_or_path=None, architectures=["Qwen3ForCausalLM"]
             ),
         ),
+        **feature_kwargs,
         **correction_kwargs,
     )
-    model_class = DSparkDraftModel if correction else DFlashDraftModel
+    model_class = MuseDraftModel if enhanced else DFlashDraftModel
     model = model_class(config).train()
     with torch.no_grad():
         # These normally come from the target; an unloaded model uses NaN sentinels.
@@ -256,6 +265,7 @@ def test_switch_is_runtime_only_and_inherited(correction):
         for name, value in model.state_dict().items():
             torch.testing.assert_close(value, original_state[name], rtol=0, atol=0)
     assert DSparkDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
+    assert MuseDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
 
 
 @pytest.mark.parametrize("attention_impl", ["eager", "sdpa"])

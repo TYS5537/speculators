@@ -1041,6 +1041,19 @@ def generate_base_model_sample(
     )
 
 
+def _load_draft_config(model_path):
+    """Resolve baseline DSpark and Muse (including legacy enhanced DSpark)."""
+    from speculators.config import SpeculatorModelConfig  # noqa: PLC0415
+
+    config = SpeculatorModelConfig.from_pretrained(model_path)
+    if config.speculators_model_type not in ("dspark", "muse"):
+        raise ValueError(
+            "This evaluator supports DSpark and Muse checkpoints; "
+            f"received {config.speculators_model_type!r}."
+        )
+    return config
+
+
 class DSparkOfflineRunner:
     def __init__(self, target_model, draft_model, tokenizer, args) -> None:
         self.target_model = target_model
@@ -1219,7 +1232,7 @@ class DSparkOfflineRunner:
             None
             if (
                 draft.correction_head is not None
-                and draft.candidate_selector is None
+                and getattr(draft, "candidate_selector", None) is None
                 and not reuse_base_logits
             )
             else draft.lm_head(hidden)
@@ -1287,7 +1300,10 @@ class DSparkOfflineRunner:
             "dflash2_selector_search_mode",
             "greedy",
         )
-        if draft.candidate_selector is not None and selector_search_mode == "global":
+        if (
+            getattr(draft, "candidate_selector", None) is not None
+            and selector_search_mode == "global"
+        ):
             if draft.markov_head is not None:
                 raise RuntimeError(
                     "Global DFlash2 path search is not compatible with a standalone "
@@ -1343,7 +1359,7 @@ class DSparkOfflineRunner:
                         hidden_states=hidden_states[:, slot : slot + 1, :],
                     )
                 logits = logits + markov_bias
-            if draft.candidate_selector is not None:
+            if getattr(draft, "candidate_selector", None) is not None:
                 candidate_ids, candidate_logits = draft.dflash2_select_candidates(
                     logits,
                     hidden_states[:, slot : slot + 1, :],
@@ -2065,7 +2081,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
     from transformers import DynamicCache as DynamicCacheClass  # noqa: PLC0415
 
-    from speculators.models.dspark.core import DSparkDraftModel  # noqa: PLC0415
+    from speculators.model import SpeculatorModel  # noqa: PLC0415
 
     torch = torch_module
     DynamicCache = DynamicCacheClass
@@ -2089,7 +2105,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
             .eval()
         )
 
-    draft_config = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    draft_config = _load_draft_config(args.draft_model)
     if target_backend == "dsv4-vllm":
         from speculators_dsv4 import HS_FORMAT  # noqa: PLC0415
 
@@ -2119,7 +2135,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     draft_dtype = (
         torch.bfloat16 if target_backend == "dsv4-vllm" else target_model.dtype
     )
-    draft_model = DSparkDraftModel.from_pretrained(
+    draft_model = SpeculatorModel.from_pretrained(
         args.draft_model,
         config=draft_config,
         d2t=d2t,
@@ -2192,9 +2208,10 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     else:
         sequential_head = "none"
     logger.info(
-        "Loaded DSpark | block_size=%d sample_from_anchor=%s "
+        "Loaded %s | block_size=%d sample_from_anchor=%s "
         "max_proposal_tokens=%d sequential_head=%s lm_head_fusion=%s "
         "dflash2_conv=%s dflash2_selector=%s",
+        draft_config.speculators_model_type,
         int(draft_model.block_size),
         bool(draft_config.sample_from_anchor),
         speculative_slots_for_draft(draft_model),
@@ -2204,8 +2221,8 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
         bool(getattr(draft_config, "dflash2_candidate_selector", False)),
     )
     logger.info(
-        "DSpark implementation: %s",
-        sys.modules[DSparkDraftModel.__module__].__file__,
+        "Draft implementation: %s",
+        sys.modules[type(draft_model).__module__].__file__,
     )
 
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
@@ -2243,7 +2260,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline DSpark/speculators evaluation on JSONL data.",
+        description="Offline DSpark/Muse evaluation on JSONL data.",
     )
     parser.add_argument("--verifier-model", required=True)
     parser.add_argument("--draft-model", required=True)

@@ -16,6 +16,7 @@ from transformers.models.auto.configuration_auto import AutoConfig
 from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
 
 from hs_connectors import HiddenStatesBackend
+from speculators.config import SpeculatorModelConfig
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
@@ -25,6 +26,11 @@ from speculators.models.eagle3.data import shift_batch
 from speculators.models.eagle3.rotary_partial import install_partial_neox_rotary
 from speculators.models.metrics import resolve_loss_config
 from speculators.models.mtp.data import shift_batch_mtp
+from speculators.models.muse.config import (
+    MUSE_OPTION_FIELDS,
+    muse_option_defaults,
+    validate_muse_options,
+)
 from speculators.models.utils import (
     get_verifier_config,
     resolve_draft_intermediate_size,
@@ -432,7 +438,8 @@ def _build_from_config_only(
     speculator config, load vocab mappings, and pull verifier weights -- but with
     no trained draft weights to restore (decoder weights are randomly initialized).
     """
-    config = model_class.config_class.from_pretrained(path)
+    config = SpeculatorModelConfig.from_pretrained(path)
+    model_class = SpeculatorModel.registered_model_class_from_config(config)
     if training_args is not None:
         _reconcile_pretrained_config_args(training_args, config)
     if draft_attn_impl is not None:
@@ -499,18 +506,23 @@ def build_draft_model(
             # the CLI selection before construction -- mirroring from_training_args.
             # MTP is skipped: its from_training_args never sets the field and its
             # __init__ resolves its own default ("eager") when it is absent.
-            config = model_class.config_class.from_pretrained(args.from_pretrained)
+            config = SpeculatorModelConfig.from_pretrained(args.from_pretrained)
             _reconcile_pretrained_config_args(args, config)
             config.transformer_layer_config._attn_implementation = args.draft_attn_impl
-            return model_class.from_pretrained(
+            return SpeculatorModel.from_pretrained(
                 args.from_pretrained,
                 config=config,
                 t2d=t2d,
                 d2t=d2t,
                 verifier=args.verifier_name_or_path,
             )
+        # MTP keeps its own attention default, but it still needs the same saved
+        # architecture/explicit-override checks as the other checkpoint paths.
+        config = SpeculatorModelConfig.from_pretrained(args.from_pretrained)
+        _reconcile_pretrained_config_args(args, config)
         return model_class.from_pretrained(
             args.from_pretrained,
+            config=config,
             t2d=t2d,
             d2t=d2t,
             verifier=args.verifier_name_or_path,
@@ -668,6 +680,10 @@ def main(args: argparse.Namespace):  # noqa: C901
     model_class = registry[args.speculator_type]
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
+    # Saved configs are authoritative, including enhanced legacy DSpark configs
+    # migrated to Muse. Use the resolved class for preprocessing/trainer policy.
+    model_class = type(draft_model)
+    args.speculator_type = draft_model.config.speculators_model_type
 
     if (
         use_dsv4_format
@@ -859,15 +875,18 @@ PRETRAINED_RUNTIME_CONFIG_FIELDS = {
     "dflash2_selector_search_mode",
 }
 
+MUSE_MODEL_CONFIG_FIELDS = MUSE_OPTION_FIELDS
 
-def _reconcile_pretrained_config_args(
+
+def _plan_pretrained_config_overrides(
     args: argparse.Namespace,
     config: PretrainedConfig,
-) -> None:
-    """Safely reconcile explicit CLI flags with a restored model config."""
-    provided = set(getattr(args, "_provided_model_config_dests", set()))
+    provided: set[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    """Collect inherited arguments and allowed overrides without mutating either."""
     incompatible: list[str] = []
-    applied: list[str] = []
+    inherited_args: dict[str, object] = {}
+    runtime_overrides: dict[str, object] = {}
 
     for dest, flag in PRETRAINED_MODEL_CONFIG_FLAGS.items():
         if not hasattr(config, dest) or not hasattr(args, dest):
@@ -877,13 +896,12 @@ def _reconcile_pretrained_config_args(
         if dest not in provided:
             # Trainer kwargs are built from args later. Inherit the saved value so
             # parser defaults cannot silently reset the checkpoint's policy.
-            setattr(args, dest, checkpoint_value)
+            inherited_args[dest] = checkpoint_value
             continue
         if cli_value == checkpoint_value:
             continue
         if dest in PRETRAINED_RUNTIME_CONFIG_FIELDS:
-            setattr(config, dest, cli_value)
-            applied.append(f"{flag}={cli_value!r}")
+            runtime_overrides[dest] = cli_value
         else:
             incompatible.append(
                 f"{flag}={cli_value!r} (checkpoint: {checkpoint_value!r})"
@@ -896,10 +914,49 @@ def _reconcile_pretrained_config_args(
             "option(s), use matching values, or start a fresh model without "
             "--from-pretrained."
         )
-    if applied:
+    return inherited_args, runtime_overrides
+
+
+def _reconcile_pretrained_config_args(
+    args: argparse.Namespace,
+    config: PretrainedConfig,
+) -> None:
+    """Validate the complete checkpoint/CLI merge, then commit it to both objects."""
+    provided = set(getattr(args, "_provided_model_config_dests", set()))
+    muse_overrides = provided & MUSE_MODEL_CONFIG_FIELDS
+    if muse_overrides and getattr(config, "speculators_model_type", None) != "muse":
+        raise ValueError(
+            "Correction, backbone enhancement and Selector options require a "
+            "Muse checkpoint; --from-pretrained cannot add them to a baseline "
+            "checkpoint. Start a fresh model with --speculator-type muse."
+        )
+
+    inherited_args, runtime_overrides = _plan_pretrained_config_overrides(
+        args, config, provided
+    )
+
+    # Validate the final saved-config/CLI combination before mutating either
+    # object. Parser defaults are not checkpoint values, and an invalid runtime
+    # override must not leave an otherwise reusable config partially changed.
+    if getattr(config, "speculators_model_type", None) == "muse":
+        candidate = {
+            field: getattr(config, field)
+            for field in PRETRAINED_MODEL_CONFIG_FLAGS
+            if hasattr(config, field)
+        }
+        validate_muse_options({**candidate, **runtime_overrides})
+
+    for dest, value in inherited_args.items():
+        setattr(args, dest, value)
+    for dest, value in runtime_overrides.items():
+        setattr(config, dest, value)
+    if runtime_overrides:
         logger.info(
             "Applied explicit runtime-only overrides to pretrained config: %s",
-            ", ".join(applied),
+            ", ".join(
+                f"{PRETRAINED_MODEL_CONFIG_FLAGS[dest]}={value!r}"
+                for dest, value in runtime_overrides.items()
+            ),
         )
 
 
@@ -960,6 +1017,7 @@ def validate_draft_init_args(
 
 def parse_args():
     parser = argparse.ArgumentParser()
+    muse_defaults = muse_option_defaults()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
     parser.add_argument(
         "--trust-remote-code",
@@ -970,7 +1028,8 @@ def parse_args():
         "--speculator-type",
         type=str,
         default="eagle3",
-        help="Type of speculator model to train (eagle3, dflash, dspark, peagle, mtp)",
+        help="Type of speculator model to train "
+        "(eagle3, dflash, dspark, muse, peagle, mtp)",
     )
     parser.add_argument(
         "--from-pretrained",
@@ -1338,70 +1397,70 @@ def parse_args():
     parser.add_argument(
         "--dflash-context-residual",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["dflash_context_residual"],
         help=(
-            "DFlash/DSpark: inject the last inference-available verifier hidden "
+            "Muse: inject the last inference-available verifier hidden "
             "state into each draft block (default: disabled)."
         ),
     )
     parser.add_argument(
         "--dflash-block-position-embedding",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["dflash_block_position_embedding"],
         help=(
-            "DFlash/DSpark: add zero-initialized block-relative slot embeddings "
+            "Muse: add zero-initialized block-relative slot embeddings "
             "(default: disabled)."
         ),
     )
     parser.add_argument(
         "--dflash-gated-layer-fusion",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["dflash_gated_layer_fusion"],
         help=(
-            "DFlash/DSpark: use normalized per-token gated auxiliary-layer fusion "
+            "Muse: use normalized per-token gated auxiliary-layer fusion "
             "(default: disabled)."
         ),
     )
     parser.add_argument(
         "--dflash2-dynamic-conv",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["dflash2_dynamic_conv"],
         help=(
-            "DFlash2: wrap every draft Attention and MLP with grouped causal "
+            "Muse: wrap every draft Attention and MLP with grouped causal "
             "dynamic convolutions (default: disabled)."
         ),
     )
     parser.add_argument(
         "--dflash2-conv-kernel-size",
         type=int,
-        default=2,
+        default=muse_defaults["dflash2_conv_kernel_size"],
         help="DFlash2 dynamic-convolution causal tap count (default: 2).",
     )
     parser.add_argument(
         "--dflash2-conv-group-size",
         type=int,
-        default=16,
+        default=muse_defaults["dflash2_conv_group_size"],
         help="DFlash2 hidden channels per dynamic-convolution group (default: 16).",
     )
     parser.add_argument(
         "--dflash2-candidate-selector",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["dflash2_candidate_selector"],
         help=(
-            "DFlash2: sequentially re-rank the existing LM-head Top-K candidate "
+            "Muse: sequentially re-rank the existing LM-head Top-K candidate "
             "chain (default: disabled)."
         ),
     )
     parser.add_argument(
         "--dflash2-selector-rank",
         type=int,
-        default=256,
+        default=muse_defaults["dflash2_selector_rank"],
         help="DFlash2 candidate-selector transition rank (default: 256).",
     )
     parser.add_argument(
         "--dflash2-selector-top-k",
         type=int,
-        default=16,
+        default=muse_defaults["dflash2_selector_top_k"],
         help="DFlash2 candidate-selector Top-K width (default: 16).",
     )
     selector_search_group = parser.add_mutually_exclusive_group()
@@ -1422,14 +1481,16 @@ def parse_args():
             "the block-local Top-K selector lattice."
         ),
     )
-    parser.set_defaults(dflash2_selector_search_mode="greedy")
+    parser.set_defaults(
+        dflash2_selector_search_mode=muse_defaults["dflash2_selector_search_mode"]
+    )
     parser.add_argument(
         "--dflash2-selector-loss-weight",
         type=float,
-        default=1.0,
+        default=muse_defaults["dflash2_selector_loss_weight"],
         help="Weight of the DFlash2 restricted-Top-K selector loss (default: 1.0).",
     )
-    # DSpark-specific arguments (sequential correction + confidence head).
+    # DSpark baseline heads and Muse-specific Correction extensions.
     parser.add_argument(
         "--markov-rank",
         type=int,
@@ -1446,19 +1507,19 @@ def parse_args():
     parser.add_argument(
         "--enable-correction-head",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["enable_correction_head"],
         help=(
-            "DSpark: use causal Correction; it replaces Markov unless "
+            "Muse: use causal Correction; it replaces Markov unless "
             "--correction-with-markov is enabled."
         ),
     )
     parser.add_argument(
         "--correction-output-mode",
         type=str,
-        default="hidden",
+        default=muse_defaults["correction_output_mode"],
         choices=["hidden", "logits"],
         help=(
-            "DSpark Correction output: 'hidden' adds a pre-LM-head hidden "
+            "Muse Correction output: 'hidden' adds a pre-LM-head hidden "
             "residual; 'logits' consumes previous logits and adds a low-rank "
             "vocabulary bias to DFlash base logits (default: hidden)."
         ),
@@ -1466,21 +1527,21 @@ def parse_args():
     parser.add_argument(
         "--correction-hidden-size",
         type=int,
-        default=512,
-        help="DSpark correction-head hidden width (default: 512).",
+        default=muse_defaults["correction_hidden_size"],
+        help="Muse correction-head hidden width (default: 512).",
     )
     parser.add_argument(
         "--correction-rank",
         type=int,
-        default=256,
-        help="DSpark correction residual bottleneck (default: 256).",
+        default=muse_defaults["correction_rank"],
+        help="Muse correction residual bottleneck (default: 256).",
     )
     parser.add_argument(
         "--correction-lm-head-fusion",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["correction_lm_head_fusion"],
         help=(
-            "DSpark Correction: during no-grad rollout, project the DFlash block "
+            "Muse Correction: during no-grad rollout, project the DFlash block "
             "once and fuse low-rank hidden residuals with the LM head. Supports "
             "hidden mode and logits mode with corrected-hidden projection "
             "(default: disabled)."
@@ -1489,49 +1550,49 @@ def parse_args():
     parser.add_argument(
         "--correction-num-layers",
         type=int,
-        default=1,
-        help="DSpark correction-head causal layers (default: 1).",
+        default=muse_defaults["correction_num_layers"],
+        help="Muse correction-head causal layers (default: 1).",
     )
     parser.add_argument(
         "--correction-num-heads",
         type=int,
-        default=8,
-        help="DSpark correction-head attention heads (default: 8).",
+        default=muse_defaults["correction_num_heads"],
+        help="Muse correction-head attention heads (default: 8).",
     )
     parser.add_argument(
         "--correction-gate-bias",
         type=float,
-        default=0.0,
-        help="DSpark initial correction residual-gate bias (default: 0).",
+        default=muse_defaults["correction_gate_bias"],
+        help="Muse initial correction residual-gate bias (default: 0).",
     )
     parser.add_argument(
         "--correction-hidden-aux-loss",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["correction_hidden_aux_loss"],
         help=(
-            "DSpark: align Correction's corrected DFlash hidden with verifier "
+            "Muse: align Correction's corrected DFlash hidden with verifier "
             "pre-LM hidden using an auxiliary SmoothL1 loss (default: disabled)."
         ),
     )
     parser.add_argument(
         "--correction-hidden-aux-weight",
         type=float,
-        default=0.1,
-        help="DSpark hidden auxiliary-loss weight (default: 0.1).",
+        default=muse_defaults["correction_hidden_aux_weight"],
+        help="Muse hidden auxiliary-loss weight (default: 0.1).",
     )
     parser.add_argument(
         "--correction-hidden-feedback",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["correction_hidden_feedback"],
         help=(
-            "DSpark: feed each corrected hidden into the next Correction slot "
+            "Muse: feed each corrected hidden into the next Correction slot "
             "(default: disabled)."
         ),
     )
     parser.add_argument(
         "--selector-correction-feedback",
         choices=("static", "corrected"),
-        default="static",
+        default=muse_defaults["selector_correction_feedback"],
         help=(
             "Selector-to-Correction token feedback: static keeps the selected path; "
             "corrected feeds each Correction token into the next greedy slot."
@@ -1540,9 +1601,9 @@ def parse_args():
     parser.add_argument(
         "--correction-project-corrected-hidden",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["correction_project_corrected_hidden"],
         help=(
-            "DSpark logits mode: compute current logits as "
+            "Muse logits mode: compute current logits as "
             "LMHead(h_DFlash + delta_hidden) + delta_logits while retaining one "
             "full LM-head projection (default: disabled)."
         ),
@@ -1550,32 +1611,32 @@ def parse_args():
     parser.add_argument(
         "--correction-with-markov",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["correction_with_markov"],
         help=(
-            "DSpark: jointly add a Correction-gated low-rank Markov bias after "
+            "Muse: jointly add a Correction-gated low-rank Markov bias after "
             "Correction's single LM-head projection (default: disabled)."
         ),
     )
     parser.add_argument(
         "--correction-markov-gate-bias",
         type=float,
-        default=-2.0,
-        help="DSpark initial collaboration gate bias (default: -2.0).",
+        default=muse_defaults["correction_markov_gate_bias"],
+        help="Muse initial collaboration gate bias (default: -2.0).",
     )
     parser.add_argument(
         "--correction-rollout-metrics",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=muse_defaults["correction_rollout_metrics"],
         help=(
-            "DSpark Correction: measure greedy self-feedback metrics during "
+            "Muse Correction: measure greedy self-feedback metrics during "
             "validation (default: disabled for DSpark baseline parity)."
         ),
     )
     parser.add_argument(
         "--correction-base-diagnostics",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="DSpark: add a validation-only base projection for change/gain metrics.",
+        default=muse_defaults["correction_base_diagnostics"],
+        help="Muse: add a validation-only base projection for change/gain metrics.",
     )
     parser.add_argument(
         "--enable-confidence-head",
@@ -1806,18 +1867,29 @@ def parse_args():
     args = parser.parse_args()
     if args.dsv4_external_arrow and (
         args.target_hidden_state_format != "deepseek_v4_mean_hc_head"
-        or args.speculator_type != "dspark"
+        or args.speculator_type not in ("dspark", "muse")
         or args.legacy_data
     ):
         parser.error(
-            "--dsv4-external-arrow requires DSV4 DSpark training with Arrow data"
+            "--dsv4-external-arrow requires DSV4 DSpark/Muse training with Arrow data"
         )
     args._provided_model_config_dests = explicitly_provided_dests(
         parser, PRETRAINED_MODEL_CONFIG_FLAGS
     )
+    if (
+        not args.from_pretrained
+        and args.speculator_type != "muse"
+        and (args._provided_model_config_dests & MUSE_MODEL_CONFIG_FIELDS)
+    ):
+        parser.error(
+            "Correction, backbone enhancement and Selector options now belong to "
+            "Muse; use --speculator-type muse. DFlash and DSpark select the "
+            "baseline architectures."
+        )
 
     # Preserve the shared CLI defaults for every other algorithm while making a
-    # bare ``--speculator-type dspark`` reproduce the paper training recipe.
+    # bare DSpark/Muse runs inherit the DSpark paper training recipe. Muse's
+    # optional architecture extensions remain explicit opt-ins.
     dspark_default_dests = {
         "block_size",
         "dflash_decay_gamma",
@@ -1826,7 +1898,7 @@ def parse_args():
         "num_layers",
     }
     dspark_provided = explicitly_provided_dests(parser, dspark_default_dests)
-    if args.speculator_type == "dspark":
+    if args.speculator_type in ("dspark", "muse"):
         if "block_size" not in dspark_provided:
             args.block_size = DSPARK_PAPER_BLOCK_SIZE
         if "dflash_decay_gamma" not in dspark_provided:
@@ -1853,103 +1925,22 @@ def parse_args():
     validate_draft_init_args(parser, args, provided)
     resolve_loss_config(args.loss_fn)
 
-    if args.enable_correction_head:
-        if args.speculator_type != "dspark":
-            parser.error("--enable-correction-head is only valid for DSpark")
-        if (
-            min(
-                args.correction_hidden_size,
-                args.correction_rank,
-                args.correction_num_layers,
-                args.correction_num_heads,
+    try:
+        if args.from_pretrained:
+            # The remaining values will come from the checkpoint, not parser
+            # defaults. Check only explicitly supplied scalars at this stage.
+            validate_muse_options(
+                {
+                    field: getattr(args, field)
+                    for field in args._provided_model_config_dests
+                    & MUSE_MODEL_CONFIG_FIELDS
+                },
+                partial=True,
             )
-            <= 0
-        ):
-            parser.error("DSpark correction sizes, layers, and heads must be > 0")
-        if args.correction_hidden_size % args.correction_num_heads != 0:
-            parser.error(
-                "--correction-hidden-size must be divisible by --correction-num-heads"
-            )
-    elif args.correction_output_mode != "hidden" and not args.from_pretrained:
-        parser.error(
-            "--correction-output-mode=logits requires --enable-correction-head"
-        )
-    if args.correction_lm_head_fusion:
-        if not args.enable_correction_head and not args.from_pretrained:
-            parser.error(
-                "--correction-lm-head-fusion requires --enable-correction-head"
-            )
-        if (
-            args.correction_output_mode == "logits"
-            and not args.correction_project_corrected_hidden
-        ):
-            parser.error(
-                "Logits --correction-lm-head-fusion requires "
-                "--correction-project-corrected-hidden"
-            )
-    if (
-        (
-            args.correction_hidden_aux_loss
-            or args.correction_hidden_feedback
-            or args.correction_project_corrected_hidden
-        )
-        and not args.enable_correction_head
-        and not args.from_pretrained
-    ):
-        parser.error(
-            "Correction auxiliary/feedback features require --enable-correction-head"
-        )
-    if args.correction_hidden_aux_weight < 0.0:
-        parser.error("--correction-hidden-aux-weight must be >= 0")
-    if (
-        args.correction_project_corrected_hidden
-        and args.correction_output_mode != "logits"
-        and not args.from_pretrained
-    ):
-        parser.error(
-            "--correction-project-corrected-hidden requires "
-            "--correction-output-mode=logits"
-        )
-    if args.correction_with_markov:
-        if not args.enable_correction_head and not args.from_pretrained:
-            parser.error("--correction-with-markov requires --enable-correction-head")
-        if args.markov_rank <= 0:
-            parser.error("--correction-with-markov requires --markov-rank > 0")
-        if args.markov_head_type == "rnn":
-            parser.error(
-                "--correction-with-markov supports only vanilla or gated Markov heads"
-            )
-    if args.selector_correction_feedback == "corrected" and not args.from_pretrained:
-        if not args.enable_correction_head or not args.dflash2_candidate_selector:
-            parser.error(
-                "--selector-correction-feedback=corrected requires Correction and "
-                "the DFlash2 candidate selector"
-            )
-        if args.dflash2_selector_search_mode != "greedy":
-            parser.error(
-                "--selector-correction-feedback=corrected requires "
-                "--dflash2-selector-greedy"
-            )
-    if (
-        args.dflash_context_residual
-        or args.dflash_block_position_embedding
-        or args.dflash_gated_layer_fusion
-        or args.dflash2_dynamic_conv
-        or args.dflash2_candidate_selector
-    ) and args.speculator_type not in ("dflash", "dspark"):
-        parser.error(
-            "DFlash backbone feature flags are only valid for DFlash or DSpark"
-        )
-    if args.dflash2_conv_kernel_size <= 0:
-        parser.error("--dflash2-conv-kernel-size must be > 0")
-    if args.dflash2_conv_group_size <= 0:
-        parser.error("--dflash2-conv-group-size must be > 0")
-    if args.dflash2_selector_rank <= 0:
-        parser.error("--dflash2-selector-rank must be > 0")
-    if args.dflash2_selector_top_k <= 0:
-        parser.error("--dflash2-selector-top-k must be > 0")
-    if args.dflash2_selector_loss_weight < 0.0:
-        parser.error("--dflash2-selector-loss-weight must be >= 0")
+        elif args.speculator_type == "muse":
+            validate_muse_options(vars(args))
+    except ValueError as error:
+        parser.error(str(error))
     if args.per_position_loss_weight == "dpace":
         if args.loss_fn != "ce":
             parser.error("--per-position-loss-weight=dpace requires --loss-fn=ce")

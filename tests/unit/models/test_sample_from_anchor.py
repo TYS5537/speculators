@@ -5,6 +5,7 @@ from transformers import AutoConfig
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark import DSparkSpeculatorConfig
+from speculators.models.muse import MuseSpeculatorConfig
 
 
 class TestSampleFromAnchorDFlash:
@@ -14,11 +15,8 @@ class TestSampleFromAnchorDFlash:
         """DFlash should default to sample_from_anchor=False."""
         config = DFlashSpeculatorConfig(draft_vocab_size=128, block_size=4)
         assert not config.sample_from_anchor
-        assert not config.dflash_context_residual
-        assert not config.dflash_block_position_embedding
-        assert not config.dflash_gated_layer_fusion
-        assert not config.dflash2_dynamic_conv
-        assert not config.dflash2_candidate_selector
+        assert "dflash_context_residual" not in type(config).model_fields
+        assert "dflash2_dynamic_conv" not in type(config).model_fields
 
     def test_can_set_to_true(self):
         """DFlash can be configured with sample_from_anchor=True."""
@@ -35,10 +33,8 @@ class TestSampleFromAnchorDSpark:
         """DSpark should default to sample_from_anchor=True."""
         config = DSparkSpeculatorConfig(draft_vocab_size=128, block_size=4)
         assert config.sample_from_anchor
-        assert not config.correction_with_markov
-        assert config.selector_correction_feedback == "static"
-        assert not config.dflash2_dynamic_conv
-        assert not config.dflash2_candidate_selector
+        assert "enable_correction_head" not in type(config).model_fields
+        assert "dflash2_candidate_selector" not in type(config).model_fields
 
     def test_can_override_to_false(self):
         """DSpark can be configured with sample_from_anchor=False."""
@@ -46,6 +42,17 @@ class TestSampleFromAnchorDSpark:
             draft_vocab_size=128, block_size=4, sample_from_anchor=False
         )
         assert not config.sample_from_anchor
+
+
+class TestSampleFromAnchorMuse:
+    def test_defaults_match_dspark_with_optional_extensions_off(self):
+        config = MuseSpeculatorConfig(draft_vocab_size=128, block_size=4)
+        assert config.sample_from_anchor
+        assert not config.enable_correction_head
+        assert not config.correction_with_markov
+        assert config.selector_correction_feedback == "static"
+        assert not config.dflash2_dynamic_conv
+        assert not config.dflash2_candidate_selector
 
 
 class TestSpeculativeTokensCalculation:

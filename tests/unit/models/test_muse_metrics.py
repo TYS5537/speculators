@@ -1,9 +1,9 @@
-"""Unit tests for the DSpark loss and metrics."""
+"""Unit tests for the Muse loss and metrics."""
 
 import torch
 
-from speculators.models.dspark.metrics import compute_metrics, select_logged_metrics
 from speculators.models.metrics import resolve_loss_config
+from speculators.models.muse.metrics import compute_metrics, select_logged_metrics
 
 _DEFAULT_LOSS = resolve_loss_config('{"ce": 0.1, "tv": 0.9}')
 

@@ -31,7 +31,9 @@ from scripts.train import (
     parse_args,
 )
 from speculators import SpeculatorsConfig, VerifierConfig
+from speculators.models.dspark import DSparkDraftModel
 from speculators.models.eagle3 import Eagle3DraftModel, Eagle3SpeculatorConfig
+from speculators.models.muse import MuseDraftModel, MuseSpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 from speculators.utils.loading import is_config_only_dir
 
@@ -482,7 +484,9 @@ def test_pretrained_config_allows_explicit_runtime_override():
         correction_rollout_metrics=True,
         _provided_model_config_dests={"correction_rollout_metrics"},
     )
-    config = SimpleNamespace(correction_rollout_metrics=False)
+    config = SimpleNamespace(
+        speculators_model_type="muse", correction_rollout_metrics=False
+    )
 
     _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
 
@@ -494,10 +498,60 @@ def test_pretrained_config_rejects_structural_override():
         dflash2_dynamic_conv=True,
         _provided_model_config_dests={"dflash2_dynamic_conv"},
     )
-    config = SimpleNamespace(dflash2_dynamic_conv=False)
+    config = SimpleNamespace(speculators_model_type="muse", dflash2_dynamic_conv=False)
 
     with pytest.raises(ValueError, match="checkpoint architecture"):
         _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
+
+
+def test_pretrained_baseline_cannot_silently_ignore_muse_flags():
+    args = SimpleNamespace(
+        enable_correction_head=True,
+        _provided_model_config_dests={"enable_correction_head"},
+    )
+    config = SimpleNamespace(speculators_model_type="dspark")
+    with pytest.raises(ValueError, match="Muse checkpoint"):
+        _reconcile_pretrained_config_args(args, config)  # type: ignore[arg-type]
+
+
+def test_config_only_legacy_enhanced_dspark_resolves_muse(tmp_path):
+    config = MuseSpeculatorConfig(
+        transformer_layer_config=Qwen3Config(**TINY_LLAMA_KWARGS),
+        speculators_config=SpeculatorsConfig(
+            algorithm="muse",
+            proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=3)],
+            default_proposal_method="greedy",
+            verifier=VerifierConfig(name_or_path=None, architectures=[]),
+        ),
+        draft_vocab_size=64,
+        mask_token_id=0,
+        aux_hidden_state_layer_ids=[0],
+        enable_correction_head=True,
+        correction_hidden_size=32,
+        correction_rank=16,
+        correction_num_heads=4,
+    )
+    legacy = config.to_dict()
+    legacy["speculators_model_type"] = "dspark"
+    legacy["architectures"] = ["DSparkSpeculator"]
+    (tmp_path / "config.json").write_text(json.dumps(legacy))
+
+    with (
+        patch.object(MuseDraftModel, "load_verifier_weights"),
+        pytest.warns(UserWarning, match="legacy DSpark"),
+    ):
+        model = _build_from_config_only(
+            DSparkDraftModel,
+            str(tmp_path),
+            None,
+            None,
+            draft_attn_impl="eager",
+        )
+
+    assert isinstance(model, MuseDraftModel)
+    assert model.correction_head is not None
+    assert model.config.speculators_model_type == "muse"
+    assert model.config.enable_correction_head
 
 
 # ---------------------------------------------------------------------------
@@ -593,6 +647,7 @@ def _capture_full_attention_indices(
     [
         ("dflash", [], []),
         ("dspark", [], []),
+        ("muse", [], []),
         ("dflash", [1], [1]),
         ("eagle3", [], []),
         ("peagle", [], []),

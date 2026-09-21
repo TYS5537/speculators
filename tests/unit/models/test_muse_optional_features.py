@@ -1,17 +1,17 @@
-"""Tests for opt-in DFlash backbone features and baseline parity."""
+"""Tests for Muse backbone features and baseline parity."""
 
 import pytest
 import torch
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
-from speculators.models.dflash import DFlashSpeculatorConfig
-from speculators.models.dflash.core import DFlashDraftModel
-from speculators.models.dflash.model_definitions import DFlash2GroupedConv
+from speculators.models.muse import MuseSpeculatorConfig
+from speculators.models.muse.core import MuseDraftModel
+from speculators.models.muse.dynamic_conv import DFlash2GroupedConv
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
-def _make_model(*, num_draft_layers: int = 1, **feature_flags) -> DFlashDraftModel:
+def _make_model(*, num_draft_layers: int = 1, **feature_flags) -> MuseDraftModel:
     transformer_config = Qwen3Config(
         vocab_size=32,
         hidden_size=16,
@@ -23,14 +23,16 @@ def _make_model(*, num_draft_layers: int = 1, **feature_flags) -> DFlashDraftMod
         max_position_embeddings=32,
         layer_types=["full_attention"] * num_draft_layers,
     )
-    config = DFlashSpeculatorConfig(
+    config = MuseSpeculatorConfig(
         transformer_layer_config=transformer_config,
         draft_vocab_size=32,
         block_size=3,
         aux_hidden_state_layer_ids=[0, 1],
         mask_token_id=0,
+        markov_rank=0,
+        enable_confidence_head=False,
         speculators_config=SpeculatorsConfig(
-            algorithm="dflash",
+            algorithm="muse",
             proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=2)],
             default_proposal_method="greedy",
             verifier=VerifierConfig(
@@ -38,9 +40,9 @@ def _make_model(*, num_draft_layers: int = 1, **feature_flags) -> DFlashDraftMod
                 architectures=["Qwen3ForCausalLM"],
             ),
         ),
-        **feature_flags,
+        **{"sample_from_anchor": False, **feature_flags},
     )
-    return DFlashDraftModel(config).eval()
+    return MuseDraftModel(config).eval()
 
 
 def test_optional_features_default_off_preserves_original_helpers():

@@ -58,7 +58,7 @@ def run(args):
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from speculators.models.dspark.core import DSparkDraftModel
+    from speculators.model import SpeculatorModel
 
     torch.manual_seed(args.seed)
     eval_impl = load_eval_impl(torch)
@@ -71,13 +71,13 @@ def run(args):
     prompt = _format_prompt(eval_impl, tokenizer, record, args)
     input_ids = tokenizer(prompt, return_tensors="pt").input_ids.to(device)
 
-    cfg = DSparkDraftModel.config_class.from_pretrained(args.draft_model)
+    cfg = eval_impl._load_draft_config(args.draft_model)
     if args.sample_from_anchor is not None:
         cfg.sample_from_anchor = args.sample_from_anchor == "true"
     if args.draft_attn_impl != "auto":
         cfg.transformer_layer_config._attn_implementation = args.draft_attn_impl
     d2t, t2d = load_vocab_maps(torch, args)
-    draft = DSparkDraftModel.from_pretrained(
+    draft = SpeculatorModel.from_pretrained(
         args.draft_model,
         config=cfg,
         d2t=d2t,

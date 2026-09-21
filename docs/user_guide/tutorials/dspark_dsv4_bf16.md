@@ -1262,8 +1262,14 @@ full-model multi-device throughput.
 Control-logic tests that do not require torch:
 
 ```bash
-PYTHONPATH=src python -m unittest discover -s tests/standalone -v
+python -m pip install -r tests/standalone/requirements.txt
+make test-fast
 ```
+
+Run these commands from the repository root. The same target runs in the
+`Standalone tests` GitHub workflow. The repository-root `CONTRIBUTING.md` describes
+commands without Make and for Windows. NumPy, datasets and PyArrow are included to
+run the real Arrow checks without installing the training stack.
 
 These cover checkpoint/manifest/HS-slot checks, hooks and guards against a
 simulated native runtime, DSV4 block/reference launch wiring and rejection of
@@ -1279,8 +1285,8 @@ pytest tests/unit/evaluate/test_dspark_offline_eval.py \
   tests/unit/evaluate/test_dsv4_block_connector.py \
   tests/unit/evaluate/test_dsv4_teacher_parity.py
 
-pytest tests/unit/models/test_dflash_optional_features.py \
-  tests/unit/models/test_dspark_core.py \
+pytest tests/unit/models/test_muse_optional_features.py \
+  tests/unit/models/test_muse_core.py \
   tests/unit/train/test_trainer_scheduler.py
 
 pytest tests/unit/train/test_checkpoint_transactions.py \

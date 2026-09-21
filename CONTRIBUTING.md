@@ -113,6 +113,77 @@ make style
 
 For testing, we use [pytest](https://docs.pytest.org/) as our testing framework. We have different test suites for unit tests, integration tests, and end-to-end tests.
 
+### Fast Standalone Regressions
+
+From the repository root, run the lightweight suite before changing model or
+training infrastructure:
+
+```bash
+python -m pip install -r tests/standalone/requirements.txt
+make test-fast
+```
+
+This discovers every `test_*.py` in `tests/standalone` using standard-library
+`unittest`, without importing the root pytest fixtures or installing the training
+stack. NumPy, datasets and PyArrow are required so the real Arrow checks are not
+silently skipped. The Make target checks those imports before running the suite.
+Use `make test-fast PYTHON=python3` to select a different interpreter.
+
+Without Make, run the same import check and test command directly:
+
+```bash
+python -c "import datasets; import numpy; import pyarrow"
+PYTHONPATH=src python -m unittest discover -s tests/standalone -v
+```
+
+In Windows PowerShell, set `$env:PYTHONPATH = "src"` and then run
+`python -m unittest discover -s tests/standalone -v`. Git Bash is required for the
+shell wiring tests; POSIX-only process-group and permission tests skip on Windows.
+
+The `Standalone tests` GitHub workflow runs this target on Ubuntu with Python
+3.10 and 3.13 for pushes and pull requests, and supports manual runs. The suite
+uses temporary files, local fixtures and a loopback test service; it does not
+download model weights or start actual training or vLLM services. It complements,
+but does not replace, real-model, GPU/NPU and distributed integration tests.
+
+### Muse CPU Model and Training Resume
+
+With the project dependencies and pytest installed, run:
+
+```bash
+make test-muse
+```
+
+This entry point covers Muse architecture/configuration round trips, parallel
+Correction anchor/gradient contracts, rollout feedback/input contracts, CLI/default
+and checkpoint-override contracts, and a tiny real Muse model trained by the
+production Trainer with AdamW, a linear scheduler
+and the single-device checkpointer. It checks that restoring an epoch-boundary
+checkpoint preserves model/optimizer/scheduler state and training progress, and that resumed
+training agrees with an uninterrupted reference run. Parameters use BF16 so the
+production BF16 checkpoint serialization does not introduce a separate rounding
+difference. No verifier download, vLLM service or accelerator is required.
+This is a deterministic training-resume check, not a claim of exact FP32
+master-weight, mid-epoch, validation/best-checkpoint or distributed replay.
+
+The `Muse CPU tests` GitHub workflow runs this target separately from the fast
+standalone suite. Its numerical baseline is Python 3.12, CPU PyTorch 2.12.1 and
+Transformers 4.57.6; it is not a GPU/NPU or dependency-version compatibility matrix.
+To reproduce that environment on Linux, install uv and run:
+
+```bash
+uv venv .venv
+source .venv/bin/activate
+UV_TORCH_BACKEND=cpu uv pip install ./hs_connectors . "pytest~=9.1.1" "torch==2.12.1" "transformers==4.57.6"
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 make test-muse
+```
+
+The target uses `--noconftest` to avoid importing unrelated end-to-end service
+fixtures. It imports real model and training modules, rather than extracting
+their source. Normal Linux imports are required because the training stack's
+hidden-state connector imports `fcntl`; native Windows is not a supported
+environment for this target.
+
 ### Running All Tests
 
 To run all tests:

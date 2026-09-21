@@ -233,6 +233,16 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
         """
         dict_obj = {**config_dict, **kwargs}
 
+        from speculators.models.muse.compat import (  # noqa: PLC0415
+            migrate_legacy_model_config,
+        )
+
+        migrated = migrate_legacy_model_config(dict_obj)
+        if migrated is not dict_obj:
+            # A legacy concrete DSpark loader must also resolve the new config
+            # class, rather than validate Muse's discriminator as DSpark.
+            return SpeculatorModelConfig.model_validate(migrated)
+
         if "speculators_model_type" not in dict_obj:
             raise ValueError(
                 "The config dictionary must contain the 'speculators_model_type' field "
