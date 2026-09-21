@@ -9,7 +9,6 @@ Optional adaptive position weights (CAT / SSAL) replace fixed decay.
 Correction can additionally report teacher-forced and rollout acceptance metrics.
 """
 
-from functools import partial
 from typing import Any, Literal
 
 import torch
@@ -65,6 +64,8 @@ def select_logged_metrics(
         return metrics
 
     def should_keep(key: str) -> bool:
+        if key == "supervision_total":
+            return True  # Internal trainer control, removed by metric normalization.
         name = key
         if name.endswith("_sum"):
             name = name.removesuffix("_sum")
@@ -189,6 +190,9 @@ def compute_metrics(  # noqa: C901
     collaboration_gate: torch.Tensor | None = None,
     proposal_candidate_ids: torch.Tensor | None = None,
     proposal_candidate_logits: torch.Tensor | None = None,
+    *,
+    target_log_normalizer: torch.Tensor | None = None,
+    target_argmax_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -196,6 +200,19 @@ def compute_metrics(  # noqa: C901
     seq_len = logits.shape[1]
     pos_idx = (torch.arange(seq_len, device=device) % block_size).unsqueeze(0)
     start_pos = 0 if sample_from_anchor else 1
+    if (target_log_normalizer is None) != (target_argmax_ids is None):
+        raise ValueError(
+            "Full target normalizer and argmax IDs must be provided together"
+        )
+    if (
+        target_log_normalizer is not None
+        and target_argmax_ids is not None
+        and (
+            target_log_normalizer.shape != targets.shape[:-1]
+            or target_argmax_ids.shape != targets.shape[:-1]
+        )
+    ):
+        raise ValueError("Full target statistics must align with target positions")
     if (proposal_candidate_ids is None) != (proposal_candidate_logits is None):
         raise ValueError(
             "proposal_candidate_ids and proposal_candidate_logits must be set together"
@@ -210,8 +227,18 @@ def compute_metrics(  # noqa: C901
 
     # Analytical overlap (also SSAL score); needed for confidence / accept metrics.
     with torch.no_grad():
-        target_p = softmax(targets.float(), dim=-1)
-        target_ids = torch.argmax(targets, dim=-1)
+        target_p = (
+            softmax(targets.float(), dim=-1)
+            if target_log_normalizer is None
+            else torch.exp(
+                targets.float() - target_log_normalizer.float().unsqueeze(-1)
+            )
+        )
+        target_ids = (
+            torch.argmax(targets, dim=-1)
+            if target_argmax_ids is None
+            else target_argmax_ids
+        )
         if proposal_candidate_ids is not None:
             if proposal_candidate_logits is None:
                 raise RuntimeError("Proposal candidate logits are missing")
@@ -241,13 +268,24 @@ def compute_metrics(  # noqa: C901
                 collaboration_base_p, target_p
             ).sum(dim=-1)
 
+    confidence_dpace_weights = None
     if per_position_loss_weight == "dpace":
-        decay_fn = partial(
-            dpace_loss_decay,
-            loss_mask=loss_mask,
-            block_size=block_size,
-            dpace_alpha=dpace_alpha,
-        )
+        # The training CLI restricts D-PACE to a single CE loss. Reuse that
+        # loss's detached weights for confidence instead of recomputing CE over
+        # the vocabulary. Later base-diagnostic calls must not replace them.
+        def decay_fn(pos, *, elementwise_loss, **_kwargs):
+            nonlocal confidence_dpace_weights
+            weights = dpace_loss_decay(
+                pos,
+                loss_mask=loss_mask,
+                block_size=block_size,
+                dpace_alpha=dpace_alpha,
+                elementwise_loss=elementwise_loss,
+            )
+            if confidence_dpace_weights is None:
+                confidence_dpace_weights = weights
+            return weights
+
         draft_weights = None
     else:
         adaptive_scores = None
@@ -255,9 +293,9 @@ def compute_metrics(  # noqa: C901
             adaptive_scores = accept_rate
         elif adaptive_loss == "cat":
             with torch.no_grad():
-                adaptive_scores = target_p.gather(-1, target_ids.unsqueeze(-1)).squeeze(
-                    -1
-                )
+                # CAT weights the unchanged conditional KD target; unlike SSAL,
+                # it does not model the actual speculative acceptance rate.
+                adaptive_scores = softmax(targets.float(), dim=-1).amax(dim=-1)
         draft_weights = position_weights(
             pos_idx.to(logits.dtype),
             block_size=block_size,
@@ -323,6 +361,7 @@ def compute_metrics(  # noqa: C901
         accept_prefix = (accept_blocks[:, start_pos:] * draft_mask).cumprod(dim=-1)
 
     metrics: dict[str, Any] = {}
+    metrics["supervision_total"] = loss_mask.float().sum().detach()
     if base_loss is not None:
         metrics["base_loss_sum"] = base_loss.detach().clone()
         metrics["base_loss_total"] = torch.ones((), device=device)
@@ -336,6 +375,11 @@ def compute_metrics(  # noqa: C901
         conf_weights = (
             draft_weights if confidence_loss_weighting == "match-draft" else None
         )
+        if (
+            confidence_loss_weighting == "match-draft"
+            and per_position_loss_weight == "dpace"
+        ):
+            conf_weights = confidence_dpace_weights
         conf_loss = _masked_weighted_mean(bce, loss_mask, conf_weights)
         loss = loss + confidence_head_alpha * conf_loss
 

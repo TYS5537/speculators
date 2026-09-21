@@ -21,7 +21,9 @@ from speculators.models.dflash.model_definitions import (
     DFlash2GroupedConv,
     Qwen3DFlashDecoderLayer,
 )
+from speculators.models.dflash.target_distribution import project_target_distribution
 from speculators.models.dflash.utils import (
+    build_anchored_loss_mask,
     get_base_indices_for_anchored_blocks,
     select_anchors,
 )
@@ -63,6 +65,7 @@ def _reject_missing_optional_weights(
 @SpeculatorModel.register("dflash")
 class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     config_class: ClassVar[type[DFlashSpeculatorConfig]] = DFlashSpeculatorConfig  # type: ignore[misc]
+    _needs_full_verifier_distribution: ClassVar[bool] = True
     _no_split_modules = ["Qwen3DFlashDecoderLayer"]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = [  # type: ignore[misc]
         "embed_tokens.weight",
@@ -404,7 +407,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         total_seq_len = loss_mask.shape[1]
 
         anchor_positions, anchor_valid = select_anchors(
-            loss_mask, max_anchors, self.block_size
+            loss_mask, max_anchors, self.block_size, document_ids=document_ids
         )
 
         full_attn_mask = None
@@ -874,7 +877,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         """Run the anchored-block draft transformer and optionally project logits.
 
         Returns ``(hidden, logits, targets, aligned_loss_mask,
-        anchored_block_indices)``. ``logits`` is ``None`` when
+        anchored_block_indices, target_log_normalizer, target_argmax_ids)``.
+        The last two entries are only needed with a pruned vocabulary; otherwise
+        they are ``None``. ``logits`` is ``None`` when
         ``project_logits=False`` so DSpark can correct hidden states before the
         single draft-vocabulary projection.
         """
@@ -931,14 +936,36 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             anchor_positions, self.block_size
         )  # shape: [num_anchors*block_size]
 
+        target_log_normalizer = None
+        target_argmax_ids = None
         with torch.no_grad():
-            verifier_logits = self.verifier_lm_head(verifier_pre_lm_hidden)
+            if self.use_draft_vocab:
+                if self.d2t is None:
+                    raise RuntimeError(
+                        "Pruned target statistics require vocabulary mappings"
+                    )
+                draft_token_ids = self.d2t + torch.arange(
+                    self.draft_vocab_size, device=self.d2t.device
+                )
+                verifier_logits, target_log_normalizer, target_argmax_ids = (
+                    project_target_distribution(
+                        verifier_pre_lm_hidden, self.verifier_lm_head, draft_token_ids
+                    )
+                )
+            else:
+                verifier_logits = self.verifier_lm_head(verifier_pre_lm_hidden)
             if not self.config.sample_from_anchor:
                 # False: shift right by 1 so slot j predicts token at position j
                 verifier_logits = torch.roll(verifier_logits, 1, dims=1)
+                if target_log_normalizer is not None:
+                    target_log_normalizer = torch.roll(target_log_normalizer, 1, dims=1)
+                    target_argmax_ids = torch.roll(target_argmax_ids, 1, dims=1)
             # else: True, slot k predicts token at position k+1 (next), no shift
             targets = verifier_logits[:, anchored_block_indices]
             # shape: [1, num_anchors*block_size, draft_vocab_size]
+            if target_log_normalizer is not None:
+                target_log_normalizer = target_log_normalizer[:, anchored_block_indices]
+                target_argmax_ids = target_argmax_ids[:, anchored_block_indices]
 
         for layer_idx, layer in enumerate(self.layers):
             layer_kwargs = dict(
@@ -977,21 +1004,24 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         logits = self.lm_head(hidden) if project_logits else None
         # shape when projected: [1, num_anchors*block_size, vocab_size]
 
-        aligned_loss_mask = loss_mask.clone()[:, anchored_block_indices]
-        # shape: [1, num_anchors*block_size]
+        aligned_loss_mask = build_anchored_loss_mask(
+            loss_mask,
+            document_ids,
+            anchor_positions,
+            anchor_valid,
+            self.block_size,
+            sample_from_anchor=self.config.sample_from_anchor,
+        )
 
-        # zero out any padded anchor blocks
-        aligned_loss_mask = aligned_loss_mask * (
-            anchor_valid.repeat_interleave(self.block_size)
-            .unsqueeze(0)
-            .to(aligned_loss_mask.dtype)
-        )  # shape: [1, num_anchors*block_size]
-
-        # For sample_from_anchor=False, mask slot 0 (anchor) since it's not trained
-        if not self.config.sample_from_anchor:
-            aligned_loss_mask[:, :: self.block_size] = 0
-
-        return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
+        return (
+            hidden,
+            logits,
+            targets,
+            aligned_loss_mask,
+            anchored_block_indices,
+            target_log_normalizer,
+            target_argmax_ids,
+        )
 
     @conditional_torch_compile
     def forward(
@@ -1009,17 +1039,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
-        hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
-            self._backbone_forward(
-                hidden_states,
-                input_ids,
-                loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
-                max_anchors=max_anchors,
-                **kwargs,
-            )
+        (
+            hidden,
+            logits,
+            targets,
+            aligned_loss_mask,
+            anchored_block_indices,
+            _target_log_normalizer,
+            target_argmax_ids,
+        ) = self._backbone_forward(
+            hidden_states,
+            input_ids,
+            loss_mask,
+            verifier_last_hidden_states,
+            document_ids,
+            position_ids,
+            max_anchors=max_anchors,
+            **kwargs,
         )
         if logits is None:
             raise RuntimeError("DFlash forward requires projected draft logits")
@@ -1069,6 +1105,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             sample_from_anchor=self.config.sample_from_anchor,
             proposal_candidate_ids=proposal_candidate_ids,
             proposal_candidate_logits=proposal_candidate_logits,
+            target_argmax_ids=target_argmax_ids,
         )
         if selector_loss is not None:
             loss = loss + self.config.dflash2_selector_loss_weight * selector_loss

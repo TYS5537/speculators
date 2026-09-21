@@ -14,11 +14,12 @@ from datasets import load_from_disk
 from torch.utils.data import Dataset
 
 from hs_connectors import FileTransfer, HiddenStatesTransfer
-from speculators.data_generation.offline import check_hidden_states
+from speculators.data_generation.offline import align_hidden_states, check_hidden_states
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
     ClientItem,
+    InvalidResponseError,
     generate_hidden_states,
 )
 from speculators.train.noise_transforms import TransformTensors
@@ -215,6 +216,8 @@ class ArrowDataset(BaseDataset):
         request_timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
         max_retries: int = DEFAULT_MAX_RETRIES,
         pretokenized_text_only: bool = False,
+        *,
+        split: Literal["train", "validation"] | None = None,
     ):
         self.pretokenized_text_only = pretokenized_text_only
         if pretokenized_text_only and max_len < 1:
@@ -229,7 +232,20 @@ class ArrowDataset(BaseDataset):
                 "torch", columns=["input_ids", "loss_mask"], output_all_columns=False
             )
         self.start_file_idx = 0
-        if split_ratio == 1.0:
+        if split is not None:
+            if split not in ("train", "validation") or not 0.0 < split_ratio < 1.0:
+                raise ValueError(
+                    "Named splits need train/validation and ratio in (0, 1)"
+                )
+            # Both views use this same positive ratio and integer boundary.
+            # Reconstructing it as 1 + (ratio - 1) can round down by one row.
+            split_idx = int(len(self.data) * split_ratio)
+            if split == "train":
+                self.data = self.data.select(range(split_idx))
+            else:
+                self.start_file_idx = split_idx
+                self.data = self.data.select(range(split_idx, len(self.data)))
+        elif split_ratio == 1.0:
             pass
         elif 1.0 > split_ratio > 0:
             self.start_file_idx = 0
@@ -348,7 +364,11 @@ class ArrowDataset(BaseDataset):
                     loaded_hs, dataset_item["input_ids"], file_idx, allow_prefix=False
                 )
             else:
-                check_hidden_states(loaded_hs, dataset_item["input_ids"].tolist())
+                loaded_hs = align_hidden_states(
+                    loaded_hs,
+                    dataset_item["input_ids"].tolist(),
+                    allow_prefix="messages" in client_item,
+                )
 
             match self.on_generate:
                 case "cache":
@@ -356,6 +376,12 @@ class ArrowDataset(BaseDataset):
                 case "delete":
                     self.transfer.delete(handle)
         except Exception as e:
+            if "messages" in client_item and isinstance(
+                e, (ValueError, InvalidResponseError)
+            ):
+                # A retokenized MM response with the wrong prefix is not a
+                # transient unavailable sample. Never silently train/skip it.
+                raise
             if isinstance(e, ValueError) and (
                 self.pretokenized_text_only or "NaN" in str(e)
             ):
@@ -404,13 +430,18 @@ class ArrowDataset(BaseDataset):
         #   "token_ids": [seq_len]
         # }
 
-        if not torch.equal(loaded_hs["token_ids"], dataset_item["input_ids"]):
-            warnings.warn(
-                f"Loaded token ids {loaded_hs['token_ids']} for index {index} don't"
-                f"match input ids {dataset_item['input_ids']}",
-                stacklevel=1,
+        try:
+            loaded_hs = align_hidden_states(
+                loaded_hs,
+                dataset_item["input_ids"].tolist(),
+                allow_prefix=_has_multimodal_content(dataset_item.get("messages", [])),
             )
-            return None
+        except (KeyError, ValueError) as exc:
+            raise ValueError(
+                f"Invalid hidden states for row {file_idx}: {exc}. "
+                "Regenerate with data_generation_offline.py --validate-outputs "
+                "to preserve invalid caches separately and retry them."
+            ) from exc
 
         return {
             "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(

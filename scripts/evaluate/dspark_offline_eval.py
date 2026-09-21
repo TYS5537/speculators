@@ -277,6 +277,14 @@ def gather_token_probs(probs, token_ids):
     return torch.gather(probs, dim=-1, index=token_ids.unsqueeze(-1)).squeeze(-1)
 
 
+def _rejection_acceptance_probs(target_probs, draft_probs):
+    if not torch.all(torch.isfinite(draft_probs) & (draft_probs > 0)):
+        raise ValueError("Proposed tokens must have finite, positive draft probability")
+    # Keep the actual q, including probabilities below 1e-8: flooring it
+    # changes acceptance without changing the rejection residual p - q.
+    return torch.clamp(target_probs / draft_probs, max=1.0)
+
+
 def sample_residual(target_probs, draft_probs):
     residual = (target_probs - draft_probs).clamp_min(0)
     denom = residual.sum(dim=-1, keepdim=True)
@@ -464,6 +472,17 @@ def _prompt_from_record(
             **_chat_template_kwargs(args),
         )
 
+    turns = _string_turns(record.get("prompt"))
+    if turns is not None:
+        return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
+
+    instruction = _string_turns(record.get("instruction"))
+    if instruction is not None:
+        # Alpaca-style records split the request across these two fields.
+        # Format once after combining them; `output` is the reference answer.
+        turns = instruction + (_string_turns(record.get("input")) or [])
+        return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
+
     for field in PROMPT_FIELDS:
         turns = _string_turns(record.get(field))
         if turns is not None:
@@ -483,11 +502,44 @@ def _discover_datasets(root: Path, names: list[str] | None) -> list[Path]:
         paths = [
             path
             for path in paths
-            if path.stem in wanted or path.name in wanted or str(path) in wanted
+            if (
+                path.stem in wanted
+                or path.name in wanted
+                or str(path) in wanted
+                or _dataset_id(path, root) in wanted
+            )
         ]
     if not paths:
         raise FileNotFoundError(f"No JSONL datasets found under {root}")
     return paths
+
+
+def _dataset_id(path: Path, root: Path) -> str:
+    """Keep dataset identities unique within a recursively discovered root."""
+    # Preserve logical input names, including symlink aliases: workers receive
+    # the same logical single-file path and name their artifacts from its stem.
+    root = Path(os.path.abspath(root))
+    path = Path(os.path.abspath(path))
+    if root.is_file():
+        if path != root:
+            raise ValueError(f"Dataset {path} does not match the input file {root}")
+        return path.stem
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise ValueError(f"Dataset {path} is outside the input root {root}") from exc
+    return relative.with_suffix("").as_posix()
+
+
+def _dataset_output_path(directory: Path, dataset: str, suffix: str = "") -> Path:
+    """Map a root-relative identity to an output without escaping its directory."""
+    parts = dataset.split("/")
+    if any(part in {"", ".", ".."} or "\\" in part or ":" in part for part in parts):
+        raise ValueError(f"Invalid root-relative dataset identity: {dataset!r}")
+    path = directory.joinpath(*parts[:-1], parts[-1] + suffix)
+    if not path.resolve().is_relative_to(directory.resolve()):
+        raise ValueError(f"Dataset output escapes its directory: {dataset!r}")
+    return path
 
 
 def _split_csv(value: str | None) -> list[str]:
@@ -688,10 +740,10 @@ def verify_draft_tokens(
         selected_draft_probs = gather_token_probs(
             proposal.draft_probs,
             proposed_tokens,
-        ).clamp_min(1e-8)
-        accept_probs = torch.clamp(
-            selected_target_probs / selected_draft_probs,
-            max=1.0,
+        )
+        accept_probs = _rejection_acceptance_probs(
+            selected_target_probs,
+            selected_draft_probs,
         )
         support_accept_rates = torch.minimum(
             proposal.draft_probs[:, :draft_token_count, :],
@@ -775,7 +827,18 @@ def generate_decoding_sample(
         raise ValueError("max_proposal_tokens must be >= 1")
     device = input_ids.device
     num_input_tokens = input_ids.shape[1]
-    max_length = num_input_tokens + int(max_new_tokens)
+    max_new_tokens = int(max_new_tokens)
+    if max_new_tokens <= 0:
+        return SimpleNamespace(
+            output_ids=input_ids.clone(),
+            num_input_tokens=num_input_tokens,
+            num_output_tokens=0,
+            proposal_lengths=[],
+            accepted_draft_lengths=[],
+            accept_prob_lists=[],
+            support_accept_rate_lists=[],
+        )
+    max_length = num_input_tokens + max_new_tokens
     output_ids = torch.empty(
         (1, max_length + max_proposal_tokens + 1),
         dtype=torch.long,
@@ -802,7 +865,7 @@ def generate_decoding_sample(
     support_accept_rate_lists: list[list[float]] = []
 
     initial_token = output_ids[:, num_input_tokens : num_input_tokens + 1]
-    if has_stop_token(initial_token, stop_token_ids):
+    if max_new_tokens == 1 or has_stop_token(initial_token, stop_token_ids):
         output_ids = trim_output_ids(
             output_ids[:, : num_input_tokens + 1],
             num_input_tokens,
@@ -821,14 +884,44 @@ def generate_decoding_sample(
     context = init_context(initial_output=output, initial_token=initial_token)
     del output
 
-    while start < max_length:
-        proposal = propose(
-            context=context,
-            output_ids=output_ids,
-            position_ids=position_ids,
-            start=start,
-            stop_token_ids=stop_token_ids,
-        )
+    # The token at start has already been generated. Reserve one remaining slot
+    # for the target's replacement/bonus token before verifying any draft tokens.
+    while start + 1 < max_length:
+        remaining = max_length - start - 1
+        if remaining == 1:
+            # No draft token can fit alongside the target token in this round.
+            proposal = DraftProposal(
+                draft_token_count=0,
+                verify_input_ids=output_ids[:, start : start + 1],
+                draft_probs=None,
+            )
+        else:
+            proposal = propose(
+                context=context,
+                output_ids=output_ids,
+                position_ids=position_ids,
+                start=start,
+                stop_token_ids=stop_token_ids,
+            )
+            if proposal.draft_token_count > max_proposal_tokens:
+                raise ValueError(
+                    "DraftProposal.draft_token_count exceeds max_proposal_tokens"
+                )
+            if proposal.draft_token_count >= remaining:
+                # The drafter may require a full block internally. Only its
+                # in-budget prefix is sent to the verifier and counted in stats.
+                draft_token_count = remaining - 1
+                proposal = DraftProposal(
+                    draft_token_count=draft_token_count,
+                    verify_input_ids=proposal.verify_input_ids[
+                        :, : draft_token_count + 1
+                    ],
+                    draft_probs=(
+                        None
+                        if proposal.draft_probs is None
+                        else proposal.draft_probs[:, :draft_token_count, :]
+                    ),
+                )
         verification = verify_draft_tokens(
             target_model=target_model,
             proposal=proposal,
@@ -866,11 +959,11 @@ def generate_decoding_sample(
         new_token_ids = output_ids[:, start + 1 : start + accepted + 2]
         start += accepted + 1
         past_key_values_target.crop(start)
-        update(context, verification)
-        if has_stop_token(new_token_ids, stop_token_ids):
+        if start + 1 >= max_length or has_stop_token(new_token_ids, stop_token_ids):
             break
+        update(context, verification)
 
-    output_ids = output_ids[:, : min(start + 1, max_length)]
+    output_ids = output_ids[:, : start + 1]
     output_ids = trim_output_ids(output_ids, num_input_tokens, stop_token_ids)
     return SimpleNamespace(
         output_ids=output_ids,
@@ -978,6 +1071,7 @@ class DSparkOfflineRunner:
                 dtype=draft_model.d2t.dtype,
             )
             self._draft_target_logit_indices = (draft_ids + draft_model.d2t).long()
+
     def _extract_context_feature(self, hidden_states):
         return torch.cat(
             [hidden_states[i] for i in self.draft_model.target_layer_ids],
@@ -1225,15 +1319,30 @@ class DSparkOfflineRunner:
         proposed_target_ids: list[int] = []
         draft_probs = []
         prev_token = first_prev_token_id.reshape(1, 1).long()
+        # RNN training also processes the reserved anchor slot when sampling
+        # starts at slot 1. Replaying that prefix warms its recurrent state.
+        markov_previous_ids = prev_token.expand(-1, self.first_draft_slot)
 
         for token_idx in range(self.max_proposal_tokens):
             slot = self.first_draft_slot + token_idx
             logits = base_logits[:, slot : slot + 1, :]
             if draft.markov_head is not None:
-                logits = logits + draft.markov_head.block_bias(
-                    prev_token_ids=prev_token,
-                    hidden_states=hidden_states[:, slot : slot + 1, :],
-                )
+                if getattr(draft.markov_head, "head_type", None) == "rnn":
+                    markov_previous_ids = torch.cat(
+                        [markov_previous_ids, prev_token], dim=1
+                    )
+                    # Blocks are short: recompute the known prefix to retain RNN
+                    # state without changing the training head or its weights.
+                    markov_bias = draft.markov_head.block_bias(
+                        prev_token_ids=markov_previous_ids,
+                        hidden_states=hidden_states[:, : slot + 1, :],
+                    )[:, -1:, :]
+                else:
+                    markov_bias = draft.markov_head.block_bias(
+                        prev_token_ids=prev_token,
+                        hidden_states=hidden_states[:, slot : slot + 1, :],
+                    )
+                logits = logits + markov_bias
             if draft.candidate_selector is not None:
                 candidate_ids, candidate_logits = draft.dflash2_select_candidates(
                     logits,
@@ -1342,7 +1451,7 @@ class DSparkOfflineRunner:
             self.device
         )
         validate_budget = getattr(self.target_model, "validate_request_budget", None)
-        if validate_budget is not None:
+        if validate_budget is not None and int(self.args.max_new_tokens) > 0:
             validate_budget(
                 input_ids.shape[1],
                 int(self.args.max_new_tokens),
@@ -1514,6 +1623,7 @@ def _evaluate_dataset(
     args: argparse.Namespace,
     stop_token_ids: list[int] | None,
 ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+    dataset = _dataset_id(path, args.datasets_root)
     records = _load_jsonl(path)
     total_records = len(records)
     records = _select_eval_records(
@@ -1525,7 +1635,7 @@ def _evaluate_dataset(
     if len(records) != total_records:
         logger.info(
             "[%s] selected %d/%d samples with seed=%d",
-            path.stem,
+            dataset,
             len(records),
             total_records,
             int(args.seed),
@@ -1549,7 +1659,7 @@ def _evaluate_dataset(
         if warmup_records:
             logger.info(
                 "[%s] warming up DSpark and base model with %d sample(s)",
-                path.stem,
+                dataset,
                 len(warmup_records),
             )
         for idx, record in warmup_records:
@@ -1570,7 +1680,7 @@ def _evaluate_dataset(
         iterator = tqdm(
             iterator,
             total=len(indexed_records),
-            desc=path.stem,
+            desc=dataset,
             unit="sample",
         )
 
@@ -1621,7 +1731,7 @@ def _evaluate_dataset(
             if base_runner is None:
                 logger.info(
                     "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | acc_len=%.3f",
-                    path.stem,
+                    dataset,
                     processed,
                     len(indexed_records),
                     stats.total_output_tokens,
@@ -1636,7 +1746,7 @@ def _evaluate_dataset(
                 logger.info(
                     "[%s] %d/%d samples | DSpark=%.2f tok/s | "
                     "base=%.2f tok/s | speedup=%.3fx | acc_len=%.3f",
-                    path.stem,
+                    dataset,
                     processed,
                     len(indexed_records),
                     out_tps,
@@ -1647,7 +1757,7 @@ def _evaluate_dataset(
 
     if base_runner is None:
         stats.elapsed_s = time.perf_counter() - start_time
-    row = _summary_row(path.stem, len(indexed_records), stats)
+    row = _summary_row(dataset, len(indexed_records), stats)
     if base_runner is not None:
         base_tps = base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
         row.update(
@@ -1680,7 +1790,9 @@ def _write_outputs(
     artifacts_dir = output_dir / "artifacts"
     artifacts_dir.mkdir(exist_ok=True)
     for dataset, artifacts in artifacts_by_dataset.items():
-        with (artifacts_dir / f"{dataset}.jsonl").open("w", encoding="utf-8") as f:
+        artifact_path = _dataset_output_path(artifacts_dir, dataset, ".jsonl")
+        artifact_path.parent.mkdir(parents=True, exist_ok=True)
+        with artifact_path.open("w", encoding="utf-8") as f:
             for artifact in artifacts:
                 f.write(json.dumps(artifact) + "\n")
 
@@ -1694,7 +1806,7 @@ def _read_worker_row(output_dir: Path) -> dict[str, Any]:
 
 
 def _read_worker_artifacts(output_dir: Path, dataset: str) -> list[dict[str, Any]]:
-    path = output_dir / "artifacts" / f"{dataset}.jsonl"
+    path = _dataset_output_path(output_dir / "artifacts", dataset, ".jsonl")
     if not path.exists():
         return []
     return _load_jsonl(path)
@@ -1803,7 +1915,8 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
     artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
     for dataset_path in dataset_paths:
         dataset_start = time.perf_counter()
-        shard_root = args.output_dir / "_shards" / dataset_path.stem
+        dataset = _dataset_id(dataset_path, args.datasets_root)
+        shard_root = _dataset_output_path(args.output_dir / "_shards", dataset)
         processes = []
         for shard_index, visible_device in enumerate(devices):
             shard_output_dir = shard_root / f"shard_{shard_index}"
@@ -1825,11 +1938,11 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
             if returncode != 0:
                 failed.append((shard_index, returncode))
         if failed:
-            raise RuntimeError(f"{dataset_path.stem} worker failures: {failed}")
+            raise RuntimeError(f"{dataset} worker failures: {failed}")
         shard_rows = [
             _read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
         ]
-        row = _aggregate_rows(dataset_path.stem, shard_rows)
+        row = _aggregate_rows(dataset, shard_rows)
         if not args.measure_base_speedup:
             row["elapsed_s"] = time.perf_counter() - dataset_start
             row["requests_per_second"] = (
@@ -1843,10 +1956,12 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
             artifacts = []
             for _, shard_output_dir, _ in processes:
                 artifacts.extend(
+                    # Each worker receives a single-file root, so its local
+                    # artifact keeps the flat stem; the parent restores the ID.
                     _read_worker_artifacts(shard_output_dir, dataset_path.stem)
                 )
             artifacts.sort(key=lambda item: int(item.get("source_index", 0)))
-            artifacts_by_dataset[dataset_path.stem] = artifacts
+            artifacts_by_dataset[dataset] = artifacts
         _write_outputs(args.output_dir, rows, artifacts_by_dataset)
 
 
@@ -1999,16 +2114,20 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
         d2t_path=args.d2t_path,
         t2d_path=args.t2d_path,
     )
+    # Use the loaded target's dtype, including the dtype resolved by HF's "auto".
+    # Older supported Transformers versions otherwise load the draft in FP32.
+    draft_dtype = (
+        torch.bfloat16 if target_backend == "dsv4-vllm" else target_model.dtype
+    )
     draft_model = DSparkDraftModel.from_pretrained(
         args.draft_model,
         config=draft_config,
         d2t=d2t,
         t2d=t2d,
+        torch_dtype=draft_dtype,
     )
-    if target_backend == "dsv4-vllm":
-        draft_model = draft_model.to(device=device, dtype=torch.bfloat16).eval()
-    else:
-        draft_model = draft_model.to(device).eval()
+    # from_pretrained also refreshes borrowed verifier weights before returning.
+    draft_model = draft_model.to(device=device, dtype=draft_dtype).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
     if target_backend == "dsv4-vllm":
         from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
@@ -2117,7 +2236,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
         )
         rows.append(row)
         if not args.skip_artifacts:
-            artifacts_by_dataset[path.stem] = artifacts
+            artifacts_by_dataset[row["dataset"]] = artifacts
     _write_outputs(args.output_dir, rows, artifacts_by_dataset)
     logger.info("Wrote results to %s", args.output_dir)
 

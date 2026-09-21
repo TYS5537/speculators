@@ -368,6 +368,7 @@ def test_decoding_loop_keeps_anchor_out_of_context_until_verification(
 ):
     evaluator = _load_evaluator()
     target = target_fixture.target
+    target.max_model_len = 5  # Prompt + output fits without a full extra draft block.
     cache = target.new_cache()
     monkeypatch.setattr(target, "new_cache", lambda: cache)
     contexts = []
@@ -392,14 +393,7 @@ def test_decoding_loop_keeps_anchor_out_of_context_until_verification(
         )
 
     def update(context, verification):
-        assert verification.accepted_draft_tokens == 2
-        assert verification.next_token.item() == 4
-        assert verification.committed_tokens.tolist() == [[4, 4, 4]]
-        context.hidden = torch.cat(
-            [context.hidden, verification.target_output.hidden_states[1][:, :3]],
-            dim=1,
-        )
-        assert context.hidden.shape[1] == cache.get_seq_length() == 5
+        pytest.fail("The final verification must not prepare another draft round")
 
     result = evaluator.generate_decoding_sample(
         target_model=target,
@@ -415,11 +409,16 @@ def test_decoding_loop_keeps_anchor_out_of_context_until_verification(
 
     assert result.output_ids.tolist() == [[2, 0, 4, 4, 4]]
     assert result.num_output_tokens == 3
-    assert result.proposal_lengths == [2]
-    assert result.accepted_draft_lengths == [2]
-    assert result.accept_prob_lists == [[1.0, 1.0]]
-    assert cache.tokens == [2, 0, 4, 4, 4]
-    assert contexts[0].hidden.shape == (1, 5, 4)
+    assert result.proposal_lengths == [1]
+    assert result.accepted_draft_lengths == [1]
+    assert result.accept_prob_lists == [[1.0]]
+    assert target_fixture.requests == [
+        ([2, 0], True),
+        ([2, 0, 4], False),
+        ([2, 0, 4, 4], True),
+    ]
+    assert cache.tokens == [2, 0, 4, 4]
+    assert contexts[0].hidden.shape == (1, 2, 4)
 
 
 def test_request_failure_does_not_commit_candidate_tokens(target_fixture, monkeypatch):
@@ -436,13 +435,27 @@ def test_request_failure_does_not_commit_candidate_tokens(target_fixture, monkey
     assert cache.tokens == [2, 0]
 
 
-def test_context_budget_reserves_speculative_suffix_and_server_decode_token(
-    target_fixture,
+@pytest.mark.parametrize("max_proposal_tokens", [0, 3, 128])
+@pytest.mark.parametrize(("prompt_length", "max_new_tokens"), [(60, 4), (63, 1)])
+def test_context_budget_allows_exact_output_limit(
+    target_fixture, prompt_length, max_new_tokens, max_proposal_tokens
 ):
     target = target_fixture.target
-    target.validate_request_budget(4, 8, 3)
-    with pytest.raises(ValueError):
-        target.validate_request_budget(60, 4, 3)
+    target.validate_request_budget(prompt_length, max_new_tokens, max_proposal_tokens)
+
+
+def test_context_budget_rejects_one_token_over_output_limit(target_fixture):
+    target = target_fixture.target
+    with pytest.raises(ValueError, match="65 target positions"):
+        target.validate_request_budget(61, 4, 3)
+
+
+@pytest.mark.parametrize("max_new_tokens", [0, -1])
+def test_context_budget_rejects_nonpositive_generation_length(
+    target_fixture, max_new_tokens
+):
+    with pytest.raises(ValueError, match="max_new_tokens must be > 0"):
+        target_fixture.target.validate_request_budget(4, max_new_tokens, 3)
 
 
 @pytest.fixture
@@ -1037,6 +1050,47 @@ def test_block_initial_eos_ends_before_any_proposal(block_fixture, monkeypatch):
     assert result.proposal_lengths == result.accepted_draft_lengths == []
     assert result.accept_prob_lists == result.support_accept_rate_lists == []
     assert case.target.num_target_requests == 1
+
+
+def test_block_last_token_uses_target_only_at_exact_context_limit(
+    block_fixture, monkeypatch
+):
+    case = block_fixture
+    evaluator = _load_evaluator()
+    case.target.max_model_len = 4
+    cache = case.target.new_cache()
+    monkeypatch.setattr(case.target, "new_cache", lambda: cache)
+    packet_shapes = []
+    case.packet_hook = lambda packet: packet_shapes.append(packet["logprobs"].shape)
+
+    def unexpected(*args, **kwargs):
+        pytest.fail("A target-only final token must not propose or update a draft")
+
+    result = evaluator.generate_decoding_sample(
+        target_model=case.target,
+        input_ids=torch.tensor([[2, 0]]),
+        max_new_tokens=2,
+        max_proposal_tokens=2,
+        temperature=0.0,
+        stop_token_ids=None,
+        init_context=lambda **kwargs: None,
+        propose=unexpected,
+        update=unexpected,
+    )
+
+    assert result.output_ids.tolist() == [[2, 0, 4, 4]]
+    assert result.num_output_tokens == 2
+    assert result.proposal_lengths == result.accepted_draft_lengths == [0]
+    assert result.accept_prob_lists == result.support_accept_rate_lists == [[]]
+    assert cache.tokens == [2, 0, 4]
+    assert len(case.calls) == case.target.num_target_requests == 2
+    assert [call["prompt"] for call in case.calls] == [[2, 0], [2, 0, 4]]
+    assert case.calls[-1]["extra_body"]["kv_transfer_params"]["dsv4_block_verify"] == {
+        "version": 1,
+        "logits_start": 2,
+        "hidden_start": 2,
+    }
+    assert packet_shapes == [(1, 5), (1, 5)]
 
 
 def test_block_corrupt_packet_does_not_commit_existing_prefix(block_fixture):

@@ -1,22 +1,92 @@
 import logging
 from pathlib import Path
+from uuid import uuid4
 
 logger = logging.getLogger(__name__)
 
 
 def check_hidden_states(data: dict, tokens: list[int]):
+    if not {"token_ids", "hidden_states"}.issubset(data):
+        raise ValueError(
+            "Hidden-state payload must contain token_ids and hidden_states"
+        )
+    if data["token_ids"].ndim != 1:
+        raise ValueError("Hidden-state token IDs must be one-dimensional")
     t_ids = data["token_ids"].tolist()
     if t_ids != tokens:
         raise ValueError(f"Token ids don't match expected token ids {tokens}")
 
     hs = data["hidden_states"]
-    if hs.isnan().any():
-        raise ValueError("Hidden states contain NaN values")
+    expected_ndim = 3  # [tokens, auxiliary slots + teacher, hidden width]
+    # MTP may export only the teacher slot; auxiliary slots are model-dependent.
+    if hs.ndim != expected_ndim or hs.shape[1] < 1 or hs.shape[2] < 1:
+        raise ValueError(
+            "Hidden states must have shape [tokens, auxiliary+teacher, width]"
+        )
+    if not hs.is_floating_point() or not hs.isfinite().all():
+        raise ValueError("Hidden states must be floating-point with no NaN/Inf values")
     if len(tokens) != hs.shape[0]:
         raise ValueError(
             f"Sequence length of hidden states {hs.shape[0]}"
             f" doesn't match num tokens {len(tokens)}"
         )
+
+
+def align_hidden_states(data: dict, tokens: list[int], *, allow_prefix: bool = False):
+    """Select an exact causal prefix from an otherwise complete HS response.
+
+    Multimodal requests must retain the complete messages/images at the server.
+    Only their returned states may be shortened, after validating token identity
+    and the full response shape. Text requests keep exact-length validation.
+    """
+    if not allow_prefix:
+        check_hidden_states(data, tokens)
+        return data
+    if "token_ids" not in data or data["token_ids"].ndim != 1:
+        raise ValueError("Hidden-state token IDs must be one-dimensional")
+    actual = data["token_ids"].tolist()
+    if len(actual) < len(tokens) or actual[: len(tokens)] != tokens:
+        raise ValueError("Hidden-state token IDs do not match the training prefix")
+    check_hidden_states(data, actual)
+    return data | {
+        "token_ids": data["token_ids"][: len(tokens)],
+        "hidden_states": data["hidden_states"][: len(tokens)],
+    }
+
+
+def validate_existing_hidden_states(output_path: Path, dataset, indices: list[int]):
+    """Keep valid caches; preserve invalid files under unique quarantine names.
+
+    The caller supplies only this rank's requested rows, so other ranks and files
+    beyond max_samples are never renamed. Quarantined files are ignored by cache
+    discovery and can be inspected or recovered by the user.
+    """
+    from safetensors import SafetensorError  # noqa: PLC0415
+    from safetensors.torch import load_file  # noqa: PLC0415
+
+    valid = []
+    for index in indices:
+        path = output_path / f"hs_{index}.safetensors"
+        item = dataset[index]
+        tokens = item["input_ids"].tolist()
+        allow_prefix = any(
+            isinstance(message.get("content"), list)
+            for message in item.get("messages", [])
+        )
+        try:
+            align_hidden_states(load_file(path), tokens, allow_prefix=allow_prefix)
+        except (KeyError, ValueError, RuntimeError, SafetensorError) as exc:
+            quarantined = path.with_name(f"{path.name}.invalid-{uuid4().hex}")
+            path.rename(quarantined)
+            logger.warning(
+                "Invalid HS cache for row %d preserved at %s; regenerating: %s",
+                index,
+                quarantined,
+                exc,
+            )
+        else:
+            valid.append(index)
+    return valid
 
 
 def get_existing_hidden_state_indices(output_path: Path) -> list[int]:

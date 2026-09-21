@@ -35,6 +35,12 @@ class Tensor(np.ndarray):
     def isnan(self):
         return np.isnan(self)
 
+    def isfinite(self):
+        return np.isfinite(self)
+
+    def is_floating_point(self):
+        return np.issubdtype(self.dtype, np.floating)
+
     def numel(self):
         return self.size
 
@@ -125,12 +131,13 @@ class ArrowHSPrefixTests(unittest.TestCase):
             "DEFAULT_REQUEST_TIMEOUT": 120,
             "DEFAULT_MAX_RETRIES": 2,
             "generate_hidden_states": self.generator,
+            "InvalidResponseError": type("InvalidResponseError", (Exception,), {}),
             "warnings": warnings,
             "cast": cast,
         }
         load_definitions(
             ROOT / "src/speculators/data_generation/offline.py",
-            {"check_hidden_states"},
+            {"check_hidden_states", "align_hidden_states"},
             self.namespace,
         )
         load_definitions(
@@ -161,7 +168,9 @@ class ArrowHSPrefixTests(unittest.TestCase):
         count = len(tokens)
         return {
             "token_ids": Tensor(tokens),
-            "hidden_states": Tensor(np.arange(count * 12).reshape(count, 3, 4)),
+            "hidden_states": Tensor(
+                np.arange(count * 12, dtype=np.float32).reshape(count, 3, 4)
+            ),
         }
 
     def generate(self, client, model, payload, **kwargs):
@@ -265,16 +274,12 @@ class ArrowHSPrefixTests(unittest.TestCase):
         )
         self.assertEqual(len(dataset._get_dataset_item(0)["input_ids"]), 5188)
 
-    def test_default_cached_token_mismatch_still_warns_and_skips(self):
+    def test_default_cached_token_mismatch_fails_closed(self):
         packet = self.packet(self.rows[0]["input_ids"])
         packet["token_ids"][0] = 9999
         self.transfer.get_cached.return_value = packet
-        with warnings.catch_warnings(record=True) as caught:
-            warnings.simplefilter("always")
-            result = self.construct(external=False)._get_raw_data(0)
-        self.assertIsNone(result)
-        self.assertEqual(len(caught), 1)
-        self.assertIn("match input ids", str(caught[0].message))
+        with self.assertRaisesRegex(ValueError, "Invalid hidden states for row 0"):
+            self.construct(external=False)._get_raw_data(0)
         self.generator.assert_not_called()
 
     def test_on_missing_skip_never_generates_hidden_states(self):

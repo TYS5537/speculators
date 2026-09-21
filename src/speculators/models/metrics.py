@@ -4,6 +4,7 @@ from collections.abc import Callable
 from functools import cache
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 _EPS = 1e-5
 
@@ -226,6 +227,10 @@ def neg_log_acceptance_loss(
     acceptance-optimal target a usable gradient from a cold start. When the target
     is a point mass, this loss reduces to cross-entropy.
 
+    Compute the overlap in log space: a probability floor would make the loss
+    constant, with zero gradients, for low but representable acceptance rates.
+    ``minimum`` splits its derivative equally at ties, just as the eager TV loss.
+
     Args:
         logits: Draft model logits (softmax applied internally to form q).
         targets: Target model logits (softmax applied internally to form p).
@@ -233,10 +238,16 @@ def neg_log_acceptance_loss(
     Returns:
         Per-position negative log-acceptance with shape [1, seq_len].
     """
-    draft_p = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
-    target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
-    overlap = torch.minimum(draft_p, target_p).sum(dim=-1)  # alpha, shape: [1, seq_len]
-    elementwise_loss = -torch.log(overlap.clamp_min(_EPS))
+    draft_logp = torch.nn.functional.log_softmax(logits, dim=-1, dtype=torch.float32)
+    target_logp = torch.nn.functional.log_softmax(targets, dim=-1, dtype=torch.float32)
+    log_overlap_terms = torch.minimum(draft_logp, target_logp)
+    # Center explicitly so logsumexp backward does not subtract two large
+    # negative numbers (and lose gradient precision) for extremely low overlap.
+    offset = log_overlap_terms.amax(dim=-1, keepdim=True).detach()
+    elementwise_loss = -(
+        offset.squeeze(-1)
+        + torch.logsumexp(log_overlap_terms - offset, dim=-1)
+    )
 
     return elementwise_loss  # noqa: RET504
 
@@ -423,11 +434,10 @@ def dpace_loss_decay(
     return weight.reshape(1, -1)
 
 
-# ``tv`` and ``nla`` run the fused Triton kernels on CUDA/ROCm (much lower peak
-# memory at long context; see models/fused_tv_loss.py) and fall back to the eager
-# losses above on every other backend -- CPU, or non-CUDA accelerators such as
-# Ascend NPU where mainline Triton has no backend. ``logits.is_cuda`` gates
-# CUDA/ROCm; the import is lazy so this module imports without Triton installed.
+# ``tv`` uses Triton on CUDA/ROCm and eager operations on CPU/NPU. NLA instead
+# uses stable log-space operations; CUDA/ROCm chunks and recomputes intermediate
+# activations to bound memory without the unstable subtraction ``1 - TV``.
+# Triton imports remain lazy, so this module also works without Triton installed.
 
 
 @cache
@@ -449,12 +459,57 @@ def tv_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
     return tv_loss(logits, targets)
 
 
+def chunked_neg_log_acceptance_loss(
+    logits: torch.Tensor,
+    targets: torch.Tensor,
+    *,
+    token_chunk_size: int = 128,
+) -> torch.Tensor:
+    """Stable NLA with token-bounded intermediates and backward recomputation.
+
+    This is a PyTorch fallback, not a fused Triton kernel. Non-reentrant
+    checkpointing retains input references instead of all FP32 log-probability
+    activations. The intermediates occupy O(token_chunk_size * vocab) space;
+    existing input/output tensors still remain resident. It costs extra dispatch
+    and recomputation compared with fused TV, whose path is unchanged.
+    """
+    if token_chunk_size <= 0:
+        raise ValueError("token_chunk_size must be positive")
+    if logits.shape != targets.shape:
+        raise ValueError("Draft and target logits must have the same shape")
+    flat_logits = logits.reshape(-1, logits.shape[-1])
+    flat_targets = targets.reshape_as(flat_logits)
+    if flat_logits.shape[0] == 0:
+        return neg_log_acceptance_loss(logits, targets)
+    recompute = torch.is_grad_enabled() and (
+        logits.requires_grad or targets.requires_grad
+    )
+    chunks = []
+    for start in range(0, flat_logits.shape[0], token_chunk_size):
+        draft_chunk = flat_logits[start : start + token_chunk_size]
+        target_chunk = flat_targets[start : start + token_chunk_size]
+        if recompute:
+            loss_chunk = checkpoint(
+                neg_log_acceptance_loss,
+                draft_chunk,
+                target_chunk,
+                use_reentrant=False,
+                preserve_rng_state=False,
+            )
+        else:
+            loss_chunk = neg_log_acceptance_loss(draft_chunk, target_chunk)
+        chunks.append(loss_chunk)
+    return torch.cat(chunks).reshape(logits.shape[:-1])
+
+
 def nla_loss_fused_or_eager(logits: torch.Tensor, targets: torch.Tensor):
-    """NLA loss: fused Triton on CUDA/ROCm (fp32), eager on CPU/NPU."""
+    """NLA: chunked/recomputed PyTorch on CUDA/ROCm, eager log-space on CPU/NPU.
+
+    The historical dispatcher name is retained for loss-config compatibility.
+    CUDA NLA no longer uses a Triton kernel; see the chunked helper's cost note.
+    """
     if logits.is_cuda:
-        kernel = _fused_kernel("fused_nla_loss")
-        if kernel is not None:
-            return kernel(logits, targets)
+        return chunked_neg_log_acceptance_loss(logits, targets)
     return neg_log_acceptance_loss(logits, targets)
 
 

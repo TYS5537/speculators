@@ -1162,25 +1162,31 @@ class DSparkDraftModel(DFlashDraftModel):
             if self.correction_head is not None
             else None
         )
-        hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
-            self._backbone_forward(
-                hidden_states,
-                input_ids,
-                loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
-                max_anchors=max_anchors,
-                project_logits=(
-                    self.correction_head is None
-                    or self.candidate_selector is not None
-                    or (
-                        correction_output_mode == "logits"
-                        and not self.config.correction_project_corrected_hidden
-                    )
-                ),
-                **kwargs,
-            )
+        (
+            hidden,
+            logits,
+            targets,
+            aligned_loss_mask,
+            anchored_block_indices,
+            target_log_normalizer,
+            target_argmax_ids,
+        ) = self._backbone_forward(
+            hidden_states,
+            input_ids,
+            loss_mask,
+            verifier_last_hidden_states,
+            document_ids,
+            position_ids,
+            max_anchors=max_anchors,
+            project_logits=(
+                self.correction_head is None
+                or self.candidate_selector is not None
+                or (
+                    correction_output_mode == "logits"
+                    and not self.config.correction_project_corrected_hidden
+                )
+            ),
+            **kwargs,
         )
 
         # DSpark: add the active sequential correction and predict confidence.
@@ -1648,6 +1654,8 @@ class DSparkDraftModel(DFlashDraftModel):
             sample_from_anchor=self.config.sample_from_anchor,
             proposal_candidate_ids=proposal_candidate_ids,
             proposal_candidate_logits=proposal_candidate_logits,
+            target_log_normalizer=target_log_normalizer,
+            target_argmax_ids=target_argmax_ids,
         )
         if selector_loss is not None:
             loss = loss + self.config.dflash2_selector_loss_weight * selector_loss

@@ -1118,9 +1118,12 @@ match; there is no automatic fallback.
 The example defaults to greedy decoding (`TEMPERATURE=0.0`). Set
 `TEMPERATURE=1.0` explicitly to test stochastic sampling.
 `DSV4_MAX_MODEL_LEN=4096` must match the service's actual `--max-model-len`.
-The evaluation input and generation budget must also leave room for verification
-candidates and the one output token used for HS export; do not rely on server-side
-truncation. `TARGET_REQUEST_TIMEOUT` defaults to 120 seconds. Set
+The tokenized prompt length plus `MAX_NEW_TOKENS` must not exceed this limit.
+The evaluator shortens the final speculative proposal to reserve one bonus token;
+the longest target request uses at most this total minus one input token, plus the
+one API output token used for HS export. No extra full draft block needs to be
+reserved, and server-side truncation must remain disabled.
+`TARGET_REQUEST_TIMEOUT` defaults to 120 seconds. Set
 `SERVED_MODEL_NAME` only when the service uses a custom alias. This example uses
 one dedicated evaluation device; the target service's TP devices are not used for
 draft data parallelism.
@@ -1151,6 +1154,109 @@ first run, check full-vocabulary probabilities, input-token alignment, HS slots
 and dtype, and outputs at EOS and generation limits. Successful DSV4 offline
 evaluation on real A3 hardware has not yet been demonstrated.
 
+## Checkpoint and pruned-vocabulary training safeguards
+
+Optimizer checkpoints keep step counters at least FP32 even when model weights
+and moments are saved in BF16. Loading an older low-precision counter promotes it
+to FP32 but cannot recover steps already lost through rounding. A checkpoint's
+initialized `t2d`/`d2t` vocabulary mappings may be reused, not replaced with a
+different same-sized vocabulary: the learned output columns depend on them.
+
+Non-finite validation losses (NaN or either infinity) cannot update the best
+checkpoint or trigger its cleanup. They produce a warning and leave the previous
+best untouched; ordinary periodic saves and training updates are unchanged.
+
+Training checkpoints are now published as complete bundles: model, optimizer,
+scheduler (when enabled), and training progress are written into a hidden staging
+directory before the numbered checkpoint becomes visible. A same-epoch replacement
+retains the latest valid previous generation for recovery; an invalid current
+directory cannot displace a valid recovery copy. Incomplete staging
+directories are not auto-resumed; keeping staging/recovery data requires additional
+disk space. Legacy numbered checkpoints remain readable.
+
+The first Ctrl+C requests a stop at a complete update boundary, not in the middle
+of an optimizer update. The resulting `interrupted` checkpoint records its actual
+epoch, completed local steps, and global step and can be auto-resumed without
+renaming. Validation also checks for stop requests between batches. A timeout or
+forced second interrupt can exit without a new checkpoint; the previously
+published complete generation remains available. New checkpoints distinguish
+completed training updates from completed validation/best-checkpoint bookkeeping.
+If interrupted during validation, resuming reruns that epoch's validation and
+finishes its bookkeeping without replaying training updates, including the final
+epoch. Older checkpoints without this phase marker retain their legacy resume
+behavior.
+
+Validation-only resume reuses an intact checkpoint of the same weights instead of
+overwriting its validation metrics. If a different generation replaces the same
+numbered checkpoint, the best pointer and score stay attached to the actual old
+weight generation until the new one improves validation loss.
+
+New checkpoints also record each rank's Python, NumPy, PyTorch CPU and current
+CUDA/NPU device RNG states in the progress JSON. Mid-epoch resume restores them
+after recreating the data iterator and skipping completed batches, before reading
+the next batch. Pending validation snapshots keep the pre-validation stream so
+validation can be replayed; successful finalization atomically records the
+post-validation stream with the finalized flag. This does not alter the normal
+uninterrupted run's random sequence. Old checkpoints without RNG metadata remain
+loadable with a warning. A changed world size or device backend warns and retains
+startup RNG state rather than assigning one rank's stream to another rank.
+
+This is main-process random-stream recovery, not a guarantee of bitwise-identical
+training: DataLoader worker RNG/prefetch queues, independent generator objects,
+remote generation, nondeterministic kernels and BF16 checkpoint rounding remain
+outside that guarantee. Random dataset transforms are reproducible this way only
+with `num_workers=0`; changing sampler seed, data order or training settings also
+invalidates exact replay assumptions.
+
+Distributed vocabulary setup reads or generates mappings on rank zero, then
+broadcasts the result (or an error) to every rank. Numpy cache files are published
+only after their writes finish. Arrow train/validation splits use one shared
+integer boundary to prevent floating-point roundoff from creating overlap.
+
+With `data_generation_offline.py --validate-outputs`, hidden states are checked
+before publication. Existing invalid caches in the requested rank/sample range
+are retained as `hs_<index>.safetensors.invalid-<unique-id>` and regenerated;
+interrupted file transfers do not acquire the final reusable cache name. Training
+also rejects invalid token alignment, shapes, and NaN/Inf instead of using bad
+cached tensors. These checks do not repair an already damaged model checkpoint.
+
+For the separate native multimodal data path (not DSV4 text-only training), the
+service still receives complete messages and images. A longer response is accepted
+only when its token IDs exactly begin with the preprocessed training tokens; token
+IDs and hidden states are then sliced together to that prefix. Offline generation
+publishes the shortened cache, while online training can reuse a validated longer
+cache. Text-only requests retain exact-length checks. The complete multimodal
+message must still fit the target service's context limit; this change does not
+enable processing messages beyond that limit.
+Both synchronous and asynchronous multimodal requests keep the final message's
+end markers (`continue_final_message=False`), matching preprocessing even for
+short, untruncated samples.
+
+For the optional `--loss-fn ce --per-position-loss-weight dpace` combination,
+confidence `match-draft` weighting reuses the main CE's D-PACE weights. Uniform
+confidence weighting and the default fixed-decay CE/TV objective are unchanged.
+
+The optional NLA loss computes negative log-overlap in log space, without flooring
+valid low probabilities at `1e-5`. Low-acceptance positions therefore retain their
+learning signal. CUDA NLA uses token-chunked PyTorch computation with recomputation
+for backward instead of deriving overlap from the fused TV result; this avoids
+cancellation and bounds intermediate activation memory, but may be slower than
+the old Triton path. Fused TV and the default CE/TV objective are unchanged.
+
+With a pruned draft vocabulary, DFlash/DSpark retain the frozen full verifier head
+to compute true global greedy targets. DSpark also uses full-vocabulary probability
+mass for acceptance, confidence supervision, and SSAL weights. Conditional KD,
+CAT weights, and Correction's teacher-logit inputs retain their previous meaning.
+Consequently, reported acceptance/accuracy can decrease and confidence/SSAL
+gradients can change without any change to trainable parameter shapes. Existing
+standard checkpoints remain loadable; their borrowed verifier head is reloaded.
+
+The full frozen head adds memory and projection work for pruned-vocabulary runs.
+Projection uses chunks of 128 tokens to bound full-vocabulary logit memory, and
+the head remains a registered module under FSDP. Full-vocabulary runs keep the
+original projection path. CPU regressions do not validate NPU kernel behavior or
+full-model multi-device throughput.
+
 ## Local tests
 
 Control-logic tests that do not require torch:
@@ -1176,6 +1282,16 @@ pytest tests/unit/evaluate/test_dspark_offline_eval.py \
 pytest tests/unit/models/test_dflash_optional_features.py \
   tests/unit/models/test_dspark_core.py \
   tests/unit/train/test_trainer_scheduler.py
+
+pytest tests/unit/train/test_checkpoint_transactions.py \
+  tests/unit/train/test_rng_checkpoint.py \
+  tests/unit/train/test_trainer_rng_resume.py \
+  tests/unit/train/test_vocab_mapping_startup.py \
+  tests/unit/train/test_arrow_cache_and_split.py \
+  tests/unit/data_generation/test_hs_cache_safety.py \
+  tests/unit/data_generation/test_multimodal_hs_prefix.py \
+  tests/unit/models/test_dspark_dpace_confidence.py \
+  tests/unit/models/test_nla_stability.py
 
 pytest tests/unit/train/test_prepare_data.py \
   tests/unit/train/test_dsv4_preprocessing.py \

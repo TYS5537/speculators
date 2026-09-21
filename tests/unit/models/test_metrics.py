@@ -265,7 +265,7 @@ class TestNegLogAcceptanceLoss:
         )
 
     def test_finite_at_zero_overlap(self):
-        """The _EPS floor keeps the loss finite when overlap collapses to ~0."""
+        """Log-space overlap keeps loss finite for sharply disagreeing logits."""
         logits = torch.full((1, 1, 50), -30.0)
         logits[0, 0, 0] = 30.0
         targets = torch.full((1, 1, 50), -30.0)

@@ -284,7 +284,7 @@ def test_dspark_hidden_feedback_is_not_recomputed(
 
     def run(model):
         uses_logits = correction_output_mode == "logits"
-        hidden, base_logits, targets, _, indices = model._backbone_forward(
+        hidden, base_logits, targets, _, indices, _, _ = model._backbone_forward(
             **_inputs(), project_logits=uses_logits
         )
         hidden_blocks = hidden.view(2, 3, 16)

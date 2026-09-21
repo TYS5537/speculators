@@ -64,8 +64,15 @@ class DraftVocabMixin(nn.Module):
 
         # LM HEADS
         self.lm_head = nn.Linear(self.hidden_size, self.draft_vocab_size, bias=False)
+        # DFlash-family acceptance/confidence needs target mass outside the draft
+        # subset. Reuse its frozen, unsaved teacher head so FSDP can still shard it.
+        verifier_head_vocab_size = (
+            self.verifier_vocab_size
+            if getattr(self, "_needs_full_verifier_distribution", False)
+            else self.draft_vocab_size
+        )
         self.verifier_lm_head = nn.Linear(
-            self.hidden_size, self.draft_vocab_size, bias=False
+            self.hidden_size, verifier_head_vocab_size, bias=False
         )
         self.verifier_lm_head.weight.requires_grad = False
         self.lm_head.weight.requires_grad = False
@@ -78,7 +85,9 @@ class DraftVocabMixin(nn.Module):
         self.embed_tokens._is_hf_initialized = True  # type: ignore[assignment] # noqa: SLF001
         self.verifier_lm_head._is_hf_initialized = True  # type: ignore[assignment] # noqa: SLF001
 
-    def load_vocab_mappings(self, t2d: torch.Tensor | None, d2t: torch.Tensor | None):
+    def load_vocab_mappings(  # noqa: C901
+        self, t2d: torch.Tensor | None, d2t: torch.Tensor | None
+    ):
         """Load target-to-draft and draft-to-target vocabulary mapping tensors.
 
         Args:
@@ -101,6 +110,21 @@ class DraftVocabMixin(nn.Module):
             # checkpoint that does not prune the vocabulary.
             return
 
+        if t2d.ndim != 1 or d2t.ndim != 1:
+            raise ValueError("t2d and d2t must be one-dimensional tensors")
+        integer_dtypes = (
+            torch.uint8,
+            torch.int8,
+            torch.int16,
+            torch.int32,
+            torch.int64,
+        )
+        if t2d.dtype != torch.bool and t2d.dtype not in integer_dtypes:
+            raise ValueError("t2d must have a boolean or integer dtype")
+        if d2t.dtype not in integer_dtypes:
+            raise ValueError("d2t offsets must have an integer dtype")
+        if not torch.all((t2d == 0) | (t2d == 1)).item():
+            raise ValueError("t2d must be a binary vocabulary mask")
         if t2d.shape[0] != self.verifier_vocab_size:
             raise ValueError(
                 f"t2d.shape[0] ({t2d.shape[0]}) must match"
@@ -117,6 +141,35 @@ class DraftVocabMixin(nn.Module):
                 f"d2t.shape[0] ({d2t.shape[0]}) must match"
                 f" draft_vocab_size ({self.draft_vocab_size})."
             )
+
+        target_ids = torch.arange(self.draft_vocab_size, device=t2d.device) + d2t.to(
+            device=t2d.device, dtype=torch.long
+        )
+        if not torch.equal(target_ids, t2d.bool().nonzero(as_tuple=True)[0]):
+            raise ValueError(
+                "d2t offsets must map draft IDs to the token IDs selected by t2d "
+                "in vocabulary order"
+            )
+
+        # Every vocabulary-indexed learned weight uses these column meanings.
+        # Only the all-zero construction placeholders may be initialized; a
+        # checkpoint's mappings cannot be replaced by another dataset's vocab.
+        has_existing_mapping = (
+            self.t2d is not None and torch.any(self.t2d).item()
+        ) or (self.d2t is not None and torch.any(self.d2t).item())
+        if has_existing_mapping:
+            if (
+                self.t2d is None
+                or self.d2t is None
+                or not torch.equal(self.t2d, t2d.to(self.t2d.device))
+                or not torch.equal(self.d2t, d2t.to(self.d2t.device))
+            ):
+                raise ValueError(
+                    "Cannot replace an initialized draft vocabulary mapping. "
+                    "Use the checkpoint's original t2d/d2t mappings or train a "
+                    "new model for the new vocabulary."
+                )
+            return
 
         self.load_state_dict({"t2d": t2d, "d2t": d2t}, strict=False)
 
@@ -169,6 +222,7 @@ class DraftVocabMixin(nn.Module):
 
         embed_tokens_weight = verifier_weights["embed_tokens.weight"]
         lm_head_weight = verifier_weights.get("lm_head.weight", embed_tokens_weight)
+        full_lm_head_weight = lm_head_weight
 
         # Load embed_tokens if not already loaded (NaN means uninitialized)
         if self.embed_tokens.weight.isnan().any():
@@ -189,7 +243,16 @@ class DraftVocabMixin(nn.Module):
                 {"weight": lm_head_weight.detach().clone()}, strict=False
             )
         self.verifier_lm_head.load_state_dict(
-            {"weight": lm_head_weight.detach().clone()}, strict=False
+            {
+                "weight": (
+                    full_lm_head_weight
+                    if self.verifier_lm_head.out_features == self.verifier_vocab_size
+                    else lm_head_weight
+                )
+                .detach()
+                .clone()
+            },
+            strict=False,
         )
 
         # Load verifier norm weights if the model has verifier_norm

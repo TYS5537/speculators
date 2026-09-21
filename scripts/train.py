@@ -2,6 +2,7 @@ import argparse
 import gc
 import logging
 import random
+import tempfile
 import warnings
 from copy import deepcopy
 from pathlib import Path
@@ -322,7 +323,22 @@ def _load_mappings(d2t_path, t2d_path, expected_draft_vocab_size: int | None):
     return d2t, t2d, draft_vocab_size
 
 
-def parse_vocab_mappings(args: argparse.Namespace):
+def _save_vocab_mapping_atomically(path: Path, values: np.ndarray) -> None:
+    """Publish a complete numpy file, never a visible partially written cache."""
+    temporary_path = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=path.parent, prefix=f".{path.name}.", suffix=".tmp", delete=False
+        ) as stream:
+            temporary_path = Path(stream.name)
+            np.save(stream, values)
+        temporary_path.replace(path)
+    finally:
+        if temporary_path is not None:
+            temporary_path.unlink(missing_ok=True)
+
+
+def _parse_vocab_mappings_local(args: argparse.Namespace):
     if args.d2t_path or args.t2d_path:
         if not (args.d2t_path and args.t2d_path):
             raise ValueError(
@@ -362,8 +378,8 @@ def parse_vocab_mappings(args: argparse.Namespace):
             )
 
         logger.info(f"Caching vocab mapping files to '{data_path}'")
-        np.save(data_path / "d2t.npy", d2t.cpu().numpy())
-        np.save(data_path / "t2d.npy", t2d.cpu().numpy())
+        _save_vocab_mapping_atomically(data_path / "d2t.npy", d2t.cpu().numpy())
+        _save_vocab_mapping_atomically(data_path / "t2d.npy", t2d.cpu().numpy())
 
         return d2t, t2d, draft_vocab_size
 
@@ -375,6 +391,30 @@ def parse_vocab_mappings(args: argparse.Namespace):
     # When vocab mapping is not provided, use the full verifier vocab
     verifier_config = get_verifier_config(args.verifier_name_or_path)
     return None, None, verifier_config.vocab_size
+
+
+def parse_vocab_mappings(args: argparse.Namespace):
+    """Resolve mappings once, then share the same result or failure with all ranks."""
+    if not is_distributed():
+        return _parse_vocab_mappings_local(args)
+
+    # All ranks must enter this collective, including when rank zero cannot read
+    # or create the mappings. A barrier after unguarded I/O would leave peers
+    # waiting forever on a rank-zero failure. CPU mappings are small startup data;
+    # broadcasting them also avoids requiring a shared cache filesystem.
+    payload = [{}]
+    if get_rank() == 0:
+        try:
+            payload[0] = {"mappings": _parse_vocab_mappings_local(args)}
+        except Exception as exc:  # noqa: BLE001 -- report failure to every rank.
+            payload[0] = {"error": f"{type(exc).__name__}: {exc}"}
+    torch.distributed.broadcast_object_list(payload, src=0)
+    result = payload[0]
+    if "error" in result:
+        raise ValueError(
+            "Vocabulary mapping setup failed on rank 0: " + result["error"]
+        )
+    return result["mappings"]
 
 
 def _build_from_config_only(

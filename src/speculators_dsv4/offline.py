@@ -223,13 +223,17 @@ class DSV4OfflineTarget:
     def validate_request_budget(
         self, prompt_length, max_new_tokens, max_proposal_tokens
     ):
-        # The original evaluator verifies whole blocks even at its output cutoff.
-        # Also reserve the one API output token used to obtain next-token logprobs.
-        needed = prompt_length + max_new_tokens + max_proposal_tokens + 1
-        if max_new_tokens <= 0 or needed > self.max_model_len:
+        del max_proposal_tokens  # Retained for the evaluator's shared target API.
+        if max_new_tokens <= 0:
+            raise ValueError("max_new_tokens must be > 0")
+        # The evaluator truncates each proposal to leave room for one bonus token.
+        # Its longest target prefix is one token short of the output limit; the
+        # API output token used to obtain next-token logprobs fills that last slot.
+        needed = prompt_length + max_new_tokens
+        if needed > self.max_model_len:
             raise ValueError(
                 f"DSV4 evaluation needs up to {needed} target positions including "
-                f"verification/API overhead; configured limit is {self.max_model_len}. "
+                f"the API output token; configured limit is {self.max_model_len}. "
                 "Increase both server and --dsv4-max-model-len, or shorten the request."
             )
 

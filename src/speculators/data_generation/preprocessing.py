@@ -640,6 +640,10 @@ def _preprocess_batch(
         results["seq_len"].append(len(input_ids))
 
         if "messages" in results:
+            # Keep media and their placeholders complete in the server request.
+            # HS extraction checks that the returned tokens start with exactly
+            # input_ids, then slices both tokens and states to this causal prefix.
+            # Do not use server-side left truncation to enforce max_length.
             results["messages"].append(_adapt_conv_for_vllm(normalized_conv))
 
     return results

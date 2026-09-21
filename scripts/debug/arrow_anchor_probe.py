@@ -86,7 +86,7 @@ def _training_anchor_forward(torch, draft, sample, anchor: int, device):
     document_ids = torch.zeros((1, seq_len), dtype=torch.long, device=device)
     position_ids = torch.arange(seq_len, dtype=torch.long, device=device).unsqueeze(0)
     with torch.inference_mode():
-        hidden, base_logits, targets, aligned_mask, anchored_idx = (
+        hidden, base_logits, targets, aligned_mask, anchored_idx, _, _ = (
             draft._backbone_forward(
                 sample.hidden_states.to(device).unsqueeze(0),
                 input_ids,

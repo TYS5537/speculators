@@ -2,6 +2,7 @@
 
 import json
 import tempfile
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -40,6 +41,9 @@ def patch_checkpointer(monkeypatch: pytest.MonkeyPatch) -> None:
         return None
 
     for cls in (SingleGPUCheckpointer, DistributedCheckpointer):
+        monkeypatch.setattr(
+            cls, "checkpoint_transaction", lambda *_a, **_kw: nullcontext()
+        )
         monkeypatch.setattr(cls, "save_checkpoint", _save_checkpoint)
         monkeypatch.setattr(cls, "save_scheduler_state_dict", _noop)
         monkeypatch.setattr(cls, "load_model_state_dict", _noop)
@@ -82,6 +86,7 @@ class _MockTrainer(Trainer):
         pass
 
     def setup_optimizer(self) -> None:
+        self.device_type = "cpu"
         p = nn.Parameter(torch.zeros(1))
         opt = torch.optim.AdamW([p], lr=1e-4)
         self.opt = opt
@@ -165,10 +170,13 @@ def test_mid_epoch_checkpoint_saves_training_state(
         state_file = Path(tmpdir) / "0" / "training_state.json"
         assert state_file.exists(), "training_state.json was not saved"
         state = json.loads(state_file.read_text())
+        assert state.pop("rng_states")["world_size"] == 1
         expected = {
             "epoch": 0,
             "local_step": step_interval,
             "global_step": step_interval,
+            "epoch_complete": False,
+            "epoch_finalized": False,
         }
         assert state == expected
 
@@ -216,6 +224,7 @@ def test_end_of_epoch_checkpoint_advances_epoch(
         t = _make_trainer(tmpdir, trained_steps=trained_steps, epochs=2)
         t.train_epoch(0)
         t.maybe_save_checkpoint(0, local_step=0)
+        t.checkpointer.mark_epoch_finalized(0, t.global_step)
 
         run2_steps: list[tuple[int, int, int]] = []
         t2 = _make_trainer(tmpdir, trained_steps=run2_steps, resume=True, epochs=2)
@@ -223,15 +232,23 @@ def test_end_of_epoch_checkpoint_advances_epoch(
         assert t2._resume_local_step == 0
 
 
-def test_interrupted_checkpoint_has_no_training_state(
+def test_interrupted_checkpoint_records_training_state(
     trained_steps: list[tuple[int, int, int]],
 ) -> None:
-    """'interrupted' checkpoint does not write training_state.json."""
+    """An interrupt before the first step resumes the same epoch, not the next."""
     with tempfile.TemporaryDirectory() as tmpdir:
         t = _make_trainer(tmpdir, trained_steps=trained_steps)
         t.maybe_save_checkpoint("interrupted")
         state_file = Path(tmpdir) / "interrupted" / "training_state.json"
-        assert not state_file.exists()
+        state = json.loads(state_file.read_text())
+        assert state.pop("rng_states")["world_size"] == 1
+        assert state == {
+            "epoch": 0,
+            "local_step": 0,
+            "global_step": 0,
+            "epoch_complete": False,
+            "epoch_finalized": False,
+        }
 
 
 def test_symlink_created_and_updated(

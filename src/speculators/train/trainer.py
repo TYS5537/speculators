@@ -1,7 +1,9 @@
 import json
 import logging
+import math
 import time
 import warnings
+from itertools import islice
 from pathlib import Path
 from typing import Literal, NamedTuple
 
@@ -25,6 +27,7 @@ from speculators.train.checkpointer import (
     BaseCheckpointer,
     DistributedCheckpointer,
     SingleGPUCheckpointer,
+    _rank0_only,
 )
 from speculators.train.distributed import (
     apply_fully_sharded,
@@ -32,8 +35,12 @@ from speculators.train.distributed import (
     get_rank,
     is_distributed,
 )
-from speculators.train.graceful_shutdown import with_graceful_shutdown
+from speculators.train.graceful_shutdown import (
+    TrainingInterruptedError,
+    with_graceful_shutdown,
+)
 from speculators.train.optimizers import build_optimizers
+from speculators.train.rng import capture_rng_states, restore_rng_states
 from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
@@ -256,23 +263,33 @@ class Trainer:
             return 0.0
         return 1.0 - (progress - start) / (end - start)
 
-    def _training_state_path(self, epoch: int) -> Path:
+    def _training_state_path(self, epoch: int | str) -> Path:
         return self.checkpointer.path / str(epoch) / "training_state.json"
 
-    def _save_training_state(self, epoch: int, local_step: int) -> None:
-        if not self.is_distributed or dist.get_rank() == 0:
-            state = {
+    @_rank0_only
+    def _save_training_state(
+        self, epoch: int | str, local_step: int, rng_states: dict | None = None
+    ) -> None:
+        if self.is_distributed and dist.get_rank() != 0:
+            return
+        state = (
+            dict(self._checkpoint_position)
+            if epoch == "interrupted"
+            else {
                 "epoch": epoch,
                 "local_step": local_step,
-                "global_step": self.global_step,
+                "epoch_complete": local_step == 0,
+                "epoch_finalized": False,
             }
-            p = self._training_state_path(epoch)
-            p.parent.mkdir(parents=True, exist_ok=True)
-            p.write_text(json.dumps(state))
+        )
+        state["global_step"] = self.global_step
+        state["rng_states"] = rng_states
+        p = self._training_state_path(epoch)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps(state))
 
     def _load_training_state(self) -> dict:
-        epoch = self.checkpointer.previous_epoch
-        p = self._training_state_path(epoch)
+        p = self.checkpointer.prev_path / "training_state.json"
         if p.exists():
             try:
                 return json.loads(p.read_text())
@@ -283,6 +300,10 @@ class Trainer:
         return {}
 
     def setup_trainer(self):
+        self._resume_validation_epoch = None
+        self._pending_rng_states = None
+        self._rng_restore_pending = False
+        self._resume_rng_after_loader = False
         if self.checkpointer.previous_epoch != -1:
             root_logger.info(f"Found checkpoint at {self.checkpointer.prev_path}.")
             self.current_epoch = self.checkpointer.previous_epoch + 1
@@ -290,29 +311,7 @@ class Trainer:
                 # Check if this was a mid-epoch checkpoint — if so, resume
                 # from within that epoch rather than jumping to the next one.
                 state = self._load_training_state()
-                is_mid_epoch = (
-                    state
-                    and state.get("epoch") == self.checkpointer.previous_epoch
-                    and state.get("local_step", 0) > 0  # 0 means end-of-epoch
-                )
-                if is_mid_epoch:
-                    # Resume within the same epoch from the exact step.
-                    self.current_epoch = state["epoch"]
-                    self._resume_local_step = state["local_step"]
-                    self._resume_global_step = state.get("global_step", 0)
-                    root_logger.info(
-                        f"Resuming mid-epoch from epoch={self.current_epoch} "
-                        f"local_step={self._resume_local_step} "
-                        f"global_step={self._resume_global_step}."
-                    )
-                else:
-                    # End-of-epoch or no state — advance to next epoch.
-                    self._resume_local_step = 0
-                    resume_global = state.get("global_step", 0) if state else 0
-                    self._resume_global_step = resume_global
-                    root_logger.info(
-                        f"Resuming training on epoch {self.current_epoch}."
-                    )
+                self._restore_training_progress(state)
             else:
                 root_logger.warning(
                     "`resume_from_checkpoint` is False, starting "
@@ -331,6 +330,12 @@ class Trainer:
             self._resume_local_step = 0
             self._resume_global_step = 0
         self.global_step = self._resume_global_step
+        self._checkpoint_position = {
+            "epoch": self.current_epoch,
+            "local_step": self._resume_local_step,
+            "epoch_complete": self._resume_validation_epoch is not None,
+            "epoch_finalized": False,
+        }
         self.best_val_loss = float("inf")
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
@@ -340,6 +345,52 @@ class Trainer:
                 root_logger.info(
                     f"Restored best_val_loss={self.best_val_loss:.6f} from checkpoint"
                 )
+
+    def _restore_training_progress(self, state: dict):
+        self._pending_rng_states = state.get("rng_states")
+        self._rng_restore_pending = True
+        self._resume_local_step = 0
+        self._resume_global_step = state.get("global_step", 0)
+        if state and state.get("epoch") == self.checkpointer.previous_epoch:
+            training_complete = state.get(
+                "epoch_complete", state.get("local_step", 0) == 0
+            )
+            # Legacy checkpoints without a phase flag retain their original
+            # end-of-epoch semantics. New snapshots cannot skip pending validation.
+            if training_complete and state.get("epoch_finalized") is False:
+                self.current_epoch = state["epoch"]
+                self._resume_validation_epoch = self.current_epoch
+            elif not training_complete:
+                self.current_epoch = state["epoch"]
+                self._resume_local_step = state["local_step"]
+                self._resume_rng_after_loader = self._resume_local_step > 0
+        root_logger.info(
+            "Resuming epoch=%d local_step=%d global_step=%d validation_only=%s",
+            self.current_epoch,
+            self._resume_local_step,
+            self._resume_global_step,
+            self._resume_validation_epoch is not None,
+        )
+
+    def _restore_pending_rng(self):
+        if getattr(self, "_rng_restore_pending", False):
+            restore_rng_states(self._pending_rng_states, self.device_type)
+            self._rng_restore_pending = False
+
+    def _checkpoint_rng_states(self, epoch: int | str, local_step: int):
+        if getattr(self, "_rng_restore_pending", False):
+            return self._pending_rng_states
+        position = getattr(self, "_checkpoint_position", {})
+        pending_validation = (
+            position.get("epoch_complete", False)
+            and not position.get("epoch_finalized", False)
+            if epoch == "interrupted"
+            else local_step == 0
+        )
+        pre_validation = getattr(self, "_validation_rng_states", None)
+        if pending_validation and pre_validation is not None:
+            return pre_validation
+        return capture_rng_states(self.device_type)
 
     def setup_model(self):
         # Verify model is compatible with training infrastructure
@@ -466,6 +517,48 @@ class Trainer:
         for scheduler in self.schedulers:
             scheduler.step()
 
+    def _supervision_status(
+        self, batch: dict, metrics: dict, device: torch.device
+    ) -> tuple[bool, int]:
+        """Return local supervision and the globally active rank count.
+
+        DFlash/DSpark report the post-alignment count: a nonempty input mask can
+        still produce no trainable anchor slots. Older models fall back to their
+        input mask, or retain the historical behavior when no mask is available.
+        """
+        count = metrics.get("supervision_total")
+        if count is None:
+            mask = batch.get("loss_mask")
+            count = mask.sum() if mask is not None else 1
+        local_active = bool(torch.as_tensor(count, device=device).sum().item() > 0)
+        active_ranks = torch.tensor(float(local_active), device=device)
+        if self.is_distributed:
+            dist.all_reduce(active_ranks, op=dist.ReduceOp.SUM)
+        return local_active, int(active_ranks.item())
+
+    @staticmethod
+    def _mask_unsupervised_metrics(metrics: dict, local_active: bool) -> dict:
+        if local_active:
+            return metrics
+        # In particular, do not count an empty rank as a zero-valued loss batch.
+        return {key: torch.zeros_like(value) for key, value in metrics.items()}
+
+    def _prepare_supervised_loss(
+        self, loss: torch.Tensor, metrics: dict, batch: dict
+    ) -> tuple[torch.Tensor, dict, int]:
+        local_active, active_ranks = self._supervision_status(
+            batch, metrics, loss.device
+        )
+        world_size = dist.get_world_size() if self.is_distributed else 1
+        metrics = self._mask_unsupervised_metrics(metrics, local_active)
+        if not local_active:
+            loss = loss * 0.0
+        elif active_ranks < world_size:
+            # DDP/FSDP averages gradients across all ranks. Preserve the existing
+            # per-rank mean over only ranks with supervision.
+            loss = loss * (world_size / active_ranks)
+        return loss, metrics, active_ranks
+
     def _prepare_resume_skip(self, epoch: int) -> int:
         """Prepare fast-skip state for mid-epoch resume and return skipped steps."""
         skip_steps = 0
@@ -480,6 +573,7 @@ class Trainer:
         has_fast_skip_api = hasattr(sampler, "_generate_batches") and hasattr(
             sampler, "_cached_generated_batches"
         )
+        self._fallback_skip_steps = skip_steps if not has_fast_skip_api else 0
         if skip_steps > 0 and has_fast_skip_api:
             all_batches = sampler._generate_batches(epoch)  # type: ignore[union-attr]  # noqa: SLF001
             remaining = all_batches[skip_steps:]
@@ -495,10 +589,19 @@ class Trainer:
             )
         elif skip_steps > 0:
             root_logger.warning(
-                "Sampler lacks fast-skip API; resume will replay "
-                f"{skip_steps} batches from the start of the epoch."
+                "Sampler lacks fast-skip API; resume will read and discard "
+                f"{skip_steps} batches without training on them."
             )
         return skip_steps
+
+    def _resume_aware_iterator(self):
+        # Iterator construction and skipped data reads can consume random numbers.
+        # Restore after those resume-only operations, before the first live batch.
+        iterator = iter(self.train_loader)
+        for _ in islice(iterator, self._fallback_skip_steps):
+            pass
+        self._restore_pending_rng()
+        return iterator
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -512,10 +615,18 @@ class Trainer:
 
         # Determine how many batches to skip for mid-epoch resume.
         skip_steps = self._prepare_resume_skip(epoch)
+        self._record_checkpoint_position(epoch, skip_steps, complete=False)
 
-        train_loader = self.train_loader
-        if self.rank == 0:
-            train_loader = tqdm(train_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
+        train_iterator = self._resume_aware_iterator()
+        train_loader = (
+            tqdm(
+                train_iterator,
+                desc=f"Epoch {epoch}",
+                total=max(0, num_steps - skip_steps),
+            )
+            if self.rank == 0
+            else train_iterator
+        )
 
         step_interval = (
             max(1, round(num_steps * self.config.checkpoint_freq))
@@ -558,9 +669,27 @@ class Trainer:
                     )
                 _draft_tokens, loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
+            loss, metrics, active_ranks = self._prepare_supervised_loss(
+                loss, metrics, gpu_batch
+            )
             timer.mark("fwd")
             self._optimizers_zero_grad()
             loss.backward()
+            if active_ranks == 0:
+                # Still complete backward on every rank after forward, including
+                # FSDP's unshard/reshard lifecycle. Adam/Muon momentum and weight
+                # decay must not update parameters on an entirely empty batch.
+                self._optimizers_zero_grad()
+                root_logger.warning(
+                    "Skipping globally unsupervised batch at epoch=%d local_step=%d",
+                    epoch,
+                    local_step,
+                )
+                t_before_fetch = time.perf_counter()
+                self._record_checkpoint_position(
+                    epoch, local_step, complete=local_step == num_steps
+                )
+                continue
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
             timer.mark("bwd")
@@ -582,8 +711,7 @@ class Trainer:
                         dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
-                world_size = dist.get_world_size() if self.is_distributed else 1
-                metrics = normalize_counted_metrics(metrics, world_size)
+                metrics = normalize_counted_metrics(metrics, active_ranks)
                 lr_info = (
                     current_lrs
                     if len(current_lrs) > 1
@@ -600,6 +728,9 @@ class Trainer:
                     extra={"step": self.global_step},
                 )
             self.global_step += 1
+            self._record_checkpoint_position(
+                epoch, local_step, complete=local_step == num_steps
+            )
 
             if (
                 step_interval is not None
@@ -622,7 +753,7 @@ class Trainer:
             val_loader = tqdm(val_loader, desc=f"Epoch {epoch}")  # type: ignore[assignment]
 
         val_metrics: dict[str, float] = {}
-        num_batches = len(val_loader)
+        supervised_rank_batches = 0
         for batch in val_loader:
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
@@ -638,6 +769,14 @@ class Trainer:
                     **gpu_batch, **(self.config.val_call_kwargs or {})
                 )
 
+            local_active, active_ranks = self._supervision_status(
+                gpu_batch, metrics, _loss.device
+            )
+            self._check_stop_requested()
+            if active_ranks == 0:
+                continue
+            supervised_rank_batches += active_ranks
+            metrics = self._mask_unsupervised_metrics(metrics, local_active)
             if self.is_distributed:
                 for m in metrics.values():
                     dist.all_reduce(m, op=dist.ReduceOp.SUM)
@@ -645,8 +784,14 @@ class Trainer:
             for k, v in metrics.items():
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
 
+        if supervised_rank_batches == 0:
+            root_logger.warning("Validation epoch %d has no supervised batches", epoch)
+            return None
         world_size = dist.get_world_size() if self.is_distributed else 1
-        val_metrics = {k: v / num_batches for k, v in val_metrics.items()}
+        # Keep the all-valid reduction order unchanged; with empty ranks this
+        # effective batch count excludes their zero losses from scalar averages.
+        effective_batches = supervised_rank_batches / world_size
+        val_metrics = {k: v / effective_batches for k, v in val_metrics.items()}
         val_metrics = normalize_counted_metrics(val_metrics, world_size)
         val_metrics = {f"{k}_epoch": v for k, v in val_metrics.items()}
 
@@ -669,41 +814,105 @@ class Trainer:
             return
 
         root_logger.info(f"Saving checkpoint to {self.checkpointer.path / str(epoch)}")
-        self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
-        if self.schedulers:
-            self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+        self._save_checkpoint_bundle(epoch, local_step)
         if isinstance(epoch, int):
-            self._save_training_state(epoch, local_step)
-            # Create a human-readable symlink for checkpoint readability.
-            # e.g. epoch0_step16626 -> 0/ (mid) or epoch0_end -> 0/ (end)
-            if not self.is_distributed or dist.get_rank() == 0:
-                ckpt_dir = self.checkpointer.path
-                suffix = f"step{local_step}" if local_step > 0 else "end"
-                link_name = ckpt_dir / f"epoch{epoch}_{suffix}"
-                target = Path(str(epoch))  # relative symlink
-                # Remove any previous link for this epoch
-                for old in ckpt_dir.glob(f"epoch{epoch}_*"):
-                    if old.is_symlink():
-                        old.unlink()
-                link_name.symlink_to(target)
+            self._save_checkpoint_alias(epoch, local_step)
         root_logger.info(f"Checkpoint saved to {self.checkpointer.path / str(epoch)}")
+
+    @_rank0_only
+    def _save_checkpoint_alias(self, epoch: int, local_step: int):
+        # Nonessential human-readable alias; its failure must not turn a complete
+        # published checkpoint into an asymmetric distributed training failure.
+        if self.is_distributed and dist.get_rank() != 0:
+            return
+        ckpt_dir = self.checkpointer.path
+        suffix = f"step{local_step}" if local_step > 0 else "end"
+        try:
+            for old in ckpt_dir.glob(f"epoch{epoch}_*"):
+                if old.is_symlink():
+                    old.unlink()
+            (ckpt_dir / f"epoch{epoch}_{suffix}").symlink_to(
+                Path(str(epoch)), target_is_directory=True
+            )
+        except OSError as exc:
+            root_logger.warning(
+                "Checkpoint is complete, but its descriptive alias "
+                "could not be created: %s",
+                exc,
+            )
+
+    def _save_checkpoint_bundle(self, epoch: int | str, local_step: int):
+        # All ranks participate in RNG capture before rank-zero file I/O.
+        rng_states = self._checkpoint_rng_states(epoch, local_step)
+        with self.checkpointer.checkpoint_transaction(
+            epoch, has_scheduler=bool(self.schedulers)
+        ):
+            self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
+            if self.schedulers:
+                self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+            self._save_training_state(epoch, local_step, rng_states=rng_states)
+
+    def _prepare_validation_checkpoint(self, epoch: int, *, validation_only: bool):
+        if validation_only and self.checkpointer.can_reuse_validation_checkpoint(
+            epoch, self.global_step
+        ):
+            root_logger.info(
+                "Reusing epoch %d checkpoint and its validation metadata", epoch
+            )
+            return
+        # A last-step interrupt can precede the numeric save. In that case publish
+        # a full bundle before validation, never just a metrics-only directory.
+        self.maybe_save_checkpoint(epoch)
+
+    def _record_checkpoint_position(
+        self, epoch: int, local_step: int, *, complete: bool, finalized: bool = False
+    ):
+        """Called only outside a forward/backward/optimizer update lifecycle."""
+        self._checkpoint_position = {
+            "epoch": epoch,
+            "local_step": local_step,
+            "epoch_complete": complete,
+            "epoch_finalized": finalized,
+        }
+        self._check_stop_requested()
+
+    def _check_stop_requested(self):
+        handler = getattr(self, "_shutdown_handler", None)
+        if handler is None:
+            return
+        requested = torch.tensor(int(handler.interrupted), device=self.local_rank)
+        if self.is_distributed:
+            dist.all_reduce(requested, op=dist.ReduceOp.MAX)
+        if requested.item():
+            raise TrainingInterruptedError(
+                "Stop requested at a complete training-step boundary"
+            )
 
     def maybe_update_best(self, epoch: int, val_metrics: dict | None):
         if val_metrics is None or "loss_epoch" not in val_metrics:
             return
-        if val_metrics["loss_epoch"] >= self.best_val_loss:
+        val_loss = val_metrics["loss_epoch"]
+        # NaN compares false against the previous best; reject all non-finite
+        # results before saving, replacing the best pointer, or deleting backups.
+        if not math.isfinite(val_loss):
+            root_logger.warning(
+                "Skipping best-checkpoint update at epoch=%d: "
+                "validation loss is non-finite (%s)",
+                epoch,
+                val_loss,
+            )
+            return
+        if val_loss >= self.best_val_loss:
             return
 
         if self.config.save_best:
-            self.checkpointer.save_checkpoint(self.model, self.optimizers, epoch)
-            if self.schedulers:
-                self.checkpointer.save_scheduler_state_dict(self.schedulers, epoch)
+            self._save_checkpoint_bundle(epoch, 0)
         elif self.config.checkpoint_freq >= 1 and not (
             epoch == 0 or (epoch + 1) % int(self.config.checkpoint_freq) == 0
         ):
             return
 
-        self.best_val_loss = val_metrics["loss_epoch"]
+        self.best_val_loss = val_loss
         self.checkpointer.save_val_metrics(epoch, val_metrics)
         self.checkpointer.update_best_symlink(epoch)
         root_logger.info(
@@ -714,16 +923,27 @@ class Trainer:
 
     @with_graceful_shutdown()
     def run_training(self):
+        if not getattr(self, "_resume_rng_after_loader", False):
+            self._restore_pending_rng()
         n_epochs = self.config.num_epochs
         for epoch in range(self.current_epoch, n_epochs):
-            root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
-            self.train_epoch(epoch)
+            self._validation_rng_states = None
+            validation_only = epoch == getattr(self, "_resume_validation_epoch", None)
+            self._record_checkpoint_position(
+                epoch, getattr(self, "_resume_local_step", 0), complete=validation_only
+            )
+            if not validation_only:
+                root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
+                self.train_epoch(epoch)
+            self._validation_rng_states = capture_rng_states(self.device_type)
+            self._record_checkpoint_position(epoch, 0, complete=True)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
 
             if self.is_distributed:
                 dist.barrier()
 
-            self.maybe_save_checkpoint(epoch)
+            self._prepare_validation_checkpoint(epoch, validation_only=validation_only)
+            self._check_stop_requested()
 
             if self.is_distributed:
                 dist.barrier()
@@ -741,6 +961,11 @@ class Trainer:
                 dist.barrier()
 
             self.maybe_update_best(epoch, val_metrics)
+            self.checkpointer.mark_epoch_finalized(
+                epoch, self.global_step, rng_states=capture_rng_states(self.device_type)
+            )
+            self._resume_validation_epoch = None
+            self._record_checkpoint_position(epoch, 0, complete=True, finalized=True)
 
             if self.is_distributed:
                 dist.barrier()

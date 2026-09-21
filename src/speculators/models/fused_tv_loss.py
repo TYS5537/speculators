@@ -1,11 +1,11 @@
 """Fused Triton kernels for the acceptance-rate losses, computed from logits.
 
 The primitive is the draft/target overlap ``alpha = sum_v min(p_v, q_v)`` (the
-acceptance rate); ``fused_tv_loss`` returns ``1 - alpha`` and ``fused_nla_loss``
-returns ``-log(alpha)``, both per-position ``[1, T]`` to match ``_LOSS_FN_MAP``.
-Softmax is fused in, so the ``[T, V]`` distributions are never materialized or
-saved for backward (the memory win over the eager losses); only five per-row
-scalars are kept.
+acceptance rate); ``fused_tv_loss`` returns ``1 - alpha`` per position. Its
+softmax is fused, so ``[T, V]`` distributions are never materialized or saved
+for backward; only five per-row scalars are kept. The historical
+``fused_nla_loss`` entry point now uses chunked, recomputed PyTorch log-space
+operations, not Triton: recovering tiny overlap via ``1 - TV`` loses precision.
 
 Derived from SpecForge specforge/core/loss.py (Apache-2.0, Unsloth/Liger lineage);
 TV gradient sign convention matches Liger ops/tvd.py.
@@ -180,14 +180,19 @@ class FusedTVLoss(torch.autograd.Function):
         return grad_in.view(B, T, V), None
 
 
-_EPS = 1e-5  # matches models/metrics.py neg_log_acceptance_loss
-
-
 def fused_tv_loss(logits, targets):
     """Per-position TV distance ``[1, T]`` from draft/target logits (fused Triton)."""
     return FusedTVLoss.apply(logits, targets)
 
 
 def fused_nla_loss(logits, targets):
-    """Per-position negative-log-acceptance ``[1, T] = -log(alpha)``; composes on TV."""
-    return -torch.log((1.0 - fused_tv_loss(logits, targets)).clamp_min(_EPS))
+    """Compatibility API for stable chunked NLA; no longer a fused Triton loss.
+
+    Recomputing each token chunk bounds intermediate memory, at the cost of
+    additional computation and dispatch compared with the former fused path.
+    """
+    from speculators.models.metrics import (  # noqa: PLC0415
+        chunked_neg_log_acceptance_loss,
+    )
+
+    return chunked_neg_log_acceptance_loss(logits, targets)

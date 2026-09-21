@@ -1,5 +1,6 @@
 import os
 import signal
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any, cast
 
@@ -27,11 +28,16 @@ def _make_minimal_trainer(tmp_path: Path, checkpoint_freq: int, save_best: bool)
     trainer.global_step = 0
     trainer.is_distributed = False
     trainer.rank = 0
-    trainer.local_rank = 0
+    trainer.local_rank = "cpu"
+    trainer.device_type = "cpu"
     trainer.resume_from_checkpoint = False
     trainer.train_loader = cast("DataLoader[Any]", [])
     trainer.val_loader = cast("DataLoader[Any]", [])
     trainer.checkpointer = SingleGPUCheckpointer(str(tmp_path))
+    # These tests stub model I/O; complete bundle publication is tested separately.
+    trainer.checkpointer.checkpoint_transaction = lambda *_args, **_kwargs: (
+        nullcontext()
+    )
 
     trainer.model = cast("SpeculatorModel", object())
     trainer.optimizers = cast("list[torch.optim.Optimizer]", [object()])

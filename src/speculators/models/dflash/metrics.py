@@ -17,7 +17,7 @@ from speculators.models.metrics import (
 _DEFAULT_LOSS_CONFIG: LossConfig = {"kl_div": (kl_div_loss, 1.0)}
 
 
-def compute_metrics(
+def compute_metrics(  # noqa: C901
     logits: torch.Tensor,  # shape: [1, num_anchors*block_size, draft_vocab_size]
     targets: torch.Tensor,  # shape: [1, num_anchors*block_size, draft_vocab_size]
     loss_mask: torch.Tensor,  # shape: [1, num_anchors*block_size]
@@ -29,6 +29,8 @@ def compute_metrics(
     sample_from_anchor: bool = False,
     proposal_candidate_ids: torch.Tensor | None = None,
     proposal_candidate_logits: torch.Tensor | None = None,
+    *,
+    target_argmax_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
     """Compute loss and accuracy metrics for draft model predictions.
 
@@ -91,7 +93,13 @@ def compute_metrics(
         pred_ids = proposal_candidate_ids.gather(-1, selected).squeeze(-1)
     else:
         pred_ids = torch.argmax(logits, dim=-1)
-    target_ids = torch.argmax(targets, dim=-1)
+    target_ids = (
+        torch.argmax(targets, dim=-1)
+        if target_argmax_ids is None
+        else target_argmax_ids
+    )
+    if target_ids.shape != targets.shape[:-1]:
+        raise ValueError("Full target argmax IDs must align with target positions")
 
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
@@ -99,6 +107,9 @@ def compute_metrics(
 
     ones = torch.tensor(1.0, device=logits.device)
     metrics: dict[str, Any] = {}
+    # The trainer needs the actual post-anchor count, including genuinely empty
+    # batches. Do not clamp this internal count or substitute the raw input mask.
+    metrics["supervision_total"] = loss_mask.float().sum().detach()
     metrics["loss_sum"] = loss.detach().clone()
     metrics["loss_total"] = ones
     for term_name, term_val in term_losses.items():

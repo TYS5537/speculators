@@ -5,25 +5,26 @@ When Ctrl+C is pressed during training:
 - In single-GPU mode, the process receives SIGINT directly
 
 This module handles both cases by registering handlers for SIGINT and SIGTERM.
-The first signal raises a TrainingInterruptedError exception that unwinds the call
-stack -- this works even when a process is stuck in a NCCL collective, data
-loading, or a GPU kernel. The exception is caught at the run_training level
-to attempt a checkpoint save.
+The first signal requests a coordinated stop. The trainer finishes its current
+forward/backward and ALL optimizer/scheduler updates before raising at a safe
+boundary. A stuck collective/kernel cannot produce a new consistent checkpoint:
+the timeout forces exit and leaves the previously published checkpoint intact.
 
 Key design decisions:
-- The handler only raises in the process that called install() (tracked via
+- The handler only runs in the process that called install() (tracked via
   PID). Forked dataloader workers inherit the handler but ignore the signal,
   preventing worker crashes.
 - After the first signal, subsequent rapid re-sends (torchrun sends SIGINT
   to the process group AND then again directly to each child) are silently
-  ignored. Default handlers are restored explicitly before the save attempt,
-  so a deliberate second Ctrl+C during the save will force immediate exit.
+  ignored for one second. A later repeat forces exit, as does another Ctrl+C
+  during the save, when the original signal handlers have been restored.
 """
 
 import logging
 import os
 import signal
 import threading
+import time
 from functools import wraps
 from typing import Any
 
@@ -34,20 +35,21 @@ DEFAULT_SHUTDOWN_TIMEOUT = 120
 
 
 class TrainingInterruptedError(Exception):
-    """Raised by the signal handler to interrupt training for checkpoint save."""
+    """Raised at a complete training-step boundary to save consistent state."""
 
 
 class GracefulShutdownHandler:
     """Manages graceful shutdown with checkpoint saving on interrupt.
 
-    First interrupt: raises TrainingInterruptedError to break out of stuck code.
-    Subsequent rapid signals (from torchrun re-sends): silently ignored.
+    First interrupt: request a stop after the current complete step.
+    Subsequent rapid signals (from torchrun re-sends): ignored for one second.
     After restore(): default handlers are active, so another Ctrl+C kills.
     """
 
     def __init__(self, timeout: int = DEFAULT_SHUTDOWN_TIMEOUT):
         self._interrupted = False
-        self._lock = threading.Lock()
+        self._requested_at = 0.0
+        self._timer: threading.Timer | None = None
         self._original_sigint: Any = None
         self._original_sigterm: Any = None
         self._timeout = timeout
@@ -79,19 +81,42 @@ class GracefulShutdownHandler:
         if os.getpid() != self._owner_pid:
             return
 
-        sig_name = signal.Signals(signum).name
-        with self._lock:
-            if self._interrupted:
-                # Already interrupted. Ignore rapid re-sends from torchrun.
-                # Default handlers will be restored via restore() before the
-                # save attempt, so a deliberate second Ctrl+C will force exit.
-                return
-            self._interrupted = True
-            logger.warning(
-                f"Received {sig_name} — interrupting training to save checkpoint. "
-                "Send again to force immediate exit."
+        if self._interrupted:
+            if time.monotonic() - self._requested_at >= 1.0:
+                os._exit(128 + signum)
+            return
+        self._interrupted = True
+        self._requested_at = time.monotonic()
+        self.start_watchdog()
+        logger.warning(
+            "Received %s — stopping after the current complete training step. "
+            "Repeat after one second to force exit without a new checkpoint; "
+            "shutdown timeout is %ss.",
+            signal.Signals(signum).name,
+            self.timeout,
+        )
+
+    @property
+    def interrupted(self) -> bool:
+        return self._interrupted
+
+    def start_watchdog(self):
+        if self._timer is not None:
+            return
+
+        def expire():
+            logger.error(
+                "Safe shutdown timed out after %ss — forcing exit", self.timeout
             )
-            raise TrainingInterruptedError(sig_name)
+            os._exit(1)
+
+        self._timer = threading.Timer(self.timeout, expire)
+        self._timer.daemon = True
+        self._timer.start()
+
+    def cancel_watchdog(self):
+        if self._timer is not None:
+            self._timer.cancel()
 
     @property
     def timeout(self) -> int:
@@ -112,6 +137,8 @@ def with_graceful_shutdown(
         @wraps(fn)
         def wrapper(self, *args, **kwargs):
             handler = GracefulShutdownHandler(timeout=timeout)
+            previous_handler = getattr(self, "_shutdown_handler", None)
+            self._shutdown_handler = handler
             handler.install()
 
             try:
@@ -124,16 +151,7 @@ def with_graceful_shutdown(
                     f"(timeout={handler.timeout}s, send Ctrl+C again to force exit)..."
                 )
 
-                def _watchdog():
-                    logger.error(
-                        f"Interrupt checkpoint save timed out after {handler.timeout}s "
-                        "— forcing exit"
-                    )
-                    os._exit(1)
-
-                timer = threading.Timer(handler.timeout, _watchdog)
-                timer.daemon = True
-                timer.start()
+                handler.start_watchdog()
 
                 try:
                     self.maybe_save_checkpoint(save_label)
@@ -143,8 +161,10 @@ def with_graceful_shutdown(
                     )
                 except Exception:
                     logger.exception("Failed to save interrupt checkpoint")
-                finally:
-                    timer.cancel()
+            finally:
+                handler.cancel_watchdog()
+                handler.restore()
+                self._shutdown_handler = previous_handler
 
         return wrapper
 

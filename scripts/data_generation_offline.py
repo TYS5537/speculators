@@ -20,16 +20,19 @@ import shutil
 import sys
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import openai
 from datasets import load_from_disk
-from safetensors.torch import load_file
+from safetensors.torch import load_file, save_file
 from tqdm import tqdm
 
 from speculators.data_generation.offline import (
+    align_hidden_states,
     check_hidden_states,
     get_existing_hidden_state_indices,
     get_indices_to_process,
+    validate_existing_hidden_states,
 )
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
@@ -192,6 +195,21 @@ def parse_args():
     return parser.parse_args()
 
 
+def _publish_hidden_states(
+    source: str, target: Path, prefix: dict | None = None
+) -> None:
+    # The source can be on another filesystem: copying directly to hs_i would
+    # expose an incomplete cache after interruption. Only rename once complete.
+    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
+    if prefix is None:
+        shutil.move(source, temporary)
+    else:
+        save_file(prefix, temporary)
+    temporary.replace(target)
+    if prefix is not None:
+        Path(source).unlink()
+
+
 async def worker(  # noqa: C901
     client,
     model: str,
@@ -238,19 +256,32 @@ async def worker(  # noqa: C901
                 await wait_for_lock_async(lock_path)
 
             async with write_semaphore:  # Limit number of active disk writes
-                await asyncio.to_thread(
-                    shutil.move, hidden_states_path, target_hidden_states_path
-                )
-                if validate_outputs:
+                allow_prefix = item.get("messages") is not None
+                prefix = None
+                if validate_outputs or allow_prefix:
 
                     def _load_and_check(
-                        path=target_hidden_states_path,
+                        path=hidden_states_path,
                         tokens=item["input_ids"],
+                        allow_prefix=allow_prefix,
                     ):
                         loaded = load_file(path)
+                        if allow_prefix:
+                            return align_hidden_states(
+                                loaded, tokens, allow_prefix=True
+                            )
                         check_hidden_states(loaded, tokens)
+                        return None
 
-                    await asyncio.to_thread(_load_and_check)
+                    prefix = await asyncio.to_thread(_load_and_check)
+                # Only validated output may acquire the reusable cache name.
+                # On validation failure the source remains available for diagnosis.
+                await asyncio.to_thread(
+                    _publish_hidden_states,
+                    hidden_states_path,
+                    target_hidden_states_path,
+                    prefix,
+                )
         except Exception as e:
             if fail_on_error:
                 logger.exception(
@@ -325,6 +356,23 @@ async def generate_and_save_hidden_states(args, dataset):
 
     existing_file_indices = get_existing_hidden_state_indices(hidden_states_dir)
     num_samples = len(dataset)
+    if args.validate_outputs:
+        requested = set(
+            get_indices_to_process(
+                num_samples, args.max_samples, [], args.world_size, args.rank
+            )
+        )
+        local_existing = [
+            index for index in existing_file_indices if index in requested
+        ]
+        valid_existing = await asyncio.to_thread(
+            validate_existing_hidden_states,
+            hidden_states_dir,
+            dataset,
+            local_existing,
+        )
+        invalid = set(local_existing) - set(valid_existing)
+        existing_file_indices = [i for i in existing_file_indices if i not in invalid]
 
     to_process = get_indices_to_process(
         num_samples,

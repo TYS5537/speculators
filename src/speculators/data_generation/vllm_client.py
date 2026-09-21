@@ -94,6 +94,8 @@ def with_retries(fn):
 def extract_output(
     response: Completion | ChatCompletion,
     token_ids: list[int],
+    *,
+    allow_prefix: bool = False,
 ) -> str:
     if isinstance(response, Completion):
         prompt_token_ids = getattr(response.choices[0], "prompt_token_ids", None)
@@ -103,7 +105,10 @@ def extract_output(
     if prompt_token_ids is None:
         raise InvalidResponseError("Response missing prompt_token_ids")
 
-    if prompt_token_ids != token_ids:
+    compared_ids = (
+        prompt_token_ids[: len(token_ids)] if allow_prefix else prompt_token_ids
+    )
+    if compared_ids != token_ids:
         raise InvalidResponseError(
             f"Prompt token IDs mismatch: expected {token_ids}, got {prompt_token_ids}"
         )
@@ -202,7 +207,8 @@ async def generate_hidden_states_async(
             max_tokens=1,
             extra_body={
                 "add_generation_prompt": False,
-                "continue_final_message": True,
+                # Match preprocessing: retain the final message's end tokens.
+                "continue_final_message": False,
                 "return_token_ids": True,
             },
             timeout=timeout,
@@ -214,7 +220,7 @@ async def generate_hidden_states_async(
     else:
         res = await coro
 
-    return extract_output(res, token_ids)
+    return extract_output(res, token_ids, allow_prefix=messages is not None)
 
 
 @with_retries
@@ -248,10 +254,11 @@ def generate_hidden_states(
             max_tokens=1,
             extra_body={
                 "add_generation_prompt": False,
-                "continue_final_message": True,
+                # Match preprocessing: retain the final message's end tokens.
+                "continue_final_message": False,
                 "return_token_ids": True,
             },
             timeout=timeout,
         )
 
-    return extract_output(res, token_ids)
+    return extract_output(res, token_ids, allow_prefix=messages is not None)
