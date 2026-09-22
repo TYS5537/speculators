@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import math
 import re
+from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from uuid import uuid4
@@ -109,6 +110,8 @@ class DSV4OfflineTarget:
         timeout=120.0,
         keep_hidden_states=False,
         verification_mode="reference",
+        hs_http_endpoint=None,
+        hs_http_token=None,
     ):
         import torch  # noqa: PLC0415
 
@@ -132,6 +135,8 @@ class DSV4OfflineTarget:
             timeout=timeout,
             keep_hidden_states=keep_hidden_states,
             verification_mode=verification_mode,
+            hs_http_endpoint=hs_http_endpoint,
+            hs_http_token=hs_http_token,
         )
 
     @classmethod
@@ -147,6 +152,8 @@ class DSV4OfflineTarget:
         timeout=120.0,
         keep_hidden_states=False,
         verification_mode="reference",
+        hs_http_endpoint=None,
+        hs_http_token=None,
     ):
         """Create strict CPU transport for teacher diagnostics without a drafter."""
         import torch  # noqa: PLC0415
@@ -164,6 +171,8 @@ class DSV4OfflineTarget:
             timeout=timeout,
             keep_hidden_states=keep_hidden_states,
             verification_mode=verification_mode,
+            hs_http_endpoint=hs_http_endpoint,
+            hs_http_token=hs_http_token,
         )
         return target
 
@@ -179,12 +188,26 @@ class DSV4OfflineTarget:
         timeout,
         keep_hidden_states,
         verification_mode,
+        hs_http_endpoint,
+        hs_http_token,
     ):
         self.layer_ids = list(layer_ids)
         validate_layers(self.layer_ids)
         self.hidden_states_path = Path(hidden_states_path).resolve()
         manifest = make_manifest(report, self.layer_ids)
-        ensure_manifest(self.hidden_states_path, manifest)
+        self.http_transfer = None
+        if hs_http_endpoint:
+            from speculators_dsv4.hs_http import HttpHiddenStates  # noqa: PLC0415
+
+            self.http_transfer = HttpHiddenStates(
+                hs_http_endpoint,
+                hs_http_token,
+                self.hidden_states_path,
+                timeout=timeout,
+            )
+            self.http_transfer.validate_manifest(manifest)
+        else:
+            ensure_manifest(self.hidden_states_path, manifest)
         self.packet_layer_ids = [*self.layer_ids, manifest["teacher_hs_id"]]
         if max_model_len <= 1 or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Invalid target context limit or request timeout")
@@ -243,13 +266,47 @@ class DSV4OfflineTarget:
         if getattr(response, "model", None) != self.model_name:
             raise ValueError("Target response model alias mismatch")
 
+    def _new_request_id(self):
+        return (
+            self.http_transfer.new_request_id()
+            if self.http_transfer is not None
+            else uuid4().hex
+        )
+
+    @contextmanager
+    def _artifact(self, handle, request_id, *, block=False, download=True):
+        if self.http_transfer is not None:
+            with self.http_transfer.artifact(
+                handle, request_id, keep=self.keep_hidden_states, download=download
+            ) as path:
+                yield path
+            return
+        path = request_hidden_file(handle, self.hidden_states_path, request_id)
+        lock_path = str(path) + ".lock"
+        if Path(lock_path).exists():
+            if block:
+                raise ValueError(
+                    "Target block packet must be complete without a writer lock"
+                )
+            from hs_connectors.transfer import wait_for_lock  # noqa: PLC0415
+
+            # On timeout leave files intact, rather than racing the writer.
+            wait_for_lock(lock_path, timeout=self.timeout)
+        try:
+            yield path
+        finally:
+            if not self.keep_hidden_states and path.exists():
+                if block:
+                    path.unlink()
+                else:
+                    from hs_connectors import FileTransfer  # noqa: PLC0415
+
+                    FileTransfer(self.hidden_states_path).delete(str(path))
+
     def _request(self, prefix, need_hidden):
         import torch  # noqa: PLC0415
-        from hs_connectors.transfer import wait_for_lock  # noqa: PLC0415
 
-        from hs_connectors import FileTransfer  # noqa: PLC0415
-
-        request_id = uuid4().hex
+        request_id = self._new_request_id()
         self.num_target_requests += 1
         response = self.client.completions.create(
             model=self.model_name,
@@ -278,18 +335,11 @@ class DSV4OfflineTarget:
         )
         self._validate_response(response, request_id)
         transfer_params = getattr(response, "kv_transfer_params", None) or {}
-        path = request_hidden_file(
+        with self._artifact(
             transfer_params.get("hidden_states_path"),
-            self.hidden_states_path,
             request_id,
-        )
-        lock_path = str(path) + ".lock"
-        # Even a discarded intermediate request may still be writing its HS.
-        # On timeout, leave its files intact rather than racing the writer.
-        if Path(lock_path).exists():
-            wait_for_lock(lock_path, timeout=self.timeout)
-        transfer = FileTransfer(self.hidden_states_path)
-        try:
+            download=need_hidden,
+        ) as path:
             choice = response.choices[0]
             if getattr(choice, "prompt_token_ids", None) != prefix:
                 raise ValueError("Target changed/truncated the requested token prefix")
@@ -299,7 +349,14 @@ class DSV4OfflineTarget:
             logprobs = parse_full_logprobs(top[0], self.vocab_size)
             if not need_hidden:
                 return logprobs, None
-            payload = transfer.get_generated(str(path))
+            if self.http_transfer is not None:
+                from safetensors.torch import load_file  # noqa: PLC0415
+
+                payload = load_file(str(path), device="cpu")
+            else:
+                from hs_connectors import FileTransfer  # noqa: PLC0415
+
+                payload = FileTransfer(self.hidden_states_path).get_generated(str(path))
             if payload is None or payload["token_ids"].tolist() != prefix:
                 raise ValueError(
                     "Target HS file is missing or its token IDs do not match"
@@ -316,9 +373,6 @@ class DSV4OfflineTarget:
             ):
                 raise ValueError("Target hidden states must be finite BF16 tensors")
             return logprobs, hidden
-        finally:
-            if not self.keep_hidden_states and path.exists():
-                transfer.delete(str(path))
 
     def _validate_block_packet(self, packet, prefix, logits_start, hidden_start):
         import torch  # noqa: PLC0415
@@ -388,7 +442,7 @@ class DSV4OfflineTarget:
     def _request_block(self, prefix, *, logits_start, hidden_start):
         from safetensors.torch import load_file  # noqa: PLC0415
 
-        request_id = uuid4().hex
+        request_id = self._new_request_id()
         self.num_target_requests += 1
         response = self.client.completions.create(
             model=self.model_name,
@@ -429,26 +483,16 @@ class DSV4OfflineTarget:
             # A legacy service may still own an asynchronous HS writer. Only a
             # confirmed block response promises that it is safe to remove its file.
             raise ValueError("Target did not confirm the DSV4 block protocol version")
-        path = request_hidden_file(
+        with self._artifact(
             transfer_params.get("hidden_states_path"),
-            self.hidden_states_path,
             request_id,
-        )
-        # Block packets must be atomically complete before the HTTP response.
-        # A legacy/in-progress writer is not safe to read or clean up here.
-        if Path(str(path) + ".lock").exists():
-            raise ValueError(
-                "Target block packet must be complete without a writer lock"
-            )
-        try:
+            block=True,
+        ) as path:
             if getattr(response.choices[0], "prompt_token_ids", None) != prefix:
                 raise ValueError("Target changed/truncated the requested token prefix")
             return self._validate_block_packet(
                 load_file(str(path), device="cpu"), prefix, logits_start, hidden_start
             )
-        finally:
-            if not self.keep_hidden_states:
-                path.unlink(missing_ok=True)
 
     def __call__(
         self,

@@ -77,6 +77,12 @@ class EvalWorkerTests(unittest.TestCase):
         self.assertEqual(count, 8)
         self.assertEqual(env["ASCEND_RT_VISIBLE_DEVICES"], str(index + 8))
         self.assertEqual(env["OPENAI_API_KEY"], "fixture-private-key")
+        if self.args.hs_http_endpoint:
+            self.assertEqual(env["DSV4_HS_HTTP_TOKEN"], "fixture-hs-token")
+            self.assertEqual(
+                self.flag(command, "--hs-http-endpoint"), self.args.hs_http_endpoint
+            )
+            self.assertNotIn("fixture-hs-token", command)
         self.assertNotIn("--ascend-devices", command)  # No recursive spawning.
         for flag, value in (
             ("--device", "npu:0"),
@@ -119,10 +125,16 @@ class EvalWorkerTests(unittest.TestCase):
         return Mock(poll=Mock(return_value=0), wait=Mock(return_value=0))
 
     def test_eight_workers_merge_uneven_and_empty_shards_in_both_modes(self):
-        for mode in ("block", "reference"):
+        for mode, endpoint in (
+            ("block", None),
+            ("reference", None),
+            ("block", "http://hs.fixture:8002"),
+            ("reference", "http://hs.fixture:8002"),
+        ):
             for limit in (4, 11):
                 with self.subTest(mode=mode, limit=limit):
                     self.args.dsv4_verification_mode = mode
+                    self.args.hs_http_endpoint = endpoint
                     self.args.max_samples = limit
                     with (
                         patch.object(
@@ -135,6 +147,7 @@ class EvalWorkerTests(unittest.TestCase):
                             {
                                 "ASCEND_RT_VISIBLE_DEVICES": "0,1",
                                 "OPENAI_API_KEY": "fixture-private-key",
+                                "DSV4_HS_HTTP_TOKEN": "fixture-hs-token",
                             },
                         ),
                     ):
@@ -174,6 +187,36 @@ class EvalWorkerTests(unittest.TestCase):
                 ):
                     self.module.run_ascend_data_parallel(self.args)
                 launch.assert_not_called()
+
+    def test_http_options_fail_early_and_metadata_excludes_secret(self):
+        self.args.hs_http_endpoint = "http://hs.fixture:8002"
+        self.args.hidden_states_path = None
+        with (
+            patch.dict(self.module.os.environ, {}, clear=True),
+            self.assertRaisesRegex(ValueError, "TOKEN"),
+        ):
+            self.module._prepare_hs_http(self.args, "dsv4-vllm")
+        secret = "fixture-hs-token-0123456789abcdef0123456789"
+        with patch.dict(self.module.os.environ, {"DSV4_HS_HTTP_TOKEN": secret}):
+            self.assertEqual(
+                self.module._prepare_hs_http(self.args, "dsv4-vllm"),
+                self.args.hs_http_endpoint,
+            )
+            self.module._write_backend_metadata(
+                self.args,
+                {
+                    "model_path": "fixture-target",
+                    "checkpoint_signature": "fixture",
+                },
+            )
+        self.assertEqual(
+            self.args.hidden_states_path, self.args.output_dir / "target-hs-downloads"
+        )
+        metadata = (self.args.output_dir / "eval_backend.json").read_text()
+        self.assertNotIn(secret, metadata)
+        self.assertEqual(json.loads(metadata)["hs_transport"], "http")
+        with self.assertRaisesRegex(ValueError, "requires"):
+            self.module._prepare_hs_http(self.args, "hf")
 
     def test_failed_worker_stops_siblings_without_waiting_for_first_worker(self):
         healthy = Mock(poll=Mock(return_value=None))

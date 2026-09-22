@@ -6,6 +6,7 @@ import importlib.util
 import json
 import math
 import sys
+import threading
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -15,8 +16,117 @@ from safetensors.torch import save_file
 
 from speculators_dsv4 import HS_FORMAT
 from speculators_dsv4 import offline as backend
+from speculators_dsv4.contract import MANIFEST, make_manifest
+from speculators_dsv4.hs_http_server import HiddenStatesServer
 
 ROOT = Path(__file__).resolve().parents[3]
+
+
+@pytest.mark.parametrize("mode", ["reference", "block"])
+@pytest.mark.parametrize("keep", [False, True])
+def test_real_http_transport_preserves_reference_and_block_tensors(
+    target_fixture, tmp_path, mode, keep
+):
+    report = target_fixture.report
+    layers = target_fixture.draft.target_layer_ids
+    remote, local = tmp_path / "http-server", tmp_path / "downloads"
+    remote.mkdir()
+    (remote / MANIFEST).write_text(json.dumps(make_manifest(report, layers)))
+    training_cache = remote / "hs_0.safetensors"
+    training_cache.write_bytes(b"training cache must survive")
+    token = "fixture-secret-0123456789abcdef0123456789"
+    server = HiddenStatesServer(("127.0.0.1", 0), remote, token)
+    thread = threading.Thread(
+        target=server.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+    )
+    thread.start()
+    paths = []
+
+    def create(**kwargs):
+        prefix = kwargs["prompt"]
+        request_id = kwargs["extra_body"]["request_id"]
+        assert request_id.startswith("hshttp-")
+        path = remote / f"cmpl-{request_id}-0.safetensors"
+        paths.append(path)
+        if mode == "block":
+            block = kwargs["extra_body"]["kv_transfer_params"]["dsv4_block_verify"]
+            start, hidden_start = block["logits_start"], block["hidden_start"]
+            packet = {
+                "token_ids": torch.tensor(prefix, dtype=torch.int64),
+                "verification_metadata": torch.tensor(
+                    [1, len(prefix), start, hidden_start]
+                ),
+                "layer_ids": torch.tensor([*layers, 43]),
+                "logprobs": torch.stack(
+                    [
+                        _native_logprobs(prefix[: i + 1])
+                        for i in range(start, len(prefix))
+                    ]
+                ),
+                "hidden_states": _hidden_for(prefix)[hidden_start:].contiguous(),
+            }
+            transfer = {"hidden_states_path": str(path), "dsv4_block_verify_version": 1}
+            choice = SimpleNamespace(prompt_token_ids=prefix)
+        else:
+            packet = {
+                "token_ids": torch.tensor(prefix),
+                "hidden_states": _hidden_for(prefix).contiguous(),
+            }
+            transfer = {"hidden_states_path": str(path)}
+            top = {
+                f"token_id:{i}": value
+                for i, value in enumerate(_native_logprobs(prefix).tolist())
+            }
+            choice = SimpleNamespace(
+                prompt_token_ids=prefix, logprobs=SimpleNamespace(top_logprobs=[top])
+            )
+        save_file(packet, str(path))
+        return SimpleNamespace(
+            id=f"cmpl-{request_id}",
+            model="served-target",
+            choices=[choice],
+            kv_transfer_params=transfer,
+        )
+
+    try:
+        target = backend.DSV4OfflineTarget.from_contract(
+            report,
+            layers,
+            hidden_states_path=local,
+            client=SimpleNamespace(completions=SimpleNamespace(create=create)),
+            model_name="served-target",
+            max_model_len=64,
+            hs_http_endpoint=f"http://127.0.0.1:{server.server_port}",
+            hs_http_token=token,
+            verification_mode=mode,
+            keep_hidden_states=keep,
+        )
+        cache = target.new_cache()
+        for tokens in ([2, 0], [1, 3, 4], [0, 2]):
+            start = len(cache.tokens)
+            output = _forward(target, cache, tokens)
+            logits_start = start if start else len(tokens) - 1
+            expected = torch.stack(
+                [
+                    _native_logprobs(cache.tokens[: i + 1])
+                    for i in range(logits_start, len(cache.tokens))
+                ]
+            ).unsqueeze(0)
+            torch.testing.assert_close(output.logits, expected)
+            for slot, layer in enumerate(layers):
+                torch.testing.assert_close(
+                    output.hidden_states[layer],
+                    _hidden_for(cache.tokens)[start:, slot].unsqueeze(0),
+                )
+            if tokens == [1, 3, 4]:
+                cache.crop(4)
+        assert all(path.exists() is keep for path in paths)
+        assert training_cache.read_bytes() == b"training cache must survive"
+        assert list(local.iterdir()) == []
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
 
 
 def _load_evaluator():

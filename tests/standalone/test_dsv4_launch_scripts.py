@@ -190,6 +190,7 @@ class LaunchScriptTests(unittest.TestCase):
             "common/ascend_training_env.sh",
             "../evaluate/dspark_dsv4_offline_eval.sh",
             "../evaluate/dspark_dsv4_single_eval.sh",
+            "dspark_dsv4_hs_http_server.sh",
         ):
             script = ROOT / "examples/train" / relative
             with self.subTest(script=relative):
@@ -233,6 +234,7 @@ class LaunchScriptTests(unittest.TestCase):
                             "ALLOW_SHARED_DEVICE": "0",
                             "SKIP_ARTIFACTS": "0",
                             "DRY_RUN": "0",
+                            "HS_HTTP_ENDPOINT": "",
                         }
                     )
                     # Capture the final argv; never invoke Python or a target service.
@@ -267,6 +269,60 @@ class LaunchScriptTests(unittest.TestCase):
                             )
                         else:
                             self.assertNotIn("--ascend-devices", args)
+
+    def test_http_eval_and_sidecar_wiring_without_shared_storage(self):
+        for sidecar in (False, True):
+            relative = (
+                "train/dspark_dsv4_hs_http_server.sh"
+                if sidecar
+                else "evaluate/dspark_dsv4_offline_eval.sh"
+            )
+            script = ROOT / "examples" / relative
+            environment = _shell_environment(
+                {
+                    "VERIFIER_MODEL": "/fixture/target",
+                    "DRAFT_MODEL": "/fixture/draft",
+                    "DATASETS_ROOT": "/fixture/eval",
+                    "HS_PATH": "/target/hs" if sidecar else "",
+                    "VLLM_ENDPOINT": "http://target.fixture:8001/v1",
+                    "EVAL_NPU": "8,9",
+                    "HS_HTTP_ENDPOINT": "http://target.fixture:8002",
+                    "HS_HTTP_HOST": "10.0.0.10",
+                    "HS_HTTP_PORT": "8002",
+                    "DSV4_HS_HTTP_TOKEN": "fixture-secret-01234567890123456789",
+                    "OUTPUT_DIR": "/eval/output",
+                    "KEEP_TARGET_HS": "0",
+                }
+            )
+            source = r"""exec() { printf '%s\0' "$@"; }"""
+            source += f"\nsource {shlex.quote(script.as_posix())}\n"
+            result = subprocess.run(  # noqa: S603 -- Fake exec, no service startup.
+                [BASH, "--noprofile", "--norc"],
+                input=source,
+                cwd=self.root,
+                env=environment,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            args = result.stdout.split("\0")[:-1]
+            self.assertNotIn(environment["DSV4_HS_HTTP_TOKEN"], args)
+            if sidecar:
+                self.assertIn("speculators_dsv4.hs_http_server", args)
+                self.assertEqual(args[args.index("--host") + 1], "10.0.0.10")
+                self.assertNotIn("scripts/launch_vllm.py", args)
+            else:
+                self.assertEqual(
+                    args[args.index("--hs-http-endpoint") + 1],
+                    "http://target.fixture:8002",
+                )
+                self.assertEqual(
+                    args[args.index("--hidden-states-path") + 1],
+                    "/eval/output/target-hs-downloads",
+                )
+                self.assertEqual(args[args.index("--ascend-devices") + 1], "8,9")
 
     def test_inherited_shell_startup_is_not_executed(self):
         startup, marker = self.root / "startup.sh", self.root / "startup-ran"

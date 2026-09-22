@@ -1849,6 +1849,8 @@ def _target_worker_args(args: argparse.Namespace) -> list[str]:
         result.extend(["--served-model-name", args.served_model_name])
     if args.keep_target_hs:
         result.append("--keep-target-hs")
+    if getattr(args, "hs_http_endpoint", None):
+        result.extend(["--hs-http-endpoint", args.hs_http_endpoint])
     return result
 
 
@@ -2060,6 +2062,8 @@ def _write_backend_metadata(args, report):
         "target_model": report["model_path"],
         "checkpoint_signature": report["checkpoint_signature"],
         "hidden_states_path": str(Path(args.hidden_states_path).resolve()),
+        "hs_transport": "http" if getattr(args, "hs_http_endpoint", None) else "file",
+        "hs_http_endpoint": getattr(args, "hs_http_endpoint", None),
         "max_model_len": args.dsv4_max_model_len,
         "temperature": args.temperature,
         "top_p": 1.0,
@@ -2077,9 +2081,28 @@ def run(args: argparse.Namespace) -> None:
         _run(args, resources)
 
 
+def _prepare_hs_http(args, target_backend):
+    endpoint = getattr(args, "hs_http_endpoint", None)
+    if not endpoint:
+        return None
+    from speculators_dsv4.hs_http import (  # noqa: PLC0415
+        validate_endpoint,
+        validate_token,
+    )
+
+    if target_backend != "dsv4-vllm":
+        raise ValueError("--hs-http-endpoint requires --target-backend dsv4-vllm")
+    args.hs_http_endpoint = validate_endpoint(endpoint)
+    validate_token(os.environ.get("DSV4_HS_HTTP_TOKEN"))
+    if not args.hidden_states_path:
+        args.hidden_states_path = args.output_dir / "target-hs-downloads"
+    return args.hs_http_endpoint
+
+
 def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     global torch, DynamicCache
     target_backend = getattr(args, "target_backend", "hf")
+    hs_http_endpoint = _prepare_hs_http(args, target_backend)
     target_config = _validate_target_cache_support(args.verifier_model, target_backend)
     report = None
     if target_backend == "dsv4-vllm":
@@ -2196,6 +2219,8 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
             timeout=args.target_request_timeout,
             keep_hidden_states=args.keep_target_hs,
             verification_mode=args.dsv4_verification_mode,
+            hs_http_endpoint=hs_http_endpoint,
+            hs_http_token=os.environ.get("DSV4_HS_HTTP_TOKEN"),
         )
         endpoint = urlsplit(args.vllm_endpoint)
         root_path = endpoint.path.rstrip("/").removesuffix("/v1")
@@ -2292,6 +2317,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-backend", choices=["hf", "dsv4-vllm"], default="hf")
     parser.add_argument("--vllm-endpoint", default=None)
     parser.add_argument("--hidden-states-path", type=Path, default=None)
+    parser.add_argument(
+        "--hs-http-endpoint",
+        default=None,
+        help="Optional authenticated HS sidecar URL (not the vLLM /v1 URL). "
+        "Use DSV4_HS_HTTP_TOKEN; --hidden-states-path becomes "
+        "a local download directory.",
+    )
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--dsv4-max-model-len", type=int, default=4096)
     parser.add_argument(

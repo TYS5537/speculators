@@ -17,7 +17,16 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 : "${VERIFIER_MODEL:?Set VERIFIER_MODEL to the same shared DSV4 checkpoint as the HS server}"
 : "${DRAFT_MODEL:?Set DRAFT_MODEL to the trained DSV4 DSpark checkpoint}"
 : "${DATASETS_ROOT:?Set DATASETS_ROOT to a JSONL file or directory of JSONL files}"
-: "${HS_PATH:?Set HS_PATH to the shared HS server directory at the same absolute path}"
+# HTTP mode needs no shared HS mount. HS_PATH then holds temporary local downloads.
+# Export the same DSV4_HS_HTTP_TOKEN on both machines; never put it in CLI arguments.
+HS_HTTP_ENDPOINT="${HS_HTTP_ENDPOINT:-}"
+if [[ -n "$HS_HTTP_ENDPOINT" ]]; then
+  : "${DSV4_HS_HTTP_TOKEN:?Export the HS sidecar bearer token}"
+  export DSV4_HS_HTTP_TOKEN
+  HS_PATH="${HS_PATH:-${OUTPUT_DIR:-dspark_dsv4_reference_eval}/target-hs-downloads}"
+else
+  : "${HS_PATH:?Set HS_PATH to the shared HS server directory at the same absolute path}"
+fi
 : "${VLLM_ENDPOINT:?Set VLLM_ENDPOINT to the trusted target service URL ending in /v1}"
 # One draft worker per listed physical NPU; keep these separate from target devices.
 : "${EVAL_NPU:?Set EVAL_NPU to comma-separated evaluation-only NPU IDs}"
@@ -44,6 +53,9 @@ cmd=(
   --dtype bfloat16
   --draft-attn-impl sdpa
 )
+if [[ -n "$HS_HTTP_ENDPOINT" ]]; then
+  cmd+=(--hs-http-endpoint "$HS_HTTP_ENDPOINT")
+fi
 if [[ "$EVAL_NPU" == *,* ]]; then
   cmd+=(--ascend-devices "$EVAL_NPU")
 fi

@@ -1078,6 +1078,92 @@ real A3 hardware; follow the checks at the end of this document on the first run
 Run `block` and `reference` with the same checkpoint, quantization, data, and seed,
 then check probabilities and HS alignment before increasing the sample count.
 
+### HTTP HS transfer without a shared filesystem (optional)
+
+Remote **evaluation** can download HS files over HTTP instead of mounting the
+target's HS directory. This does not change training's existing file backend,
+load another target, or restart/reconfigure vLLM. Use
+`dspark_dsv4_offline_eval.sh`, not the managed `single_eval` launcher.
+
+The existing target must already provide the matching evaluation protocol:
+`DSV4_EVAL=1` (or equivalent full-vocabulary raw-logprob options) for reference,
+or the dedicated block-verification service for block. Adding the HTTP sidecar
+does **not** enable these features on a training-only service. Do not interrupt
+an active training job to change the target's startup options.
+
+On the **target host**, deploy this checkout and start the CPU-only sidecar:
+
+```bash
+# Supply the same independently generated random secret on both hosts through
+# your secret manager, or enter it without echo/history. Do not commit the key.
+read -rsp 'HS HTTP token (at least 32 characters): ' DSV4_HS_HTTP_TOKEN; echo
+export DSV4_HS_HTTP_TOKEN
+export HS_PATH=/target/local/hidden_states  # Existing target HS directory.
+export HS_HTTP_HOST=10.0.0.10              # Target's reachable private interface.
+export HS_HTTP_PORT=8002                  # Separate from the vLLM port.
+bash examples/train/dspark_dsv4_hs_http_server.sh
+```
+
+The default bind address is loopback. Plain HTTP carries the token and tensors
+without encryption: use only a trusted LAN/VPN, or put a TLS reverse proxy in
+front and use an `https://` endpoint. Do not expose this small sidecar directly
+to the public Internet. It performs no NPU allocation. On a multi-host target,
+the sidecar must still see artifacts from **all** target DP ranks (for example,
+the existing target-side shared HS directory).
+
+On the **evaluation host**, keep the usual model/data variables and add:
+
+```bash
+read -rsp 'Same HS HTTP token: ' DSV4_HS_HTTP_TOKEN; echo
+export DSV4_HS_HTTP_TOKEN
+export VLLM_ENDPOINT=http://10.0.0.10:8001/v1
+export HS_HTTP_ENDPOINT=http://10.0.0.10:8002  # No /v1 suffix here.
+export HS_PATH=/eval/local/hs-downloads       # Local temporary downloads, not NFS.
+export VERIFICATION_MODE=reference
+export EVAL_NPU=0                            # An evaluation-only device.
+bash examples/evaluate/dspark_dsv4_offline_eval.sh
+```
+
+In HTTP mode, `HS_PATH` may be omitted; it defaults beneath `OUTPUT_DIR`.
+Unset `HS_HTTP_ENDPOINT` to keep the previous shared-file behavior unchanged.
+The Python equivalent is `--hs-http-endpoint URL`. The secret comes only from
+`DSV4_HS_HTTP_TOKEN`, never a CLI argument or saved metadata; multi-NPU workers
+inherit it. `OPENAI_API_KEY`, if needed by vLLM, remains a separate credential.
+
+Only HS storage becomes remote: the evaluator still needs local access to the
+draft checkpoint and the matching verifier checkpoint/IO weights. Existing
+model-path and checkpoint-signature checks remain strict. Copies must retain
+the same expected absolute model path and signature-relevant file metadata;
+this is not a model-path migration or remote weight-loading feature.
+
+The sidecar exposes only `cmpl-hshttp-<random-request-id>-0[...].safetensors`,
+never directory listings, `hs_<index>` training caches, or ordinary completion
+artifacts. It waits for producer locks, rejects traversal/symlinks/hard links,
+and refuses a changed target manifest. Downloads are streamed to private
+temporary directories. Keep the reference target's default producer
+synchronization locks enabled (`use_synchronization_lock=true`); an unlocked
+asynchronous writer cannot be made safe by the HTTP reader. Downloads use a size
+limit and SHA-256 verification before tensor loading. Redirects and environment
+HTTP proxies are disabled. The default file
+limit is 512 MiB; larger contexts may require a coordinated client/server limit
+change. This is a safety limit, not a per-request memory reservation.
+
+Successful consumption deletes only the corresponding HTTP evaluation artifact.
+`KEEP_TARGET_HS=1` retains it on the **target**; local temporary copies are always
+removed. Interrupted downloads or failed cleanup can leave HTTP evaluation
+artifacts on the target: inspect and remove only that dedicated namespace after
+the evaluation has stopped, never bulk-clear a live training HS directory.
+For reference steps that do not use HS, the evaluator avoids downloading the
+tensor file and only requests safe cleanup.
+
+Transfer preserves the binary tensors and the existing probability/HS checks;
+it does not quantize or alter acceptance statistics. It does add network and
+disk overhead, and shared target requests still compete with training. A full
+2048-token, six-layer BF16 HS packet is about 96 MiB before metadata; reference
+evaluation can issue many requests. Timing is **not** online decoding throughput.
+Start with one worker and a few samples. Loopback transport and tensor tests do
+not replace validation on the actual two-host network and Ascend deployment.
+
 ### Connecting to an existing service manually (advanced use)
 
 If you already maintain a separate HS service or need two machines, use the
