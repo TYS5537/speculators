@@ -6,6 +6,10 @@
 # Full-prefix target recomputation and file/API transfers are NOT serving speed.
 set -euo pipefail
 
+# Dataset selection: edit the comma-separated JSONL names/stems here.
+# Environment overrides are supported; DATASETS="" evaluates all discovered files.
+DATASETS="${DATASETS-gsm8k,math500}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
@@ -13,7 +17,7 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 : "${VERIFIER_MODEL:?Set VERIFIER_MODEL to the same shared DSV4 checkpoint as the HS server}"
 : "${DRAFT_MODEL:?Set DRAFT_MODEL to the trained DSV4 DSpark checkpoint}"
 : "${DATASETS_ROOT:?Set DATASETS_ROOT to a JSONL file or directory of JSONL files}"
-: "${HS_PATH:?Set HS_PATH to the HS server's shared directory at the same absolute path}"
+: "${HS_PATH:?Set HS_PATH to the shared HS server directory at the same absolute path}"
 : "${VLLM_ENDPOINT:?Set VLLM_ENDPOINT to the trusted target service URL ending in /v1}"
 : "${EVAL_NPU:?Set EVAL_NPU to one evaluation-only NPU ID, separate from target devices}"
 

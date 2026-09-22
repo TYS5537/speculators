@@ -4,6 +4,10 @@
 # This is not a serving-throughput benchmark and has not been verified on A3.
 set -euo pipefail
 
+# Dataset selection: edit the comma-separated JSONL names/stems here.
+# Environment overrides are supported; DATASETS="" evaluates all discovered files.
+DATASETS="${DATASETS-gsm8k,math500}"
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"

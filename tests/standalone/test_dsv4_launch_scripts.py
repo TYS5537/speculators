@@ -188,6 +188,8 @@ class LaunchScriptTests(unittest.TestCase):
             "dspark_dsv4_flash_bf16_trainer.sh",
             "dspark_qwen3_8b_trainer.sh",
             "common/ascend_training_env.sh",
+            "../evaluate/dspark_dsv4_offline_eval.sh",
+            "../evaluate/dspark_dsv4_single_eval.sh",
         ):
             script = ROOT / "examples/train" / relative
             with self.subTest(script=relative):
@@ -202,6 +204,54 @@ class LaunchScriptTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_eval_dataset_defaults_overrides_and_explicit_empty(self):
+        for kind in ("offline", "single"):
+            script = ROOT / f"examples/evaluate/dspark_dsv4_{kind}_eval.sh"
+            for datasets, expected in (
+                (None, "gsm8k,math500"),
+                ("aime24,humaneval", "aime24,humaneval"),
+                ("", ""),
+            ):
+                with self.subTest(kind=kind, datasets=datasets):
+                    environment = _shell_environment(
+                        {
+                            "VERIFIER_MODEL": "/fixture/target",
+                            "DRAFT_MODEL": "/fixture/draft",
+                            "DATASETS_ROOT": "/fixture/eval data",
+                            "DATASETS": datasets,
+                            "HS_PATH": "/fixture/hs",
+                            "VLLM_ENDPOINT": "http://target.fixture:8001/v1",
+                            "VLLM_NPUS": "0,1",
+                            "EVAL_NPU": "2",
+                            "KEEP_TARGET_HS": "0",
+                            "ALLOW_SHARED_DEVICE": "0",
+                            "SKIP_ARTIFACTS": "0",
+                            "DRY_RUN": "0",
+                        }
+                    )
+                    # Capture the final argv; never invoke Python or a target service.
+                    source = r"""exec() { printf '%s\0' "$@"; }"""
+                    source += f"\nsource {shlex.quote(script.as_posix())}\n"
+                    result = subprocess.run(  # noqa: S603 -- Fake exec only.
+                        [BASH, "--noprofile", "--norc"],
+                        input=source,
+                        cwd=self.root,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertTrue(result.stdout.endswith("\0"))
+                    args = result.stdout.split("\0")[:-1]
+                    self.assertEqual(args.count("--datasets"), 1 if expected else 0)
+                    if expected:
+                        self.assertEqual(args[args.index("--datasets") + 1], expected)
+                    self.assertEqual(
+                        args[args.index("--datasets-root") + 1], "/fixture/eval data"
+                    )
 
     def test_inherited_shell_startup_is_not_executed(self):
         startup, marker = self.root / "startup.sh", self.root / "startup-ran"
