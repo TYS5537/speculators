@@ -92,6 +92,8 @@ class PlanningTests(LauncherFixture):
         self.assertFalse(plan.shared_device)
         self.assertEqual(plan.target_devices, [0, 1, 2, 3])
         self.assertEqual(plan.eval_device, 4)
+        self.assertEqual(plan.eval_devices, [4])
+        self.assertNotIn("--ascend-devices", plan.eval_command)
         self.assertEqual(plan.target_env["ASCEND_RT_VISIBLE_DEVICES"], "0,1,2,3")
         self.assertEqual(plan.eval_env["ASCEND_RT_VISIBLE_DEVICES"], "4")
         self.assertEqual(self.flag(plan.target_command, "--host"), "127.0.0.1")
@@ -131,6 +133,54 @@ class PlanningTests(LauncherFixture):
             plan.public_metadata()["mode"], "single-host-managed-reference"
         )
 
+    def test_eight_eval_devices_share_target_without_changing_tp_or_block_batching(
+        self,
+    ):
+        for mode in ("block", "reference"):
+            with self.subTest(mode=mode):
+                plan = self.plan(
+                    "--eval-devices",
+                    "8,9,10,11,12,13,14,15",
+                    "--verification-mode",
+                    mode,
+                )
+                self.assertEqual(plan.eval_devices, list(range(8, 16)))
+                self.assertIsNone(plan.eval_device)
+                self.assertFalse(plan.shared_device)
+                self.assertEqual(plan.public_metadata()["eval_num_workers"], 8)
+                self.assertEqual(
+                    plan.public_metadata()["eval_devices"], list(range(8, 16))
+                )
+                self.assertEqual(
+                    plan.eval_env["ASCEND_RT_VISIBLE_DEVICES"],
+                    "8,9,10,11,12,13,14,15",
+                )
+                self.assertEqual(
+                    self.flag(plan.eval_command, "--ascend-devices"),
+                    "8,9,10,11,12,13,14,15",
+                )
+                self.assertEqual(self.flag(plan.eval_command, "--device"), "npu:0")
+                self.assertEqual(
+                    self.flag(plan.target_command, "--tensor-parallel-size"), "4"
+                )
+                self.assertEqual(self.flag(plan.target_command, "--max-num-seqs"), "1")
+
+    def test_overlap_checks_every_eval_device_not_only_the_first(self):
+        with self.assertRaisesRegex(ValueError, "allow-shared-device"):
+            self.plan("--eval-device", "4,3")
+        with self.assertRaisesRegex(ValueError, "memory-utilization"):
+            self.plan("--eval-device", "4,3", "--allow-shared-device")
+        plan = self.plan(
+            "--eval-device",
+            "4,3",
+            "--allow-shared-device",
+            "--target-memory-utilization",
+            "0.6",
+        )
+        self.assertTrue(plan.shared_device)
+        self.assertEqual(plan.eval_devices, [4, 3])
+        self.assertEqual(self.flag(plan.eval_command, "--ascend-devices"), "4,3")
+
     def test_unknown_verification_mode_is_rejected_before_target_start(self):
         with self.assertRaises(SystemExit), redirect_stderr(io.StringIO()):
             launcher.parse_args(self.argv("--verification-mode", "automatic"))
@@ -164,7 +214,11 @@ class PlanningTests(LauncherFixture):
             ("--target-devices", "0,"),
             ("--target-devices", "0,x"),
             ("--target-devices=-1",),
-            ("--eval-device", "4,5"),
+            ("--eval-device", ""),
+            ("--eval-device", "4,4"),
+            ("--eval-device", "4,"),
+            ("--eval-device", "4,x"),
+            ("--eval-device", "4,-1"),
             ("--target-tp-size", "2"),
         ):
             with self.subTest(extra=extra), self.assertRaises(ValueError):

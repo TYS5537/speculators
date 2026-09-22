@@ -205,15 +205,20 @@ class LaunchScriptTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_eval_dataset_defaults_overrides_and_explicit_empty(self):
-        for kind in ("offline", "single"):
+    def test_eval_dataset_and_device_wiring(self):
+        for kind, devices in (
+            ("offline", "2"),
+            ("single", "2"),
+            ("offline", "8,9,10,11,12,13,14,15"),
+            ("single", "8,9,10,11,12,13,14,15"),
+        ):
             script = ROOT / f"examples/evaluate/dspark_dsv4_{kind}_eval.sh"
             for datasets, expected in (
                 (None, "gsm8k,math500"),
                 ("aime24,humaneval", "aime24,humaneval"),
                 ("", ""),
             ):
-                with self.subTest(kind=kind, datasets=datasets):
+                with self.subTest(kind=kind, datasets=datasets, devices=devices):
                     environment = _shell_environment(
                         {
                             "VERIFIER_MODEL": "/fixture/target",
@@ -223,7 +228,7 @@ class LaunchScriptTests(unittest.TestCase):
                             "HS_PATH": "/fixture/hs",
                             "VLLM_ENDPOINT": "http://target.fixture:8001/v1",
                             "VLLM_NPUS": "0,1",
-                            "EVAL_NPU": "2",
+                            "EVAL_NPU": devices,
                             "KEEP_TARGET_HS": "0",
                             "ALLOW_SHARED_DEVICE": "0",
                             "SKIP_ARTIFACTS": "0",
@@ -252,6 +257,16 @@ class LaunchScriptTests(unittest.TestCase):
                     self.assertEqual(
                         args[args.index("--datasets-root") + 1], "/fixture/eval data"
                     )
+                    if kind == "single":
+                        self.assertEqual(args[args.index("--eval-device") + 1], devices)
+                    else:
+                        self.assertIn(f"ASCEND_RT_VISIBLE_DEVICES={devices}", args)
+                        if "," in devices:
+                            self.assertEqual(
+                                args[args.index("--ascend-devices") + 1], devices
+                            )
+                        else:
+                            self.assertNotIn("--ascend-devices", args)
 
     def test_inherited_shell_startup_is_not_executed(self):
         startup, marker = self.root / "startup.sh", self.root / "startup-ran"

@@ -19,7 +19,8 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 : "${DATASETS_ROOT:?Set DATASETS_ROOT to a JSONL file or directory of JSONL files}"
 : "${HS_PATH:?Set HS_PATH to the shared HS server directory at the same absolute path}"
 : "${VLLM_ENDPOINT:?Set VLLM_ENDPOINT to the trusted target service URL ending in /v1}"
-: "${EVAL_NPU:?Set EVAL_NPU to one evaluation-only NPU ID, separate from target devices}"
+# One draft worker per listed physical NPU; keep these separate from target devices.
+: "${EVAL_NPU:?Set EVAL_NPU to comma-separated evaluation-only NPU IDs}"
 
 cmd=(
   python3 scripts/evaluate/dspark_offline_eval.py
@@ -43,6 +44,9 @@ cmd=(
   --dtype bfloat16
   --draft-attn-impl sdpa
 )
+if [[ "$EVAL_NPU" == *,* ]]; then
+  cmd+=(--ascend-devices "$EVAL_NPU")
+fi
 if [[ -n "${DATASETS:-}" ]]; then
   cmd+=(--datasets "$DATASETS")
 fi

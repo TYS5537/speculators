@@ -1919,10 +1919,40 @@ def _worker_command(
     return cmd
 
 
+def _stop_eval_worker(process) -> None:
+    """Reap only our child; managed launches also own its surrounding group."""
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+
+def _wait_eval_workers(processes, dataset: str) -> None:
+    while True:
+        statuses = [(index, process.poll()) for index, _, process in processes]
+        failed = [(index, code) for index, code in statuses if code not in (None, 0)]
+        if failed:
+            raise RuntimeError(f"{dataset} worker failures: {failed}")
+        if all(code is not None for _, code in statuses):
+            for _, _, process in processes:
+                process.wait()
+            return
+        time.sleep(0.25)
+
+
 def run_ascend_data_parallel(args: argparse.Namespace) -> None:
     devices = _split_csv(args.ascend_devices)
     if not devices:
         raise ValueError("--ascend-devices must contain at least one device id")
+    if getattr(args, "target_backend", "hf") == "dsv4-vllm":
+        from speculators_dsv4.eval_launcher import parse_devices  # noqa: PLC0415
+
+        devices = [str(device) for device in parse_devices(args.ascend_devices)]
+        if args.device != "npu:0":
+            raise ValueError("DSV4 data-parallel workers require --device npu:0")
     dataset_paths = _discover_datasets(
         args.datasets_root,
         _split_csv(args.datasets) or None,
@@ -1934,27 +1964,22 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
         dataset = _dataset_id(dataset_path, args.datasets_root)
         shard_root = _dataset_output_path(args.output_dir / "_shards", dataset)
         processes = []
-        for shard_index, visible_device in enumerate(devices):
-            shard_output_dir = shard_root / f"shard_{shard_index}"
-            cmd = _worker_command(
-                args,
-                dataset_path=dataset_path,
-                shard_index=shard_index,
-                num_shards=len(devices),
-                output_dir=shard_output_dir,
-            )
-            env = os.environ.copy()
-            env["ASCEND_RT_VISIBLE_DEVICES"] = visible_device
-            processes.append(
-                (shard_index, shard_output_dir, subprocess.Popen(cmd, env=env))
-            )
-        failed = []
-        for shard_index, _, process in processes:
-            returncode = process.wait()
-            if returncode != 0:
-                failed.append((shard_index, returncode))
-        if failed:
-            raise RuntimeError(f"{dataset} worker failures: {failed}")
+        with ExitStack() as workers:
+            for shard_index, visible_device in enumerate(devices):
+                shard_output_dir = shard_root / f"shard_{shard_index}"
+                cmd = _worker_command(
+                    args,
+                    dataset_path=dataset_path,
+                    shard_index=shard_index,
+                    num_shards=len(devices),
+                    output_dir=shard_output_dir,
+                )
+                env = os.environ.copy()
+                env["ASCEND_RT_VISIBLE_DEVICES"] = visible_device
+                process = subprocess.Popen(cmd, env=env)
+                workers.callback(_stop_eval_worker, process)
+                processes.append((shard_index, shard_output_dir, process))
+            _wait_eval_workers(processes, dataset)
         shard_rows = [
             _read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
         ]

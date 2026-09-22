@@ -73,7 +73,7 @@ class LaunchPlan:
     report: dict
     layer_ids: list[int]
     target_devices: list[int]
-    eval_device: int
+    eval_devices: list[int]
     shared_device: bool
     target_memory_utilization: float
     target_quantization: str | None
@@ -81,6 +81,11 @@ class LaunchPlan:
     startup_timeout: float
     shutdown_timeout: float
     interrupted_signal: int | None = field(default=None, repr=False)
+
+    @property
+    def eval_device(self):
+        """Preserve the single-device metadata field without hiding extra workers."""
+        return self.eval_devices[0] if len(self.eval_devices) == 1 else None
 
     def public_metadata(self):
         """Never serialize API tokens or inherited process environments."""
@@ -95,6 +100,8 @@ class LaunchPlan:
             "endpoint": self.endpoint,
             "target_devices": self.target_devices,
             "eval_device": self.eval_device,
+            "eval_devices": self.eval_devices,
+            "eval_num_workers": len(self.eval_devices),
             "shared_device": self.shared_device,
             "target_memory_utilization": self.target_memory_utilization,
             "runtime_quantization": {"method": self.target_quantization},
@@ -121,7 +128,12 @@ def parse_args(argv=None):
     parser.add_argument(
         "--target-devices", required=True, help="Physical NPU IDs, e.g. 0,1,2,3"
     )
-    parser.add_argument("--eval-device", required=True, help="One physical NPU ID")
+    parser.add_argument(
+        "--eval-device",
+        "--eval-devices",
+        required=True,
+        help="Comma-separated physical evaluation NPU IDs; one draft worker per NPU",
+    )
     parser.add_argument("--target-tp-size", type=int, default=None)
     parser.add_argument("--target-python", default=sys.executable)
     parser.add_argument("--eval-python", default=sys.executable)
@@ -211,9 +223,7 @@ def _validate_options(args):
 def _device_config(args):
     target_devices = parse_devices(args.target_devices)
     eval_devices = parse_devices(args.eval_device)
-    if len(eval_devices) != 1:
-        raise ValueError("--eval-device must select exactly one NPU")
-    shared = eval_devices[0] in target_devices
+    shared = bool(set(eval_devices) & set(target_devices))
     if shared and not args.allow_shared_device:
         raise ValueError(
             "Target/eval devices overlap; explicitly set --allow-shared-device"
@@ -234,7 +244,7 @@ def _device_config(args):
         raise ValueError(
             "With DP=PP=1, target TP size must match selected target devices"
         )
-    return target_devices, eval_devices[0], shared, memory, tp_size
+    return target_devices, eval_devices, shared, memory, tp_size
 
 
 def _draft_layers(args, report):
@@ -311,6 +321,8 @@ def _target_command(
         "--max-num-batched-tokens",
         str(args.max_model_len),
         "--max-num-seqs",
+        # Block export supports one scheduled request. Multiple draft workers
+        # share this target through its request queue, not batched verification.
         "1",
         "--block-size",
         "128",
@@ -339,7 +351,9 @@ def _target_command(
     return command
 
 
-def _eval_command(args, *, report, hs_path, output_dir, endpoint, model_name):
+def _eval_command(
+    args, *, report, hs_path, output_dir, endpoint, model_name, eval_devices
+):
     command = [
         args.eval_python,
         "-u",
@@ -386,6 +400,8 @@ def _eval_command(args, *, report, hs_path, output_dir, endpoint, model_name):
         "sdpa",
         "--no-progress",
     ]
+    if len(eval_devices) > 1:
+        command.extend(["--ascend-devices", ",".join(map(str, eval_devices))])
     if args.datasets:
         command.extend(["--datasets", args.datasets])
     if args.keep_target_hs:
@@ -398,7 +414,7 @@ def _eval_command(args, *, report, hs_path, output_dir, endpoint, model_name):
 def build_plan(args, *, run_id=None, port=None):
     """Read-only planning: no directories, child processes or NPU imports."""
     _validate_options(args)
-    devices, eval_device, shared, memory, tp_size = _device_config(args)
+    devices, eval_devices, shared, memory, tp_size = _device_config(args)
     report = inspect_checkpoint(args.verifier_model.resolve())
     layers = _draft_layers(args, report)
     run_id = (
@@ -426,7 +442,7 @@ def build_plan(args, *, run_id=None, port=None):
             "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
         }
     )
-    eval_env = _child_env([eval_device])
+    eval_env = _child_env(eval_devices)
     eval_env["OPENAI_API_KEY"] = api_key
     return LaunchPlan(
         run_id=run_id,
@@ -452,6 +468,7 @@ def build_plan(args, *, run_id=None, port=None):
             output_dir=output_dir,
             endpoint=endpoint,
             model_name=model_name,
+            eval_devices=eval_devices,
         ),
         target_env=target_env,
         eval_env=eval_env,
@@ -459,7 +476,7 @@ def build_plan(args, *, run_id=None, port=None):
         report=report,
         layer_ids=layers,
         target_devices=devices,
-        eval_device=eval_device,
+        eval_devices=eval_devices,
         shared_device=shared,
         target_memory_utilization=memory,
         target_quantization=args.target_quantization,
@@ -622,6 +639,12 @@ def run_plan(plan):
     # no pre-existing HS files or services are adopted, moved or removed.
     plan.hidden_states_path.mkdir(parents=True, exist_ok=False)
     logger.info("Run directory: %s", plan.output_dir)
+    logger.info(
+        "Evaluation NPUs: %s (%d draft worker(s)); target requests are queued "
+        "with max-num-seqs=1",
+        plan.eval_devices,
+        len(plan.eval_devices),
+    )
     if plan.shared_device:
         logger.warning(
             "Shared NPU explicitly enabled; memory budget is not an OOM guarantee"

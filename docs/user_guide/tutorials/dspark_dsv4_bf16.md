@@ -954,7 +954,7 @@ export DATASETS_ROOT=/shared/data/eval-jsonl
 export HS_PATH=/shared/hs/dsv4-eval-runs
 export OUTPUT_DIR=/shared/eval/dsv4-single-runs
 export VLLM_NPUS='<comma-separated target physical device IDs>'
-export EVAL_NPU='<one physical device ID outside VLLM_NPUS>'
+export EVAL_NPU='<one or more comma-separated physical device IDs outside VLLM_NPUS>'
 # TP_SIZE defaults to the device count in VLLM_NPUS; an explicit value must match it.
 # export TP_SIZE='<target tensor-parallel size>'
 # A nonempty value is passed unchanged to the target; it does not convert weights.
@@ -968,10 +968,38 @@ bash examples/evaluate/dspark_dsv4_single_eval.sh
 
 The default target memory utilization is `0.9`. This is a startup budget for the
 default configuration with separate devices, not a guarantee that the model fits.
-Both `VLLM_NPUS` and `EVAL_NPU` take physical device IDs on the same host. The
-evaluation process sees its single visible device as `npu:0`. The target TP group
-is not used as a data-parallel group for the draft; DP is fixed at 1, and both
-processes clear inherited distributed rank environment variables.
+Both `VLLM_NPUS` and `EVAL_NPU` take physical device IDs on the same host. A single
+evaluation ID preserves the original single-worker path. With multiple IDs, each
+evaluation worker sees only its assigned physical NPU as `npu:0`, loads its own
+complete draft and target IO weights, and evaluates a round-robin shard of each
+dataset. The selected sample limit applies to the entire dataset, not to each
+worker. Results are merged using total proposal/acceptance counts, and artifacts
+are restored to sample order. Target TP is unchanged; target DP/PP remain 1.
+The launcher clears inherited distributed rank environment variables.
+
+For example, on a host with **16 visible devices** and enough memory for this
+target topology, dedicate eight to the target and eight to draft evaluation:
+
+```bash
+export VLLM_NPUS=0,1,2,3,4,5,6,7
+export EVAL_NPU=8,9,10,11,12,13,14,15
+export MAX_SAMPLES=500
+bash examples/evaluate/dspark_dsv4_single_eval.sh
+```
+
+No change to the draft checkpoint or TP setting is needed. The Python launcher
+accepts either `--eval-device` or its alias `--eval-devices` with the same list.
+Duplicate/invalid device IDs are rejected, and overlap checks cover **all**
+evaluation devices. `launcher.json` records `eval_devices` and `eval_num_workers`;
+the legacy `eval_device` remains an integer for one worker and is null for many.
+
+This is draft-side data parallelism, **not eight-way batched target verification**.
+The target keeps `--max-num-seqs 1`, as required by the block connector; concurrent
+clients queue their target requests. More draft workers do not guarantee linear
+speedup and may require a larger `TARGET_REQUEST_TIMEOUT` for queueing. Multiple
+workers, like the single-worker launcher, still need real A3 runtime validation.
+Failed worker startup or evaluation stops its siblings; the managed launcher also
+cleans up its owned process group and target. No unrelated service is stopped.
 
 To share a device between the target and drafter, explicitly enable sharing and
 provide a memory budget:
@@ -1125,8 +1153,12 @@ one API output token used for HS export. No extra full draft block needs to be
 reserved, and server-side truncation must remain disabled.
 `TARGET_REQUEST_TIMEOUT` defaults to 120 seconds. Set
 `SERVED_MODEL_NAME` only when the service uses a custom alias. This example uses
-one dedicated evaluation device; the target service's TP devices are not used for
-draft data parallelism.
+dedicated evaluation devices; `EVAL_NPU` accepts one ID or a comma-separated list.
+For multiple IDs, the shell forwards `--ascend-devices` to the evaluator, which
+runs one draft worker per NPU against the same endpoint. Unlike the managed
+launcher, this script cannot check the remote target's device allocation: keep
+evaluation devices separate from target devices on the same host. It does not
+change the existing service's TP or concurrency limits.
 
 For message-based JSONL, the target service's `/tokenize` renderer applies the
 current model's official chat encoding; no invented Jinja template is needed for

@@ -17,7 +17,9 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 : "${DATASETS_ROOT:?Set DATASETS_ROOT to a JSONL file or directory}"
 : "${HS_PATH:?Set HS_PATH to a parent directory for isolated per-run HS}"
 : "${VLLM_NPUS:?Set VLLM_NPUS to comma-separated physical target NPU IDs}"
-: "${EVAL_NPU:?Set EVAL_NPU to one physical evaluation NPU ID}"
+# One ID keeps single-card evaluation; a list runs one draft worker per card.
+# Example on a 16-device host: VLLM_NPUS=0,1,2,3,4,5,6,7 EVAL_NPU=8,9,10,11,12,13,14,15
+: "${EVAL_NPU:?Set EVAL_NPU to comma-separated physical evaluation NPU IDs}"
 
 cmd=(
   python3 scripts/evaluate/run_dsv4_offline_eval.py
