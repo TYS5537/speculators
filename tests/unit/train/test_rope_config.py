@@ -10,8 +10,8 @@ import types
 
 import pytest
 
-import scripts.train as train_module
 from scripts.train import create_transformer_layer_config
+from speculators.train import draft_config
 
 
 def _make_verifier_config(**overrides) -> types.SimpleNamespace:
@@ -42,9 +42,9 @@ def patch_verifier(monkeypatch):
             def from_pretrained(*_args, **_kwargs):
                 return verifier_config
 
-        monkeypatch.setattr(train_module, "AutoConfig", _FakeAutoConfig)
+        monkeypatch.setattr(draft_config, "AutoConfig", _FakeAutoConfig)
         monkeypatch.setattr(
-            train_module.transformers, "__version__", transformers_version
+            draft_config.transformers, "__version__", transformers_version
         )
 
     return _apply

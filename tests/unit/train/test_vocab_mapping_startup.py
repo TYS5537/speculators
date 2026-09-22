@@ -1,69 +1,35 @@
 """Vocabulary startup must not expose partial files or strand distributed peers."""
 
 import argparse
-import ast
 import copy
-import logging
 import multiprocessing
-import tempfile
 import threading
 from datetime import timedelta
 from pathlib import Path
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import numpy as np
 import pytest
 import torch
 
+from speculators.train import vocab_setup
 
-def _load_startup():
-    root = Path(__file__).parents[3]
-    module = ModuleType("vocab_startup_cpu")
-    module.__dict__.update(
-        argparse=argparse,
-        logging=logging,
-        logger=logging.getLogger("vocab-startup-test"),
-        tempfile=tempfile,
-        Path=Path,
-        np=np,
-        torch=torch,
-        is_distributed=lambda: False,
-        get_rank=lambda: 0,
-        get_target_vocab_size=lambda *_: 8,
-        get_verifier_config=lambda *_: SimpleNamespace(vocab_size=8),
+
+def _configure_startup(monkeypatch):
+    """Use real startup code, isolating only rank and verifier metadata."""
+    monkeypatch.setattr(vocab_setup, "is_distributed", lambda: False)
+    monkeypatch.setattr(vocab_setup, "get_rank", lambda: 0)
+    monkeypatch.setattr(vocab_setup, "get_target_vocab_size", lambda *_: 8)
+    monkeypatch.setattr(
+        vocab_setup, "get_verifier_config", lambda *_: SimpleNamespace(vocab_size=8)
     )
-    for relative, names in (
-        (
-            "scripts/train.py",
-            {
-                "_load_mappings",
-                "_save_vocab_mapping_atomically",
-                "_parse_vocab_mappings_local",
-                "parse_vocab_mappings",
-            },
-        ),
-        (
-            "src/speculators/train/vocab_mapping.py",
-            {"build_vocab_mappings_from_distribution"},
-        ),
-    ):
-        path = root / relative
-        definitions = [
-            node
-            for node in ast.parse(path.read_text(encoding="utf-8")).body
-            if isinstance(node, ast.FunctionDef) and node.name in names
-        ]
-        exec(  # noqa: S102 -- Run actual startup without importing model backends.
-            compile(ast.Module(body=definitions, type_ignores=[]), str(path), "exec"),
-            module.__dict__,
-        )
-    return module
+    return vocab_setup
 
 
 @pytest.fixture
-def startup():
-    return _load_startup()
+def startup(monkeypatch):
+    return _configure_startup(monkeypatch)
 
 
 def _args(tmp_path, **overrides):
@@ -78,7 +44,9 @@ def _args(tmp_path, **overrides):
     return argparse.Namespace(**(values | overrides))
 
 
-def test_first_local_startup_publishes_complete_maps_and_reuses_them(startup, tmp_path):
+def test_first_local_startup_publishes_complete_maps_and_reuses_them(
+    startup, tmp_path, monkeypatch
+):
     torch.save({0: 4, 2: 3, 4: 2}, tmp_path / "token_freq.pt")
     first = startup.parse_vocab_mappings(_args(tmp_path))
     assert first[2] == 3
@@ -86,8 +54,10 @@ def test_first_local_startup_publishes_complete_maps_and_reuses_them(startup, tm
     assert first[1].nonzero().flatten().tolist() == [0, 2, 4]
     np.testing.assert_array_equal(np.load(tmp_path / "d2t.npy"), first[0].numpy())
     np.testing.assert_array_equal(np.load(tmp_path / "t2d.npy"), first[1].numpy())
-    startup.build_vocab_mappings_from_distribution = Mock(
-        side_effect=AssertionError("existing maps must not be regenerated")
+    monkeypatch.setattr(
+        startup,
+        "build_vocab_mappings_from_distribution",
+        Mock(side_effect=AssertionError("existing maps must not be regenerated")),
     )
     second = startup.parse_vocab_mappings(_args(tmp_path))
     torch.testing.assert_close(first[0], second[0])
@@ -170,7 +140,7 @@ def test_rank_zero_broadcasts_result_without_peer_filesystem_reads(
         if source == "explicit":
             args.d2t_path, args.t2d_path = str(d2t_path), str(t2d_path)
 
-    startup.is_distributed = lambda: True
+    monkeypatch.setattr(startup, "is_distributed", lambda: True)
     payloads = []
 
     def broadcast(items, src):
@@ -182,9 +152,15 @@ def test_rank_zero_broadcasts_result_without_peer_filesystem_reads(
 
     monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
     first = startup.parse_vocab_mappings(args)
-    startup.get_rank = lambda: 1
-    startup._parse_vocab_mappings_local = Mock(
-        side_effect=AssertionError("nonzero rank must not read or write mapping files")
+    monkeypatch.setattr(startup, "get_rank", lambda: 1)
+    monkeypatch.setattr(
+        startup,
+        "_parse_vocab_mappings_local",
+        Mock(
+            side_effect=AssertionError(
+                "nonzero rank must not read or write mapping files"
+            )
+        ),
     )
     other = startup.parse_vocab_mappings(args)
     assert len(payloads) == 1
@@ -195,8 +171,10 @@ def test_rank_zero_broadcasts_result_without_peer_filesystem_reads(
 
 
 def test_rank_zero_failure_is_reported_to_every_rank(startup, tmp_path, monkeypatch):
-    startup.is_distributed = lambda: True
-    startup._parse_vocab_mappings_local = Mock(side_effect=OSError("disk full"))
+    monkeypatch.setattr(startup, "is_distributed", lambda: True)
+    monkeypatch.setattr(
+        startup, "_parse_vocab_mappings_local", Mock(side_effect=OSError("disk full"))
+    )
     stored = []
 
     def broadcast(items, src):
@@ -208,7 +186,7 @@ def test_rank_zero_failure_is_reported_to_every_rank(startup, tmp_path, monkeypa
 
     monkeypatch.setattr(torch.distributed, "broadcast_object_list", broadcast)
     for rank in (0, 1, 2):
-        startup.get_rank = lambda rank=rank: rank
+        monkeypatch.setattr(startup, "get_rank", lambda rank=rank: rank)
         with pytest.raises(ValueError, match="rank 0: OSError: disk full"):
             startup.parse_vocab_mappings(_args(tmp_path))
     assert startup._parse_vocab_mappings_local.call_count == 1
@@ -229,21 +207,24 @@ def _distributed_vocab_worker(rank, directory, failure, results):
         timeout=timedelta(seconds=30),
     )
     try:
-        module = _load_startup()
-        module.is_distributed = lambda: True
-        module.get_rank = lambda: rank
-        if rank != 0:
-            module._parse_vocab_mappings_local = Mock(
-                side_effect=AssertionError("peer performed mapping I/O")
-            )
-        args = _args(root if rank == 0 else root / "not-visible-to-this-rank")
-        if failure:
-            args.d2t_path = "only-one.npy"
-        try:
-            d2t, t2d, size = module.parse_vocab_mappings(args)
-            results.put((rank, "ok", d2t.tolist(), t2d.tolist(), size))
-        except ValueError as exc:
-            results.put((rank, "error", str(exc)))
+        with pytest.MonkeyPatch.context() as monkeypatch:
+            module = _configure_startup(monkeypatch)
+            monkeypatch.setattr(module, "is_distributed", lambda: True)
+            monkeypatch.setattr(module, "get_rank", lambda: rank)
+            if rank != 0:
+                monkeypatch.setattr(
+                    module,
+                    "_parse_vocab_mappings_local",
+                    Mock(side_effect=AssertionError("peer performed mapping I/O")),
+                )
+            args = _args(root if rank == 0 else root / "not-visible-to-this-rank")
+            if failure:
+                args.d2t_path = "only-one.npy"
+            try:
+                d2t, t2d, size = module.parse_vocab_mappings(args)
+                results.put((rank, "ok", d2t.tolist(), t2d.tolist(), size))
+            except ValueError as exc:
+                results.put((rank, "error", str(exc)))
     finally:
         torch.distributed.destroy_process_group()
 

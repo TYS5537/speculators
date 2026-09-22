@@ -35,9 +35,8 @@ case "${TRAINING_SMOKE:-0}" in
     ;;
   *) echo "TRAINING_SMOKE must be 0 or 1" >&2; exit 2 ;;
 esac
-export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+source "$(dirname "${BASH_SOURCE[0]}")/common/ascend_training_env.sh"
+configure_ascend_training_env
 
 # Contact the configured target directly; keep proxies for other destinations.
 # Preserve both existing exclusion lists and export both spellings to workers.

@@ -7,7 +7,7 @@
 # dependency) and a confidence head (per-position acceptance prediction); the
 # pipeline is the DFlash one plus a few DSpark-specific flags.
 #
-# Usage: Copy this script, modify the configuration variables below, then run:
+# Usage: Keep copies beside common/, modify the configuration variables, then run:
 #   bash examples/train/dspark_qwen3_0_6b_sharegpt_online.sh
 #
 # For a detailed walkthrough, see
@@ -20,6 +20,7 @@
 # later-position accuracy over plain DFlash).
 
 set -euo pipefail
+source "$(dirname "${BASH_SOURCE[0]}")/common/dspark_online_args.sh"
 
 # ============ Configuration ============
 MODEL="Qwen/Qwen3-0.6B"
@@ -85,30 +86,10 @@ echo "vLLM server ready."
 
 # Step 3: Train DSpark against the live vLLM server
 echo "=== Step 3: Training ==="
+build_dspark_online_train_args
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
     scripts/train.py \
-    --verifier-name-or-path "$MODEL" \
-    --data-path "$OUTPUT_DIR" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
-    --save-path "$OUTPUT_DIR/checkpoints" \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-    --epochs "$EPOCHS" \
-    --lr "$LR" \
-    --total-seq-len "$SEQ_LENGTH" \
-    --speculator-type "$SPECULATOR_TYPE" \
-    --block-size "$BLOCK_SIZE" \
-    --max-anchors "$MAX_ANCHORS" \
-    --num-layers "$NUM_LAYERS" \
-    --target-layer-ids $TARGET_LAYER_IDS \
-    --markov-rank "$MARKOV_RANK" \
-    --markov-head-type "$MARKOV_HEAD_TYPE" \
-    --enable-confidence-head \
-    --confidence-head-with-markov \
-    --loss-fn "$LOSS_FN" \
-    --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
-    --confidence-loss-weighting "$CONFIDENCE_LOSS_WEIGHTING" \
-    --on-missing generate \
-    --on-generate delete
+    "${DSPARK_TRAIN_ARGS[@]}"
 
 echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"

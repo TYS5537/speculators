@@ -33,6 +33,7 @@ class _RecordingEncoder(nn.Module):
 class _InputHarness:
     _validate_rollout_inputs = MuseDraftModel._validate_rollout_inputs
     _initial_rollout_logit_feedback = MuseDraftModel._initial_rollout_logit_feedback
+    _rollout_correction_step = MuseDraftModel._rollout_correction_step
     _rollout_correction_steps = MuseDraftModel._rollout_correction_steps
     _draft_ids_to_verifier = MuseDraftModel._draft_ids_to_verifier
     rollout_correction = MuseDraftModel.rollout_correction

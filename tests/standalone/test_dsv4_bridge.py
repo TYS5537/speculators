@@ -971,10 +971,14 @@ class RecipeTests(unittest.TestCase):
             "--log-dir": "$LOG_DIR/tensorboard",
         }.items():
             self.assertEqual(args[args.index(name) + 1], value)
-        tree = ast.parse((ROOT / "scripts/train.py").read_text(encoding="utf-8"))
+        argument_sources = (
+            ROOT / "src/speculators/train/cli.py",
+            ROOT / "src/speculators/train/muse_args.py",
+        )
         declared = {
             node.value
-            for node in ast.walk(tree)
+            for source in argument_sources
+            for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
             if isinstance(node, ast.Constant)
             and isinstance(node.value, str)
             and node.value.startswith("--")

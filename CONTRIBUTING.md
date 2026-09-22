@@ -140,6 +140,13 @@ In Windows PowerShell, set `$env:PYTHONPATH = "src"` and then run
 `python -m unittest discover -s tests/standalone -v`. Git Bash is required for the
 shell wiring tests; POSIX-only process-group and permission tests skip on Windows.
 
+Shell wiring coverage includes the shared training helpers under
+`examples/train/common/`. The online DSpark tests capture data-preparation,
+target-server and training arguments with fake commands, including edited recipes
+and paths with spaces. Keep hardware presets separate from experiment values and
+preserve each launcher's proxy, readiness, cleanup and foreground/background
+behavior when deduplicating scripts. New sourced shell files must use LF endings.
+
 The `Standalone tests` GitHub workflow runs this target on Ubuntu with Python
 3.10 and 3.13 for pushes and pull requests, and supports manual runs. The suite
 uses temporary files, local fixtures and a loopback test service; it does not
@@ -154,15 +161,25 @@ With the project dependencies and pytest installed, run:
 make test-muse
 ```
 
-This entry point covers Muse architecture/configuration round trips, parallel
-Correction anchor/gradient contracts, rollout feedback/input contracts, CLI/default
-and checkpoint-override contracts, and a tiny real Muse model trained by the
-production Trainer with AdamW, a linear scheduler
+This entry point automatically includes `tests/unit/models/test_muse_*.py` and
+`tests/unit/train/test_muse_*.py`. New CPU Muse unit-test modules following those
+names join the suite without another Makefile or workflow edit. Shared activation
+checkpointing, CLI/draft initialization, RoPE configuration, vocabulary startup
+and the training-resume integration test remain explicitly included; unrelated
+model/service tests are not collected.
+Keep accelerator and external-service tests in separate integration targets.
+
+Coverage includes architecture/configuration round trips, Correction caching and
+LM-head fusion, metrics, optional backbone features, parallel anchor/gradient
+contracts, rollout feedback/input contracts, and CLI/checkpoint overrides. It also
+trains a tiny real Muse model with the production Trainer, AdamW, a linear scheduler
 and the single-device checkpointer. It checks that restoring an epoch-boundary
 checkpoint preserves model/optimizer/scheduler state and training progress, and that resumed
 training agrees with an uninterrupted reference run. Parameters use BF16 so the
 production BF16 checkpoint serialization does not introduce a separate rounding
-difference. No verifier download, vLLM service or accelerator is required.
+difference. Vocabulary startup also covers per-file atomic cache publication and
+two-rank CPU Gloo success/failure when Gloo is available. No verifier download,
+vLLM service or accelerator is required.
 This is a deterministic training-resume check, not a claim of exact FP32
 master-weight, mid-epoch, validation/best-checkpoint or distributed replay.
 
@@ -172,7 +189,7 @@ Transformers 4.57.6; it is not a GPU/NPU or dependency-version compatibility mat
 To reproduce that environment on Linux, install uv and run:
 
 ```bash
-uv venv .venv
+uv venv --python 3.12 .venv
 source .venv/bin/activate
 UV_TORCH_BACKEND=cpu uv pip install ./hs_connectors . "pytest~=9.1.1" "torch==2.12.1" "transformers==4.57.6"
 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 make test-muse

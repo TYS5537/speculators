@@ -178,6 +178,7 @@ class _RolloutHarness:
     _selector_correction_inputs = MuseDraftModel._selector_correction_inputs
     _validate_rollout_inputs = MuseDraftModel._validate_rollout_inputs
     _initial_rollout_logit_feedback = MuseDraftModel._initial_rollout_logit_feedback
+    _rollout_correction_step = MuseDraftModel._rollout_correction_step
     _rollout_correction_steps = MuseDraftModel._rollout_correction_steps
     rollout_correction = MuseDraftModel.rollout_correction
 
@@ -192,6 +193,7 @@ class _CollaborativeRolloutHarness:
     _apply_collaborative_markov = MuseDraftModel._apply_collaborative_markov
     _validate_rollout_inputs = MuseDraftModel._validate_rollout_inputs
     _initial_rollout_logit_feedback = MuseDraftModel._initial_rollout_logit_feedback
+    _rollout_correction_step = MuseDraftModel._rollout_correction_step
     _rollout_correction_steps = MuseDraftModel._rollout_correction_steps
     rollout_correction = MuseDraftModel.rollout_correction
 

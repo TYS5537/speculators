@@ -4,7 +4,7 @@
 # Trains against prepared Arrow data and an already-running vLLM server.
 # DSpark uses the baseline Markov/confidence heads; MUSE supports the extensions.
 #
-# Usage: Copy this script, modify the configuration variables below, then run:
+# Usage: Keep copies beside common/, modify the configuration variables, then run:
 #   bash examples/train/dspark_qwen3_8b_trainer.sh
 #   SPECULATOR_TYPE=muse bash examples/train/dspark_qwen3_8b_trainer.sh
 #
@@ -12,9 +12,8 @@
 # vLLM installation that supports hidden-state extraction.
 
 set -euo pipefail
-export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+source "$(dirname "${BASH_SOURCE[0]}")/common/ascend_training_env.sh"
+configure_ascend_training_env
 export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 # ============ Configuration ============
 MODEL="/mnt/pipeline-data/beta_lab/weights/Qwen3-8B"

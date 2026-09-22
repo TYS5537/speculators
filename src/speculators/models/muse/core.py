@@ -12,7 +12,7 @@ from speculators.models.dspark.model_definitions import (
 from speculators.models.metrics import LossConfig, resolve_loss_config
 from speculators.models.muse.backbone import MuseBackboneMixin
 from speculators.models.muse.config import MuseSpeculatorConfig, validate_muse_options
-from speculators.models.muse.correction import CausalCorrectionHead
+from speculators.models.muse.correction import CausalCorrectionHead, CorrectionCache
 from speculators.models.muse.metrics import compute_metrics, select_logged_metrics
 from speculators.models.utils import conditional_torch_compile
 
@@ -492,6 +492,114 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
         zero = features.new_zeros(features.shape[0], 1, features.shape[-1])
         return torch.cat([zero, features], dim=1)
 
+    def _prepare_selector_conditioning(
+        self,
+        base_logits: torch.Tensor | None,
+        targets: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        *,
+        block_tokens: torch.Tensor,
+        aligned_loss_mask: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+        block_positions: torch.Tensor,
+        correction_output_mode: str | None,
+    ) -> tuple[
+        torch.Tensor | None,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
+        """Prepare teacher-forced Selector inputs only for joint Correction.
+
+        Token embeddings remain frozen while compact previous-distribution
+        features retain their gradient path. Standalone Selector handling and
+        autoregressive corrected-token feedback are owned by their callers.
+
+        Returns selector loss, previous-token IDs, current-token embeddings,
+        previous-distribution rank features and their validity mask, in order.
+        """
+        if self.candidate_selector is None or self.correction_head is None:
+            return None, prev_token_ids, None, None, None
+        if base_logits is None:
+            raise RuntimeError(
+                "Selector-conditioned Correction requires pure DFlash base logits"
+            )
+        num_blocks, block = hidden_blocks.shape[:2]
+        selector_previous_rank_features = None
+        selector_previous_logits_mask = None
+        (
+            selector_candidate_ids,
+            selector_candidate_logits,
+            selector_loss,
+            selector_selected_ids,
+            selector_teacher_logits,
+        ) = self._dflash2_block_outputs(
+            base_logits,
+            targets,
+            hidden_blocks,
+            block_tokens[:, 0],
+            aligned_loss_mask,
+            teacher_previous_token_ids=prev_token_ids,
+        )
+        selector_initial_logits = None
+        if not self.config.sample_from_anchor:
+            selector_initial_logits = targets.view(num_blocks, block, -1)[:, 0]
+        if self.config.selector_correction_feedback == "corrected":
+            selected_indices = selector_teacher_logits.argmax(dim=-1, keepdim=True)
+            teacher_selected_ids = selector_candidate_ids.gather(
+                -1, selected_indices
+            ).squeeze(-1)
+            # Main train/validation metrics remain teacher forced. Actual
+            # corrected-token feedback is measured by rollout/offline eval.
+            selector_current_ids = self._draft_ids_to_verifier(teacher_selected_ids)
+            selector_previous_ids = prev_token_ids
+            if correction_output_mode == "logits":
+                teacher_source_mask = torch.ones(
+                    num_blocks,
+                    max(block - 1, 0),
+                    dtype=torch.bool,
+                    device=hidden_blocks.device,
+                )
+                teacher_rank = self.correction_head.encode_previous_distribution(
+                    teacher_source_mask,
+                    previous_logits=targets.view(num_blocks, block, -1)[:, :-1],
+                )
+
+                selector_previous_rank_features = self._prepend_zero_compact_feature(
+                    teacher_rank
+                )
+                selector_previous_logits_mask = block_positions > 0
+        else:
+            (
+                selector_current_ids,
+                selector_previous_ids,
+                selector_previous_rank_features,
+                selector_previous_logits_mask,
+            ) = self._selector_correction_inputs(
+                selector_candidate_ids,
+                selector_candidate_logits,
+                selector_selected_ids,
+                block_tokens[:, 0],
+                initial_previous_logits=selector_initial_logits,
+            )
+        selector_current_embeddings = None
+        if selector_current_ids is not None:
+            with torch.no_grad():
+                selector_current_embeddings = self.embed_tokens(selector_current_ids)
+        correction_previous_ids = (
+            selector_previous_ids
+            if selector_previous_ids is not None
+            else prev_token_ids
+        )
+        return (
+            selector_loss,
+            correction_previous_ids,
+            selector_current_embeddings,
+            selector_previous_rank_features,
+            selector_previous_logits_mask,
+        )
+
     def _selector_correction_inputs(
         self,
         candidate_ids: torch.Tensor,
@@ -830,6 +938,93 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
             online_previous_mask,
         )
 
+    def _rollout_correction_step(
+        self,
+        previous_embeddings: torch.Tensor,
+        current_hidden: torch.Tensor,
+        correction_hidden: torch.Tensor,
+        block_positions: torch.Tensor,
+        *,
+        position: int,
+        cache: CorrectionCache | None,
+        precomputed_base_logits: torch.Tensor | None = None,
+        fused_base_logits: torch.Tensor | None = None,
+        **correction_kwargs: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, CorrectionCache | None]:
+        """Compute one Correction residual and its final vocabulary projection.
+
+        The caller supplies independent residual/input hidden slices to preserve
+        autograd accumulation order. Selector conditioning, Markov collaboration,
+        sampling and feedback-state updates remain in the rollout loop.
+        """
+        correction_output_mode = getattr(self.correction_head, "output_mode", "hidden")
+        hidden_auxiliary_enabled = getattr(
+            self.config, "correction_hidden_aux_loss", False
+        )
+        hidden_feedback_enabled = getattr(
+            self.config, "correction_hidden_feedback", False
+        )
+        project_corrected_hidden = getattr(
+            self.config, "correction_project_corrected_hidden", False
+        )
+        residual, causal_states, next_cache = self.correction_head(
+            previous_embeddings,
+            correction_hidden,
+            block_positions,
+            cache=cache,
+            use_cache=True,
+            **correction_kwargs,
+        )
+        if correction_output_mode == "logits":
+            if (
+                project_corrected_hidden
+                or hidden_feedback_enabled
+                or (hidden_auxiliary_enabled and self.training)
+            ):
+                delta_hidden = self.correction_head.auxiliary_hidden_residual(
+                    causal_states,
+                )
+                corrected_current_hidden = current_hidden + delta_hidden[:, 0].to(
+                    current_hidden.dtype
+                )
+            else:
+                corrected_current_hidden = current_hidden
+            projection_hidden = (
+                corrected_current_hidden if project_corrected_hidden else current_hidden
+            )
+            if project_corrected_hidden and fused_base_logits is not None:
+                hidden_delta_logits = self.correction_head.fused_lm_head_residual(
+                    causal_states,
+                    self.lm_head.weight,
+                )
+                projected_logits = fused_base_logits[:, position] + (
+                    hidden_delta_logits[:, 0].to(fused_base_logits.dtype)
+                )
+            elif precomputed_base_logits is not None and not project_corrected_hidden:
+                projected_logits = precomputed_base_logits[:, position]
+            else:
+                projected_logits = self.lm_head(
+                    projection_hidden.to(self.lm_head.weight.dtype)
+                )
+            final_logits = projected_logits + residual[:, 0].to(projected_logits.dtype)
+        else:
+            corrected_current_hidden = current_hidden + residual[:, 0].to(
+                current_hidden.dtype
+            )
+            if fused_base_logits is not None:
+                delta_logits = self.correction_head.fused_lm_head_residual(
+                    causal_states,
+                    self.lm_head.weight,
+                )
+                final_logits = fused_base_logits[:, position] + (
+                    delta_logits[:, 0].to(fused_base_logits.dtype)
+                )
+            else:
+                final_logits = self.lm_head(
+                    corrected_current_hidden.to(self.lm_head.weight.dtype)
+                )
+        return final_logits, causal_states[:, 0], corrected_current_hidden, next_cache
+
     @torch.compiler.disable
     def _rollout_correction_steps(
         self,
@@ -870,14 +1065,8 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
         output_corrected_hidden: list[torch.Tensor] = []
         start_position = 0 if self.config.sample_from_anchor else 1
         correction_output_mode = getattr(self.correction_head, "output_mode", "hidden")
-        hidden_auxiliary_enabled = getattr(
-            self.config, "correction_hidden_aux_loss", False
-        )
         hidden_feedback_enabled = getattr(
             self.config, "correction_hidden_feedback", False
-        )
-        project_corrected_hidden = getattr(
-            self.config, "correction_project_corrected_hidden", False
         )
         logit_feedback_enabled = correction_output_mode == "logits"
         fused_lm_head_enabled = (
@@ -1030,84 +1219,21 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
                             "previous_logits": previous_feedback_logits,
                             "previous_logits_mask": previous_feedback_mask,
                         }
-                if correction_output_mode == "logits":
-                    delta_logits, causal_states, cache = self.correction_head(
+                final_logits, causal_states, corrected_current_hidden, cache = (
+                    self._rollout_correction_step(
                         previous_emb,
+                        current_hidden,
                         dflash_hidden[:, position : position + 1],
                         block_positions,
+                        position=position,
                         cache=cache,
-                        use_cache=True,
+                        precomputed_base_logits=precomputed_base_logits,
+                        fused_base_logits=fused_base_logits,
                         **current_token_kwargs,
                         **hidden_feedback_kwargs,
                         **logit_feedback_kwargs,
                     )
-                    if (
-                        project_corrected_hidden
-                        or hidden_feedback_enabled
-                        or (hidden_auxiliary_enabled and self.training)
-                    ):
-                        delta_hidden = self.correction_head.auxiliary_hidden_residual(
-                            causal_states,
-                        )
-                        corrected_current_hidden = current_hidden + delta_hidden[
-                            :, 0
-                        ].to(current_hidden.dtype)
-                    else:
-                        corrected_current_hidden = current_hidden
-                    projection_hidden = (
-                        corrected_current_hidden
-                        if project_corrected_hidden
-                        else current_hidden
-                    )
-                    if project_corrected_hidden and fused_base_logits is not None:
-                        hidden_delta_logits = (
-                            self.correction_head.fused_lm_head_residual(
-                                causal_states,
-                                self.lm_head.weight,
-                            )
-                        )
-                        projected_logits = fused_base_logits[:, position] + (
-                            hidden_delta_logits[:, 0].to(fused_base_logits.dtype)
-                        )
-                    elif (
-                        precomputed_base_logits is not None
-                        and not project_corrected_hidden
-                    ):
-                        projected_logits = precomputed_base_logits[:, position]
-                    else:
-                        projected_logits = self.lm_head(
-                            projection_hidden.to(self.lm_head.weight.dtype)
-                        )
-                    final_logits = projected_logits + delta_logits[:, 0].to(
-                        projected_logits.dtype
-                    )
-                else:
-                    delta_hidden, causal_states, cache = self.correction_head(
-                        previous_emb,
-                        dflash_hidden[:, position : position + 1],
-                        block_positions,
-                        cache=cache,
-                        use_cache=True,
-                        **current_token_kwargs,
-                        **hidden_feedback_kwargs,
-                        **logit_feedback_kwargs,
-                    )
-                    corrected_current_hidden = current_hidden + delta_hidden[:, 0].to(
-                        current_hidden.dtype
-                    )
-                    if fused_base_logits is not None:
-                        delta_logits = self.correction_head.fused_lm_head_residual(
-                            causal_states,
-                            self.lm_head.weight,
-                        )
-                        final_logits = fused_base_logits[:, position] + (
-                            delta_logits[:, 0].to(fused_base_logits.dtype)
-                        )
-                    else:
-                        final_logits = self.lm_head(
-                            corrected_current_hidden.to(self.lm_head.weight.dtype)
-                        )
-                causal_states = causal_states[:, 0]
+                )
                 if getattr(self, "markov_head", None) is not None:
                     final_logits, _, _ = self._apply_collaborative_markov(
                         final_logits.unsqueeze(1),
@@ -1182,6 +1308,96 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
             torch.stack(output_states, dim=1),
             torch.stack(output_corrected_hidden, dim=1),
         )
+
+    def _validation_correction_outputs(
+        self,
+        hidden: torch.Tensor,
+        hidden_blocks: torch.Tensor,
+        *,
+        base_logits: torch.Tensor | None,
+        base_logits_blocks: torch.Tensor | None,
+        targets: torch.Tensor,
+        anchor_token_ids: torch.Tensor,
+        correction_output_mode: str | None,
+    ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
+        """Return optional validation base diagnostics and flattened rollout logits."""
+        if self.training:
+            return base_logits, None
+
+        # This extra projection is for diagnostics only, not rollout conditioning.
+        if self.config.correction_base_diagnostics and base_logits is None:
+            with torch.no_grad():
+                base_logits = self.lm_head(
+                    hidden.detach().to(self.lm_head.weight.dtype)
+                )
+
+        rollout_logits = None
+        if self.config.correction_rollout_metrics:
+            num_blocks, block = hidden_blocks.shape[:2]
+            rollout_initial_logits = None
+            if (
+                not self.config.sample_from_anchor
+                and correction_output_mode == "logits"
+            ):
+                rollout_initial_logits = targets.view(num_blocks, block, -1)[:, 0]
+            _, rollout_blocks = self.rollout_correction(
+                hidden_blocks.detach(),
+                anchor_token_ids=anchor_token_ids,
+                initial_previous_logits=rollout_initial_logits,
+                base_logits=base_logits_blocks,
+            )
+            rollout_logits = rollout_blocks.reshape(1, num_blocks * block, -1)
+        return base_logits, rollout_logits
+
+    def _add_auxiliary_losses(
+        self,
+        loss: torch.Tensor,
+        metrics: dict[str, torch.Tensor],
+        *,
+        selector_loss: torch.Tensor | None,
+        corrected_hidden: torch.Tensor | None,
+        verifier_last_hidden_states: torch.Tensor,
+        anchored_block_indices: torch.Tensor,
+        aligned_loss_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Add Selector then hidden-alignment losses, updating metrics in place."""
+        if selector_loss is not None:
+            loss = loss + self.config.dflash2_selector_loss_weight * selector_loss
+            metrics["loss_sum"] = loss.detach().clone()
+            metrics["dflash2_selector_loss_sum"] = selector_loss.detach().clone()
+            metrics["dflash2_selector_loss_total"] = torch.ones(
+                (), device=loss.device, dtype=torch.float32
+            )
+        if self.config.correction_hidden_aux_loss:
+            if corrected_hidden is None:
+                raise RuntimeError(
+                    "Hidden auxiliary loss requires corrected DFlash hidden states"
+                )
+            with torch.no_grad():
+                verifier_hidden_targets = self.verifier_norm(
+                    verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
+                )
+                if not self.config.sample_from_anchor:
+                    verifier_hidden_targets = torch.roll(
+                        verifier_hidden_targets, 1, dims=1
+                    )
+                verifier_hidden_targets = verifier_hidden_targets[
+                    :, anchored_block_indices
+                ].view_as(corrected_hidden)
+            hidden_aux_loss = self._hidden_alignment_loss(
+                corrected_hidden,
+                verifier_hidden_targets,
+                aligned_loss_mask.view(*corrected_hidden.shape[:2]),
+            )
+            loss = loss + (self.config.correction_hidden_aux_weight * hidden_aux_loss)
+            metrics["loss_sum"] = loss.detach().clone()
+            metrics["correction_hidden_aux_loss_sum"] = hidden_aux_loss.detach().clone()
+            metrics["correction_hidden_aux_loss_total"] = torch.ones(
+                (),
+                device=loss.device,
+                dtype=torch.float32,
+            )
+        return loss, metrics
 
     @conditional_torch_compile
     def forward(
@@ -1263,83 +1479,21 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
         base_logits_blocks = (
             None if base_logits is None else base_logits.view(num_blocks, block, -1)
         )
-        selector_loss = None
-        selector_candidate_ids = None
-        selector_candidate_logits = None
-        selector_teacher_logits = None
-        selector_selected_ids = None
-        selector_current_ids = None
-        selector_previous_ids = None
-        selector_previous_rank_features = None
-        selector_previous_logits_mask = None
-        if self.candidate_selector is not None and self.correction_head is not None:
-            if base_logits is None or base_logits_blocks is None:
-                raise RuntimeError(
-                    "Selector-conditioned Correction requires pure DFlash base logits"
-                )
-            (
-                selector_candidate_ids,
-                selector_candidate_logits,
-                selector_loss,
-                selector_selected_ids,
-                selector_teacher_logits,
-            ) = self._dflash2_block_outputs(
-                base_logits,
-                targets,
-                hidden_blocks,
-                block_tokens[:, 0],
-                aligned_loss_mask,
-                teacher_previous_token_ids=prev_token_ids,
-            )
-            selector_initial_logits = None
-            if not self.config.sample_from_anchor:
-                selector_initial_logits = targets.view(num_blocks, block, -1)[:, 0]
-            if self.config.selector_correction_feedback == "corrected":
-                selected_indices = selector_teacher_logits.argmax(dim=-1, keepdim=True)
-                teacher_selected_ids = selector_candidate_ids.gather(
-                    -1, selected_indices
-                ).squeeze(-1)
-                # Main train/validation metrics remain teacher forced. Actual
-                # corrected-token feedback is measured by rollout/offline eval.
-                selector_current_ids = self._draft_ids_to_verifier(teacher_selected_ids)
-                selector_previous_ids = prev_token_ids
-                if correction_output_mode == "logits":
-                    teacher_source_mask = torch.ones(
-                        num_blocks,
-                        max(block - 1, 0),
-                        dtype=torch.bool,
-                        device=hidden.device,
-                    )
-                    teacher_rank = self.correction_head.encode_previous_distribution(
-                        teacher_source_mask,
-                        previous_logits=targets.view(num_blocks, block, -1)[:, :-1],
-                    )
-
-                    selector_previous_rank_features = (
-                        self._prepend_zero_compact_feature(teacher_rank)
-                    )
-                    selector_previous_logits_mask = block_positions > 0
-            else:
-                (
-                    selector_current_ids,
-                    selector_previous_ids,
-                    selector_previous_rank_features,
-                    selector_previous_logits_mask,
-                ) = self._selector_correction_inputs(
-                    selector_candidate_ids,
-                    selector_candidate_logits,
-                    selector_selected_ids,
-                    block_tokens[:, 0],
-                    initial_previous_logits=selector_initial_logits,
-                )
-        selector_current_embeddings = None
-        if selector_current_ids is not None:
-            with torch.no_grad():
-                selector_current_embeddings = self.embed_tokens(selector_current_ids)
-        correction_previous_ids = (
-            selector_previous_ids
-            if selector_previous_ids is not None
-            else prev_token_ids
+        (
+            selector_loss,
+            correction_previous_ids,
+            selector_current_embeddings,
+            selector_previous_rank_features,
+            selector_previous_logits_mask,
+        ) = self._prepare_selector_conditioning(
+            base_logits,
+            targets,
+            hidden_blocks,
+            block_tokens=block_tokens,
+            aligned_loss_mask=aligned_loss_mask,
+            prev_token_ids=prev_token_ids,
+            block_positions=block_positions,
+            correction_output_mode=correction_output_mode,
         )
         confidence_logits = None
         prev_emb = None
@@ -1418,31 +1572,15 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
                 )
                 logits = collaborative_blocks.reshape(1, mask_tokens_size, -1)
 
-            # Optional validation-only base projection for change/gain diagnostics.
-            # It is never part of the training or inference correction path.
-            if not self.training and self.config.correction_base_diagnostics:
-                if base_logits is None:
-                    with torch.no_grad():
-                        base_logits = self.lm_head(
-                            hidden.detach().to(self.lm_head.weight.dtype)
-                        )
-
-            # Validation keeps the teacher-forced view for comparison and also
-            # measures the actual autoregressive feedback chain.
-            if not self.training and self.config.correction_rollout_metrics:
-                rollout_initial_logits = None
-                if (
-                    not self.config.sample_from_anchor
-                    and correction_output_mode == "logits"
-                ):
-                    rollout_initial_logits = targets.view(num_blocks, block, -1)[:, 0]
-                _, rollout_blocks = self.rollout_correction(
-                    hidden_blocks.detach(),
-                    anchor_token_ids=block_tokens[:, 0],
-                    initial_previous_logits=rollout_initial_logits,
-                    base_logits=base_logits_blocks,
-                )
-                rollout_logits = rollout_blocks.reshape(1, mask_tokens_size, -1)
+            base_logits, rollout_logits = self._validation_correction_outputs(
+                hidden,
+                hidden_blocks,
+                base_logits=base_logits,
+                base_logits_blocks=base_logits_blocks,
+                targets=targets,
+                anchor_token_ids=block_tokens[:, 0],
+                correction_output_mode=correction_output_mode,
+            )
         elif self.markov_head is not None:
             if logits is None:
                 raise RuntimeError("Markov correction requires base logits")
@@ -1526,42 +1664,15 @@ class MuseDraftModel(MuseBackboneMixin, DSparkDraftModel):
             target_log_normalizer=target_log_normalizer,
             target_argmax_ids=target_argmax_ids,
         )
-        if selector_loss is not None:
-            loss = loss + self.config.dflash2_selector_loss_weight * selector_loss
-            metrics["loss_sum"] = loss.detach().clone()
-            metrics["dflash2_selector_loss_sum"] = selector_loss.detach().clone()
-            metrics["dflash2_selector_loss_total"] = torch.ones(
-                (), device=loss.device, dtype=torch.float32
-            )
-        if self.config.correction_hidden_aux_loss:
-            if corrected_hidden is None:
-                raise RuntimeError(
-                    "Hidden auxiliary loss requires corrected DFlash hidden states"
-                )
-            with torch.no_grad():
-                verifier_hidden_targets = self.verifier_norm(
-                    verifier_last_hidden_states.to(self.verifier_norm.weight.dtype)
-                )
-                if not self.config.sample_from_anchor:
-                    verifier_hidden_targets = torch.roll(
-                        verifier_hidden_targets, 1, dims=1
-                    )
-                verifier_hidden_targets = verifier_hidden_targets[
-                    :, anchored_block_indices
-                ].view_as(corrected_hidden)
-            hidden_aux_loss = self._hidden_alignment_loss(
-                corrected_hidden,
-                verifier_hidden_targets,
-                aligned_loss_mask.view(num_blocks, block),
-            )
-            loss = loss + (self.config.correction_hidden_aux_weight * hidden_aux_loss)
-            metrics["loss_sum"] = loss.detach().clone()
-            metrics["correction_hidden_aux_loss_sum"] = hidden_aux_loss.detach().clone()
-            metrics["correction_hidden_aux_loss_total"] = torch.ones(
-                (),
-                device=loss.device,
-                dtype=torch.float32,
-            )
+        loss, metrics = self._add_auxiliary_losses(
+            loss,
+            metrics,
+            selector_loss=selector_loss,
+            corrected_hidden=corrected_hidden,
+            verifier_last_hidden_states=verifier_last_hidden_states,
+            anchored_block_indices=anchored_block_indices,
+            aligned_loss_mask=aligned_loss_mask,
+        )
         metrics = select_logged_metrics(
             metrics,
             include_diagnostics=(

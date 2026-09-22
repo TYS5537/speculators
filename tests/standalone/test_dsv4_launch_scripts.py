@@ -3,11 +3,13 @@
 # ruff: noqa: PT009 -- Also runnable without pytest/torch.
 
 import os
+import shlex
 import shutil
 import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 if os.name == "nt":
@@ -52,6 +54,7 @@ sleep() { SECONDS=$((SECONDS + 5)); }
 """
 
 TRAINER_STUBS = r"""
+fixture_initial_pwd="$PWD"
 # Set case-sensitive fixture variables inside Bash, including on Windows hosts.
 export NO_PROXY="$FIXTURE_NO_PROXY_UPPER" no_proxy="$FIXTURE_NO_PROXY_LOWER"
 if [[ -z "$FIXTURE_NO_PROXY_UPPER" && -z "$FIXTURE_NO_PROXY_LOWER" ]]; then
@@ -61,6 +64,7 @@ export HTTP_PROXY=http://http-proxy.fixture:3128 http_proxy=http://http-lower.fi
 export HTTPS_PROXY=http://https-proxy.fixture:3128 https_proxy=http://https-lower.fixture:3128
 export ALL_PROXY=socks5://all-proxy.fixture:1080 all_proxy=socks5://all-lower.fixture:1080
 capture_proxy_environment() {
+  [[ "$PWD" == "$fixture_initial_pwd" ]] || exit 98
   # env is a child process: unexported shell variables must not satisfy this test.
   env | while IFS='=' read -r name value; do
     case "$name" in
@@ -68,6 +72,14 @@ capture_proxy_environment() {
         printf '%s=%s\n' "$name" "$value" ;;
     esac
   done > "$ENV_CAPTURE"
+  env | while IFS='=' read -r name value; do
+    case "$name" in
+      OMP_PROC_BIND|OMP_NUM_THREADS|MKL_NUM_THREADS|VE_OMP_NUM_THREADS|\
+      PYTORCH_NPU_ALLOC_CONF|TASK_QUEUE_ENABLE|ACLNN_CACHE_LIMIT|\
+      NPU_ASD_ENABLE|ASCEND_LAUNCH_BLOCKING)
+        printf '%s=%s\n' "$name" "$value" ;;
+    esac
+  done > "$RUNTIME_ENV_CAPTURE"
 }
 # The fixture already owns this directory; avoid MSYS mkdir path translation.
 mkdir() { [[ "$1" == -p && -d "$2" ]]; }
@@ -85,6 +97,13 @@ exec() {
 """
 
 
+def _shell_environment(overrides=None):
+    environment = {**os.environ, **(overrides or {})}
+    environment.pop("BASH_ENV", None)
+    environment.pop("ENV", None)
+    return {key: value for key, value in environment.items() if value is not None}
+
+
 @unittest.skipUnless(BASH, "Bash is required for shell wiring tests")
 class LaunchScriptTests(unittest.TestCase):
     def setUp(self):
@@ -94,16 +113,17 @@ class LaunchScriptTests(unittest.TestCase):
         self.capture = self.root / "arguments"
         self.checkpoint_capture = self.root / "checkpoint-arguments"
         self.environment_capture = self.root / "proxy-environment"
+        self.runtime_environment_capture = self.root / "runtime-environment"
         self.curl_capture = self.root / "curl-arguments"
         self.signals = self.root / "signals"
         self.output = self.root / "output with spaces"
 
-    def run_script(self, kind, **overrides):
+    def run_script(self, kind, *, cwd=None, **overrides):
         environment = {
-            **os.environ,
             "CAPTURE": self.capture.as_posix(),
             "CHECKPOINT_CAPTURE": self.checkpoint_capture.as_posix(),
             "ENV_CAPTURE": self.environment_capture.as_posix(),
+            "RUNTIME_ENV_CAPTURE": self.runtime_environment_capture.as_posix(),
             "CURL_CAPTURE": self.curl_capture.as_posix(),
             "FIXTURE_NO_PROXY_UPPER": "",
             "FIXTURE_NO_PROXY_LOWER": "",
@@ -145,17 +165,16 @@ class LaunchScriptTests(unittest.TestCase):
             "WAIT_STATUS": "0",
             **overrides,
         }
-        environment = {
-            key: value for key, value in environment.items() if value is not None
-        }
-        source = f"source examples/train/dspark_dsv4_flash_bf16_{kind}.sh\n"
+        environment = _shell_environment(environment)
+        script = ROOT / f"examples/train/dspark_dsv4_flash_bf16_{kind}.sh"
+        source = f"source {shlex.quote(script.as_posix())}\n"
         stubs = SERVER_STUBS if kind == "server" else TRAINER_STUBS
         if kind == "trainer":
             source += 'wait "$TRAIN_PID"\n'
         return subprocess.run(  # noqa: S603 -- Fixed repository scripts, fake commands.
             [BASH, "--noprofile", "--norc"],
             input=stubs + source,
-            cwd=ROOT,
+            cwd=ROOT if cwd is None else cwd,
             env=environment,
             capture_output=True,
             text=True,
@@ -164,17 +183,113 @@ class LaunchScriptTests(unittest.TestCase):
         )
 
     def test_bash_syntax(self):
-        for kind in ("server", "trainer"):
-            with self.subTest(kind=kind):
+        for relative in (
+            "dspark_dsv4_flash_bf16_server.sh",
+            "dspark_dsv4_flash_bf16_trainer.sh",
+            "dspark_qwen3_8b_trainer.sh",
+            "common/ascend_training_env.sh",
+        ):
+            script = ROOT / "examples/train" / relative
+            with self.subTest(script=relative):
+                self.assertNotIn(b"\r\n", script.read_bytes())
                 result = subprocess.run(  # noqa: S603 -- Syntax check only.
-                    [BASH, "-n", f"examples/train/dspark_dsv4_flash_bf16_{kind}.sh"],
+                    [BASH, "-n", script.as_posix()],
                     cwd=ROOT,
+                    env=_shell_environment(),
                     capture_output=True,
                     text=True,
                     timeout=10,
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_inherited_shell_startup_is_not_executed(self):
+        startup, marker = self.root / "startup.sh", self.root / "startup-ran"
+        startup.write_bytes(b'printf "startup\\n" >> "$STARTUP_MARKER"\n')
+        (self.output / "logs").mkdir(parents=True)
+        with patch.dict(
+            os.environ,
+            {
+                "BASH_ENV": startup.as_posix(),
+                "ENV": startup.as_posix(),
+                "STARTUP_MARKER": marker.as_posix(),
+            },
+        ):
+            control = subprocess.run(  # noqa: S603 -- Only a temporary printf hook.
+                [BASH, "--noprofile", "--norc"],
+                input=":\n",
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+            self.assertEqual(control.returncode, 0, control.stderr)
+            self.assertEqual(marker.read_text(), "startup\n")
+            marker.unlink()
+            for kind, smoke in (("server", "0"), ("trainer", "0"), ("trainer", "1")):
+                with self.subTest(kind=kind, smoke=smoke):
+                    result = self.run_script(
+                        kind,
+                        TRAINING_SMOKE=smoke,
+                        SMOKE_PHASE="fresh",
+                        SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                    )
+                    self.assertEqual(
+                        result.returncode, 17 if smoke == "1" else 0, result.stderr
+                    )
+                    self.assertTrue(self.capture.exists())
+                    self.assertFalse(marker.exists())
+
+    def test_trainer_exports_shared_ascend_settings_to_background_and_smoke(self):
+        (self.output / "logs").mkdir(parents=True)
+        for smoke in ("0", "1"):
+            with self.subTest(smoke=smoke):
+                result = self.run_script(
+                    "trainer",
+                    TRAINING_SMOKE=smoke,
+                    SMOKE_PHASE="fresh",
+                    SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                )
+                self.assertEqual(
+                    result.returncode, 17 if smoke == "1" else 0, result.stderr
+                )
+                captured = self.runtime_environment_capture.read_text().splitlines()
+                self.assertEqual(
+                    dict(line.split("=", 1) for line in captured),
+                    {
+                        "OMP_PROC_BIND": "false",
+                        "OMP_NUM_THREADS": "1",
+                        "MKL_NUM_THREADS": "1",
+                        "VE_OMP_NUM_THREADS": "1",
+                        "PYTORCH_NPU_ALLOC_CONF": "expandable_segments:True",
+                        "TASK_QUEUE_ENABLE": "2",
+                        "ACLNN_CACHE_LIMIT": "100000",
+                        "NPU_ASD_ENABLE": "0",
+                        "ASCEND_LAUNCH_BLOCKING": "0",
+                    },
+                )
+
+    def test_trainer_sources_helper_from_foreign_cwd_without_rebasing_output(self):
+        caller = self.root / "caller with spaces"
+        (caller / "relative output/logs").mkdir(parents=True)
+        for smoke in ("0", "1"):
+            with self.subTest(smoke=smoke):
+                result = self.run_script(
+                    "trainer",
+                    cwd=caller,
+                    OUTPUT_DIR="relative output",
+                    TRAINING_SMOKE=smoke,
+                    SMOKE_PHASE="fresh",
+                    SMOKE_REPORT_DIR=(self.root / "reports").as_posix(),
+                )
+                self.assertEqual(
+                    result.returncode, 17 if smoke == "1" else 0, result.stderr
+                )
+                args = self.capture.read_text().splitlines()
+                self.assertEqual(
+                    args[args.index("--save-path") + 1], "relative output/checkpoints"
+                )
+                self.assertIn("torchrun", args)
 
     def test_server_captures_pid_waits_and_cleans_only_owned_group(self):
         result = self.run_script("server")

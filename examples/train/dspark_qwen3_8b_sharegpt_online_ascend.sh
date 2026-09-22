@@ -5,16 +5,16 @@
 # vLLM server launch, and training with hidden states generated on-the-fly.
 # DSpark extends DFlash with a Markov head and a confidence head.
 #
-# Usage: Copy this script, modify the configuration variables below, then run:
+# Usage: Keep copies beside common/, modify the configuration variables, then run:
 #   bash examples/train/dspark_qwen3_8b_sharegpt_online_ascend.sh
 #
 # Note: This assumes your environment has torch_npu and an Ascend-compatible
 # vLLM installation that supports hidden-state extraction.
 
 set -euo pipefail
-export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
-export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+source "$(dirname "${BASH_SOURCE[0]}")/common/ascend_training_env.sh"
+source "$(dirname "${BASH_SOURCE[0]}")/common/dspark_online_args.sh"
+configure_ascend_training_env
 export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54 no_proxy=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 
 # ============ Configuration ============
@@ -87,31 +87,10 @@ echo "vLLM server ready."
 
 # Step 3: Train DSpark against the live vLLM server
 echo "=== Step 3: Training on Ascend NPU(s): $TRAIN_NPUS ==="
+build_dspark_online_train_args --draft-attn-impl "$DRAFT_ATTN_IMPL"
 env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
     scripts/train.py \
-    --verifier-name-or-path "$MODEL" \
-    --data-path "$OUTPUT_DIR" \
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
-    --save-path "$OUTPUT_DIR/checkpoints" \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
-    --epochs "$EPOCHS" \
-    --lr "$LR" \
-    --total-seq-len "$SEQ_LENGTH" \
-    --speculator-type "$SPECULATOR_TYPE" \
-    --block-size "$BLOCK_SIZE" \
-    --max-anchors "$MAX_ANCHORS" \
-    --num-layers "$NUM_LAYERS" \
-    --draft-attn-impl "$DRAFT_ATTN_IMPL" \
-    --target-layer-ids $TARGET_LAYER_IDS \
-    --markov-rank "$MARKOV_RANK" \
-    --markov-head-type "$MARKOV_HEAD_TYPE" \
-    --enable-confidence-head \
-    --confidence-head-with-markov \
-    --loss-fn "$LOSS_FN" \
-    --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
-    --confidence-loss-weighting "$CONFIDENCE_LOSS_WEIGHTING" \
-    --on-missing generate \
-    --on-generate delete
+    "${DSPARK_TRAIN_ARGS[@]}"
 
 echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"
