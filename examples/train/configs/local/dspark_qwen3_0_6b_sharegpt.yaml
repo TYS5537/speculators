@@ -1,0 +1,40 @@
+# Local experiment settings, separate from the unmodified upstream example.
+# Run with: python -m speculators.train --config <this file>
+train:
+  speculator_type: dspark
+  # Preserve the original loss implementation, Markov initialization and Muon
+  # grouping/LR policy through the unified entrypoint, not a second launcher.
+  training_recipe: legacy
+  verifier:
+    verifier_name_or_path: Qwen/Qwen3-0.6B
+  draft:
+    num_layers: 5
+    draft_vocab_size: 32000
+    target_layer_ids: [2, 14, 25]
+  data:
+    # Keep data and checkpoints separate from the upstream baseline experiment.
+    data_path: ./output/dspark_qwen3_0_6b_sharegpt_local
+    total_seq_len: 4096
+    max_anchors: 3072
+  generation:
+    vllm_endpoint: http://localhost:8000/v1
+    on_missing: generate
+    on_generate: delete
+  optimizer:
+    lr: 0.0003
+    # Omitted muon_lr follows the legacy policy: 10 * lr, including CLI overrides.
+  trainer:
+    epochs: 10
+    save_path: ./output/dspark_qwen3_0_6b_sharegpt_local/checkpoints
+  dflash:
+    block_size: 7
+    # Omitted dflash_decay_gamma follows block_size under the legacy recipe.
+  dspark:
+    markov_rank: 256
+    markov_head_type: vanilla
+    enable_confidence_head: true
+    confidence_head_with_markov: true
+    confidence_head_alpha: 1.0
+    confidence_loss_weighting: match-draft
+  loss:
+    loss_fn: '{"ce": 0.1, "tv": 0.9}'

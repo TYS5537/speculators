@@ -1,17 +1,23 @@
 #!/bin/bash
 # Online DSpark Training Script
 #
-# Runs the full online DSpark training pipeline: data preparation, vLLM server
-# launch, and training (with hidden states generated on-the-fly from the live
-# server). DSpark extends DFlash with a Markov head (intra-block token
-# dependency) and a confidence head (per-position acceptance prediction); the
-# pipeline is the DFlash one plus a few DSpark-specific flags.
+# Runs the full online DSpark training pipeline using the unified `speculators`
+# CLI end-to-end: vLLM server launch, data preparation, and training (with
+# hidden states generated on-the-fly from the live server). DSpark extends
+# DFlash with a Markov head (intra-block token dependency) and a confidence
+# head (per-position acceptance prediction); the pipeline is the DFlash one
+# plus a few DSpark-specific flags.
 #
-# Usage: Keep copies beside common/, modify the configuration variables, then run:
+# For natural-language datasets (sharegpt/ultrachat), `prepare-data` derives
+# loss masks from vLLM's render boundaries, so it needs a live server via
+# `--render-endpoint`. The vLLM server is therefore launched FIRST; the same
+# server also streams hidden states during training.
+#
+# Usage: Copy this script, modify the configuration variables below, then run:
 #   bash examples/train/dspark_qwen3_0_6b_sharegpt_online.sh
 #
 # For a detailed walkthrough, see
-# https://docs.vllm.ai/projects/speculators/en/latest/user_guide/tutorials/train_dflash_online/
+# https://docs.vllm.ai/projects/speculators/en/latest/user_guide/tutorials/train/
 
 ### Example E2E run for DSpark Qwen3-0.6B on 5k samples from ShareGPT ###
 
@@ -20,7 +26,6 @@
 # later-position accuracy over plain DFlash).
 
 set -euo pipefail
-source "$(dirname "${BASH_SOURCE[0]}")/common/dspark_online_args.sh"
 
 # ============ Configuration ============
 MODEL="Qwen/Qwen3-0.6B"
@@ -29,14 +34,14 @@ OUTPUT_DIR="./output/dspark_qwen3_0_6b_sharegpt"
 VLLM_PORT=8000
 MAX_SAMPLES=5000
 SEQ_LENGTH=4096
-EPOCHS=10
+EPOCHS=5
 LR=3e-4
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="dspark"
-BLOCK_SIZE=7
+BLOCK_SIZE=8
 MAX_ANCHORS=3072
-NUM_LAYERS=5
+NUM_LAYERS=3
 DRAFT_VOCAB_SIZE=32000
 TARGET_LAYER_IDS="2 14 25"  # Must match vLLM's eagle_aux_hidden_state_layer_ids
 
@@ -45,7 +50,6 @@ MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 CONFIDENCE_HEAD_ALPHA=1.0
-CONFIDENCE_LOSS_WEIGHTING="match-draft"
 
 # GPU assignments (online training needs separate GPUs for vLLM and training)
 VLLM_GPUS="0"
@@ -53,18 +57,11 @@ TRAIN_GPUS="1"
 NUM_TRAIN_GPUS=1
 # =======================================
 
-# Step 1: Prepare data
-echo "=== Step 1: Preparing data ==="
-python scripts/prepare_data.py \
-    --model "$MODEL" \
-    --data "$DATASET" \
-    --output "$OUTPUT_DIR" \
-    --max-samples "$MAX_SAMPLES" \
-    --seq-length "$SEQ_LENGTH" \
-    --disable-thinking
-
-# Step 2: Launch vLLM server in the background
-echo "=== Step 2: Launching vLLM server ==="
+# Step 1: Launch vLLM server in the background
+# The same server serves both prepare-data's render endpoint (Step 2) and the
+# hidden-state stream during training (Step 3), so it must expose the target
+# layers via --target-layer-ids.
+echo "=== Step 1: Launching vLLM server ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     -- --port "$VLLM_PORT" &
@@ -84,12 +81,43 @@ until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
 done
 echo "vLLM server ready."
 
+# Step 2: Prepare data
+# sharegpt is a natural-language dataset, so prepare-data needs the live server
+# to render conversations and derive loss masks (--render-endpoint).
+echo "=== Step 2: Preparing data ==="
+speculators prepare-data \
+    --model "$MODEL" \
+    --data "$DATASET" \
+    --output "$OUTPUT_DIR" \
+    --max-samples "$MAX_SAMPLES" \
+    --seq-length "$SEQ_LENGTH" \
+    --render-endpoint "http://localhost:${VLLM_PORT}"
+
 # Step 3: Train DSpark against the live vLLM server
 echo "=== Step 3: Training ==="
-build_dspark_online_train_args
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
-    scripts/train.py \
-    "${DSPARK_TRAIN_ARGS[@]}"
+    -m speculators.train \
+    --verifier-name-or-path "$MODEL" \
+    --data-path "$OUTPUT_DIR" \
+    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
+    --save-path "$OUTPUT_DIR/checkpoints" \
+    --draft-vocab-size "$DRAFT_VOCAB_SIZE" \
+    --epochs "$EPOCHS" \
+    --lr "$LR" \
+    --total-seq-len "$SEQ_LENGTH" \
+    --speculator-type "$SPECULATOR_TYPE" \
+    --block-size "$BLOCK_SIZE" \
+    --max-anchors "$MAX_ANCHORS" \
+    --num-layers "$NUM_LAYERS" \
+    --target-layer-ids $TARGET_LAYER_IDS \
+    --markov-rank "$MARKOV_RANK" \
+    --markov-head-type "$MARKOV_HEAD_TYPE" \
+    --enable-confidence-head \
+    --confidence-head-with-markov \
+    --loss-fn "$LOSS_FN" \
+    --confidence-head-alpha "$CONFIDENCE_HEAD_ALPHA" \
+    --on-missing generate \
+    --on-generate delete
 
 echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"

@@ -26,8 +26,13 @@ loss implementations. Upstream selects the new defaults and fused loss interface
 Do not change recipes while resuming optimizer state without checking group and
 scheduler compatibility.
 
-The original Qwen ShareGPT example remains unchanged. Its upstream counterpart is
-`examples/train/dspark_qwen3_0_6b_sharegpt_upstream.sh`.
+The standard `examples/train/dspark_qwen3_0_6b_sharegpt_online.sh` now matches the
+merged upstream example. The duplicate `_upstream.sh` copy has been removed.
+The fork's prior 10-epoch, 7-token, 5-layer experiment lives in
+`examples/train/configs/local/dspark_qwen3_0_6b_sharegpt.yaml`, with an explicit
+legacy training recipe and separate data/checkpoint directories. Run it through
+the typed entrypoint; see the [local configuration guide](../../examples/train/configs/local/README.md).
+Ascend/MMuse/DSV4 launchers and their compatibility entrypoints are unchanged.
 
 ## Included and preserved
 

@@ -50,6 +50,7 @@ STUBS = r"""
 capture_call() {
     local kind="$1"
     shift
+    printf '%s\n' "$kind" >> "$CAPTURE_DIR/stages"
     printf '%s\0' "$@" > "$CAPTURE_DIR/$kind.argv"
     command env > "$CAPTURE_DIR/$kind.env"
     printf '%s\n' "$PWD" > "$CAPTURE_DIR/$kind.cwd"
@@ -59,6 +60,12 @@ python() {
         scripts/prepare_data.py) capture_call prepare "$@" ;;
         scripts/launch_vllm.py) capture_call server "$@" ;;
         *) printf 'Unexpected Python command: %s\n' "$*" >&2; return 97 ;;
+    esac
+}
+speculators() {
+    case "$1" in
+        prepare-data) capture_call prepare "$@" ;;
+        *) printf 'Unexpected speculators command: %s\n' "$*" >&2; return 97 ;;
     esac
 }
 # Keep env assignments local to this invocation and execute only the fake commands.
@@ -76,6 +83,8 @@ torchrun() {
 }
 curl_calls=0
 curl() {
+    # The fake health check must wait for the background server stub, too.
+    while [[ ! -f "$CAPTURE_DIR/server.argv" ]]; do command sleep 0.01; done
     curl_calls=$((curl_calls + 1))
     printf '%s\0' "$@" > "$CAPTURE_DIR/curl-$curl_calls.argv"
     (( curl_calls > 1 ))
@@ -102,12 +111,12 @@ def recipe_values(kind):
         "VLLM_PORT": "8000",
         "MAX_SAMPLES": "5000",
         "SEQ_LENGTH": "8192" if kind == "ascend" else "4096",
-        "EPOCHS": "10",
+        "EPOCHS": "10" if kind == "ascend" else "5",
         "LR": "3e-4",
         "SPECULATOR_TYPE": "dspark",
-        "BLOCK_SIZE": "7",
+        "BLOCK_SIZE": "7" if kind == "ascend" else "8",
         "MAX_ANCHORS": "3072",
-        "NUM_LAYERS": "5",
+        "NUM_LAYERS": "5" if kind == "ascend" else "3",
         "DRAFT_VOCAB_SIZE": "32000",
         "TARGET_LAYER_IDS": "2 18 33" if kind == "ascend" else "2 14 25",
         "MARKOV_RANK": "256",
@@ -119,7 +128,7 @@ def recipe_values(kind):
     }
 
 
-def expected_train_arguments(values, attention_args=()):
+def expected_train_arguments(values, attention_args=(), *, legacy=True):
     return [
         "--verifier-name-or-path",
         values["MODEL"],
@@ -158,8 +167,11 @@ def expected_train_arguments(values, attention_args=()):
         values["LOSS_FN"],
         "--confidence-head-alpha",
         values["CONFIDENCE_HEAD_ALPHA"],
-        "--confidence-loss-weighting",
-        values["CONFIDENCE_LOSS_WEIGHTING"],
+        *(
+            ["--confidence-loss-weighting", values["CONFIDENCE_LOSS_WEIGHTING"]]
+            if legacy
+            else []
+        ),
         "--on-missing",
         "generate",
         "--on-generate",
@@ -253,10 +265,11 @@ class DSparkOnlineScriptTests(unittest.TestCase):
         return result, captures, values
 
     def assert_recipe_contract(self, kind, captures, values):
+        legacy = kind == "ascend"
         self.assertEqual(
             self.arguments(captures, "prepare"),
             [
-                "scripts/prepare_data.py",
+                "scripts/prepare_data.py" if legacy else "prepare-data",
                 "--model",
                 values["MODEL"],
                 "--data",
@@ -267,7 +280,14 @@ class DSparkOnlineScriptTests(unittest.TestCase):
                 values["MAX_SAMPLES"],
                 "--seq-length",
                 values["SEQ_LENGTH"],
-                "--disable-thinking",
+                *(
+                    ["--disable-thinking"]
+                    if legacy
+                    else [
+                        "--render-endpoint",
+                        f"http://localhost:{values['VLLM_PORT']}",
+                    ]
+                ),
             ],
         )
         self.assertEqual(
@@ -296,8 +316,8 @@ class DSparkOnlineScriptTests(unittest.TestCase):
                 "--standalone",
                 "--nproc_per_node",
                 "4" if kind == "ascend" else "1",
-                "scripts/train.py",
-                *expected_train_arguments(values, attention),
+                *(["scripts/train.py"] if legacy else ["-m", "speculators.train"]),
+                *expected_train_arguments(values, attention, legacy=legacy),
             ],
         )
         probe = (
@@ -342,6 +362,12 @@ class DSparkOnlineScriptTests(unittest.TestCase):
         self.assertRegex(owned_pid[0], r"^[1-9][0-9]*$")
         self.assertEqual(self.arguments(captures, "kill"), owned_pid)
         self.assertEqual(self.arguments(captures, "wait"), owned_pid)
+        self.assertEqual(
+            (captures / "stages").read_text().splitlines(),
+            ["prepare", "server", "training"]
+            if legacy
+            else ["server", "prepare", "training"],
+        )
 
     def test_baseline_scripts_preserve_complete_launch_contract(self):
         for kind in RECIPES:

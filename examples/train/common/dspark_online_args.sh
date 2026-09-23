@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Shared baseline DSpark argv for the two full online Qwen examples.
+# Local DSpark argv helper used by the Ascend online Qwen example.
 # Reads their configuration variables and replaces DSPARK_TRAIN_ARGS on each call.
 # Optional arguments (e.g. attention implementation) go before target layer IDs.
 # Device selection, data preparation and server/trainer lifecycles stay in callers.

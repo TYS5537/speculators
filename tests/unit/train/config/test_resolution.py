@@ -659,6 +659,14 @@ RECIPES: dict[str, dict] = {
 }
 
 
+@pytest.mark.parametrize("recipe", list(RECIPES))
+def test_recipe_training_entrypoint_is_extractable_without_bash(recipe: str):
+    # Catch an accidentally substituted legacy launcher even when Bash-only
+    # expansion tests are skipped on a developer's machine.
+    lines = (EXAMPLES / recipe).read_text().splitlines()
+    assert _train_invocation_args(lines).strip()
+
+
 @pytest.mark.skipif(shutil.which("bash") is None, reason="requires bash")
 @pytest.mark.parametrize(("recipe", "expected"), RECIPES.items(), ids=list(RECIPES))
 def test_recipe_flags_resolve_unchanged(recipe: str, expected: dict):

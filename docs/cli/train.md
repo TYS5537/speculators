@@ -15,6 +15,13 @@ These entrypoints share the training runtime, not necessarily their default
 hyperparameters. See [upstream integration notes](../developer/upstream_alignment.md)
 before switching an existing experiment to the typed entrypoint.
 
+Upstream-named examples retain upstream settings. Fork-specific experiments live
+under `examples/train/configs/local/` and use the same typed entrypoint with
+`--config`. For example, `dspark_qwen3_0_6b_sharegpt.yaml` explicitly retains the
+local 10-epoch, 7-token, 5-layer recipe instead of changing the upstream example.
+See the [local configuration guide](../../examples/train/configs/local/README.md)
+for server, data preparation and training commands.
+
 ## Basic Usage
 
 **Single-GPU:**
