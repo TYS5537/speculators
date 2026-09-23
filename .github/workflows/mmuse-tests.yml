@@ -35,6 +35,6 @@ jobs:
         uses: astral-sh/setup-uv@v7
       - name: Install CPU model test dependencies
         # A fixed baseline for numerical resume checks, not a backend version matrix.
-        run: uv pip install ./hs_connectors . "pytest~=9.1.1" "torch==2.12.1" "transformers==4.57.6"
+        run: uv pip install ./hs_connectors . -r tests/mmuse_cpu_requirements.txt
       - name: Run all MMuse CPU and training-resume regressions
         run: make test-mmuse

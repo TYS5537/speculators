@@ -4,10 +4,12 @@ Unit tests for the model module in the Speculators library.
 
 import tempfile
 from typing import Literal
+from unittest.mock import Mock
 
 import pytest
 import torch
 from torch import nn
+from transformers import PretrainedConfig, PreTrainedModel
 
 from speculators import (
     SpeculatorModel,
@@ -283,6 +285,205 @@ def test_from_pretrained_loading_info_keeps_post_load_hooks(
     assert loaded_vocab[0][1] is t2d
     assert loaded_vocab[0][2] is d2t
     assert loaded_verifier == [loaded_model]
+
+
+@pytest.fixture
+def hf_loader(monkeypatch):
+    """Record the concrete HF load without downloading or initializing weights."""
+    loader = Mock()
+    monkeypatch.setattr(
+        PreTrainedModel,
+        "from_pretrained",
+        classmethod(loader),
+    )
+    return loader
+
+
+@pytest.mark.parametrize("loader", [SpeculatorModel, SpeculatorTestModel])
+@pytest.mark.parametrize("requested_info", [False, True])
+@pytest.mark.parametrize("hf_returns_info", [False, True])
+@pytest.mark.parametrize(
+    "hooks",
+    [(), ("vocab",), ("verifier",), ("missing",), ("vocab", "verifier", "missing")],
+)
+def test_pretrained_dispatch_preserves_options_and_hook_order(
+    speculator_model_test_config,
+    monkeypatch,
+    hf_loader,
+    tmp_path,
+    loader,
+    requested_info,
+    hf_returns_info,
+    hooks,
+):
+    config = speculator_model_test_config
+    model = SpeculatorTestModel(config)
+    info = {"missing_keys": ["optional.weight"], "unexpected_keys": []}
+    hf_loader.return_value = (model, info) if hf_returns_info else model
+    calls = []
+    t2d, d2t = torch.tensor([True]), torch.tensor([0])
+    hook_specs = {
+        "vocab": ("load_vocab_mappings", (t2d, d2t)),
+        "verifier": ("load_verifier_weights", ()),
+        "missing": (
+            "_prepare_missing_checkpoint_weights",
+            (info if hf_returns_info else {},),
+        ),
+    }
+    for name in hooks:
+        method, _ = hook_specs[name]
+        monkeypatch.setattr(
+            model,
+            method,
+            lambda *args, name=name: calls.append((name, args)),
+            raising=False,
+        )
+    options = {
+        "cache_dir": tmp_path / "cache",
+        "ignore_mismatched_sizes": True,
+        "force_download": True,
+        "local_files_only": True,
+        "token": "unit-test-token",
+        "revision": "test-revision",
+        "use_safetensors": False,
+        "weights_only": False,
+        "dtype": torch.float32,
+    }
+    constructor_arg = object()
+    result = loader.from_pretrained(
+        tmp_path,
+        constructor_arg,
+        config=config,
+        t2d=t2d,
+        d2t=d2t,
+        verifier="conversion-only-verifier",
+        output_loading_info=requested_info,
+        **options,
+    )
+    hf_loader.assert_called_once_with(
+        SpeculatorTestModel,
+        tmp_path,
+        constructor_arg,
+        config=config,
+        output_loading_info=True,
+        **options,
+    )
+    assert [name for name, _ in calls] == list(hooks)
+    for name, args in calls:
+        expected = hook_specs[name][1]
+        assert len(args) == len(expected)
+        if name == "vocab":
+            assert args[0] is t2d
+            assert args[1] is d2t
+        elif name == "missing":
+            assert args[0] == expected[0]
+            if hf_returns_info:
+                assert args[0] is info
+    if requested_info:
+        assert result[0] is model
+        assert result[1] == (info if hf_returns_info else {})
+        if hf_returns_info:
+            assert result[1] is info
+    else:
+        assert result is model
+
+
+@pytest.mark.parametrize("failing_hook", [0, 1, 2])
+def test_pretrained_hook_failure_stops_subsequent_work(
+    speculator_model_test_config, monkeypatch, hf_loader, failing_hook
+):
+    model = SpeculatorTestModel(speculator_model_test_config)
+    hf_loader.return_value = (model, {})
+    calls = []
+    failure = ValueError("incompatible checkpoint")
+
+    def hook(index, *args):
+        calls.append(index)
+        if index == failing_hook:
+            raise failure
+
+    for index, name in enumerate(
+        (
+            "load_vocab_mappings",
+            "load_verifier_weights",
+            "_prepare_missing_checkpoint_weights",
+        )
+    ):
+        monkeypatch.setattr(
+            model,
+            name,
+            lambda *args, index=index: hook(index, *args),
+            raising=False,
+        )
+    with pytest.raises(ValueError, match="incompatible checkpoint") as raised:
+        SpeculatorModel.from_pretrained("unused", config=speculator_model_test_config)
+    assert raised.value is failure
+    assert calls == list(range(failing_hook + 1))
+
+
+@pytest.mark.parametrize("loader", [SpeculatorModel, SpeculatorTestModel])
+@pytest.mark.parametrize("external", [False, True])
+def test_pretrained_config_resolution_converts_only_external_checkpoints(
+    speculator_model_test_config, monkeypatch, hf_loader, tmp_path, loader, external
+):
+    config = speculator_model_test_config
+    model = SpeculatorTestModel(config)
+    hf_loader.return_value = (model, {})
+    checkpoint = tmp_path / "original"
+    converted = str(tmp_path / "converted")
+    raw_config = {"dflash_config": {}} if external else config.to_dict()
+    inspect_config = Mock(return_value=(raw_config, {}))
+    load_config = Mock(return_value=config)
+    convert = Mock(return_value=converted)
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", inspect_config)
+    monkeypatch.setattr(SpeculatorModelConfig, "from_pretrained", load_config)
+    monkeypatch.setattr(
+        "speculators.convert.entrypoints.maybe_convert_external_checkpoint", convert
+    )
+    options = {
+        "cache_dir": tmp_path / "cache",
+        "force_download": False,
+        "local_files_only": True,
+        "token": "unit-test-token",
+        "revision": "test-revision",
+    }
+    result = loader.from_pretrained(checkpoint, verifier="target", **options)
+    assert result is model
+    inspect_config.assert_called_once_with(checkpoint, cache_dir=options["cache_dir"])
+    if external:
+        convert.assert_called_once_with(
+            checkpoint,
+            verifier="target",
+            cache_dir=options["cache_dir"],
+            config_dict=raw_config,
+        )
+    else:
+        convert.assert_not_called()
+    resolved_path = converted if external else checkpoint
+    load_config.assert_called_once_with(resolved_path, **options)
+    assert hf_loader.call_count == 1
+    assert hf_loader.call_args.args == (SpeculatorTestModel, resolved_path)
+    assert hf_loader.call_args.kwargs["config"] is config
+
+
+def test_pretrained_explicit_config_skips_detection_and_preserves_state_dict(
+    speculator_model_test_config, monkeypatch, hf_loader
+):
+    model = SpeculatorTestModel(speculator_model_test_config)
+    hf_loader.return_value = (model, {})
+    unexpected_read = Mock(
+        side_effect=AssertionError("explicit config must not read files")
+    )
+    monkeypatch.setattr(PretrainedConfig, "get_config_dict", unexpected_read)
+    state_dict = model.state_dict()
+    assert (
+        SpeculatorModel.from_pretrained(
+            None, config=speculator_model_test_config, state_dict=state_dict
+        )
+        is model
+    )
+    unexpected_read.assert_not_called()
+    assert hf_loader.call_args.kwargs["state_dict"] is state_dict
 
 
 @pytest.mark.smoke

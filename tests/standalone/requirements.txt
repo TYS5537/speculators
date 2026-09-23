@@ -2,3 +2,6 @@
 numpy>=2.0.0,<=2.4.6
 datasets>=4.0.0,<=5.0.0
 pyarrow
+# Check CI's numerical pins against the upstream package metadata without Torch.
+packaging
+tomli>=2.0; python_version < '3.11'

@@ -1,0 +1,5 @@
+# Numerical CPU regression baseline; shared by CI and local setup instructions.
+# Keep torch/transformers inside pyproject.toml's upstream dependency ranges.
+torch==2.12.1
+transformers==5.16.1
+pytest~=9.1.1

@@ -106,16 +106,16 @@ make lint
 
 Ruff's version is pinned in `pyproject.toml` so local and CI checks use the same
 rules. `make lint` scans the whole repository and checks formatting. It permits
-only the existing C901 complexity entries in
+only explicitly recorded C901 complexity entries in
 `scripts/quality/lint_baseline.json`, keyed by file and qualified function name,
 not line numbers. New findings, increased complexity, stale entries and tool
 failures fail the gate. When simplifying a listed function, lower its recorded
 complexity or remove its entry once Ruff no longer reports it. Do not refresh the
 baseline to absorb new warnings; it is a refactoring backlog, not a general ignore
-list. Deliberate import/API-boundary exceptions remain narrowly explained beside
-the code.
+list. The baseline is currently empty, so every reported finding fails the gate.
+Deliberate import/API-boundary exceptions remain narrowly explained beside the code.
 
-`make lint-strict` runs unfiltered Ruff checks and currently reports that backlog.
+`make lint-strict` runs Ruff directly and currently passes without baseline exceptions.
 The dedicated Lint workflow runs the lightweight gate on every push and pull
 request. The full quality checks below also run the gate before checking Markdown
 and types; passing `make lint` alone does not mean those additional checks passed.
@@ -166,6 +166,8 @@ This discovers every `test_*.py` in `tests/standalone` using standard-library
 `unittest`, without importing the root pytest fixtures or installing the training
 stack. NumPy, datasets and PyArrow are required so the real Arrow checks are not
 silently skipped. The Make target checks those imports before running the suite.
+Lightweight packaging/TOML dependencies also check that the MMuse CPU test pins
+remain compatible with the upstream package requirements.
 Use `make test-fast PYTHON=python3` to select a different interpreter.
 
 Without Make, run the same import check and test command directly:
@@ -204,8 +206,10 @@ This entry point automatically includes `tests/unit/models/test_mmuse_*.py` and
 `tests/unit/train/test_mmuse_*.py`. New CPU MMuse unit-test modules following those
 names join the suite without another Makefile or workflow edit. Shared activation
 checkpointing, CLI/draft initialization, RoPE configuration, vocabulary startup
-and the training-resume integration test remain explicitly included; unrelated
-model/service tests are not collected.
+and the training-resume integration test remain explicitly included. Shared model
+loading, verifier-weight ownership, external-checkpoint conversion, typed config
+and legacy/upstream recipe contracts are also included; unrelated model/service
+tests are not collected.
 Keep accelerator and external-service tests in separate integration targets.
 
 Coverage includes architecture/configuration round trips, Correction caching and
@@ -223,14 +227,17 @@ This is a deterministic training-resume check, not a claim of exact FP32
 master-weight, mid-epoch, validation/best-checkpoint or distributed replay.
 
 The `MMuse CPU tests` GitHub workflow runs this target separately from the fast
-standalone suite. Its numerical baseline is Python 3.12, CPU PyTorch 2.12.1 and
-Transformers 4.57.6; it is not a GPU/NPU or dependency-version compatibility matrix.
-To reproduce that environment on Linux, install uv and run:
+standalone suite. It uses Python 3.12 and the numerical CPU baseline in
+`tests/mmuse_cpu_requirements.txt`, shared with the local installation command.
+The Torch/Transformers pins must satisfy the upstream ranges in `pyproject.toml`;
+the standalone suite checks this after dependency updates. This is not a GPU/NPU
+or dependency-version compatibility matrix. To reproduce it on Linux, install uv
+and run:
 
 ```bash
 uv venv --python 3.12 .venv
 source .venv/bin/activate
-UV_TORCH_BACKEND=cpu uv pip install ./hs_connectors . "pytest~=9.1.1" "torch==2.12.1" "transformers==4.57.6"
+UV_TORCH_BACKEND=cpu uv pip install ./hs_connectors . -r tests/mmuse_cpu_requirements.txt
 HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 make test-mmuse
 ```
 
@@ -243,13 +250,14 @@ environment for this target.
 ### Offline Evaluation Boundaries
 
 The existing `scripts/evaluate/dspark_offline_eval.py` command remains the entry
-point for DSpark/MMuse evaluation. Its model loading, decoding, verification and
-per-request timing stay together for now. The lightweight `src/speculators_eval/`
-package owns the backend-independent parts:
+point for DSpark/MMuse evaluation. Backend-specific model loading, decoding,
+verification and per-request timing remain in that script. The lightweight
+`src/speculators_eval/` package owns the backend-independent parts:
 
 - `data.py`: dataset discovery, stable identities, deterministic sample caps,
   prompt formatting and sample sharding.
-- `reporting.py`: acceptance counters, weighted summaries and CSV/JSON artifacts.
+- `reporting.py`: acceptance counters, weighted summaries, shared base-speedup
+  calculation and CSV/JSON artifacts.
 - `parallel.py`: worker arguments, device-isolated child launch, failure cleanup
   and shard aggregation. The caller supplies the original script entrypoint.
 
@@ -259,15 +267,94 @@ initializing model backends. The script re-exports its existing data/reporting
 helpers for compatibility. New integrations should import their owning modules;
 tests should patch dependencies where they are used, not the compatibility aliases.
 
+Within the script, `_prepare_target_backend` validates the target/transport and
+publishes backend metadata before `_run` chooses parent-worker dispatch or local
+execution. `_load_evaluation_models` retains the backend-import and seeding order;
+`_load_evaluation_draft` owns config binding, overrides, vocabulary checks and
+precision, while `_load_dsv4_target` constructs remote clients and tokenization.
+`_log_loaded_draft` validates/reports the sequential head before
+`_evaluate_loaded_models` constructs runners and executes the dataset loop.
+The named setup/model records hold references only. `run` still owns one
+`ExitStack`: each DSV4 client is registered immediately and remains open through
+result writing; setup errors, evaluation errors and interrupts unwind in reverse
+acquisition order. Do not move model loading ahead of worker dispatch or close
+clients inside the initialization helpers.
+
+For each dataset, `_evaluate_dataset` keeps selection/sharding and generation in
+order. `_warmup_dataset` owns paired draft/base warmup and the subsequent device
+sync/RNG reset, including when the warmup count or shard is empty.
+`_log_dataset_progress` reports a caller-timed snapshot without reading the clock
+or mutating counters. Unpaired runs still use the outer wall-clock interval;
+paired runs accumulate only synchronized generation times. Keep progress creation,
+prompt formatting, artifact collection and log cadence at their existing timing
+boundaries. Both local rows and worker aggregation use
+`reporting.add_base_speedup_metrics`; aggregation retains its slowest-worker time
+and zero-base-time guard. Do not sum worker elapsed times or include warmup tokens.
+
+`verify_draft_tokens` owns input checks, the target forward, diagnostic truncation
+and replacement/bonus sampling. `_compute_draft_acceptance` computes full-proposal
+acceptance and support statistics; `_accepted_stop_prefix_length` locates the
+first stop only within accepted draft tokens, excluding the anchor and rejected
+suffix. The prefix mask stays full-width while probability diagnostics may be
+truncated. Preserve the uniform draw for every proposed position, even in greedy
+mode, and the continuation draw after an accepted stop: the outer decoder drops
+that token, but the draw remains part of the RNG contract. Missing/invalid draft
+probabilities still fail after the target forward; size/anchor checks precede it.
+
 `make test-fast` includes package/import boundaries and worker lifecycle checks.
+It also tests the complete evaluator startup with fake backends, covering preflight
+errors, HF/DSV4 arguments, reference/block and file/HTTP modes, parent/worker
+dispatch, partial client acquisition, interrupts and cleanup failures. Real-tensor
+dtype tests call the draft-loading helper directly rather than extracting source
+statements from `_run`. Dataset-loop tests use deterministic clocks and fake
+runners to cover warmup/generation ordering, timing boundaries, progress logging,
+source indices, empty shards, artifacts, zero denominators and partial-pair errors.
 With the CPU model dependencies installed, also run the evaluator regressions:
 
 ```bash
 PYTHONPATH=src:hs_connectors/src python -m pytest --noconftest -p no:cacheprovider -o addopts='' tests/unit/evaluate/test_dspark_offline*.py tests/unit/evaluate/test_dsv4_offline_target.py tests/unit/evaluate/test_dsv4_block_connector.py
 ```
 
+Verifier tests cover branch outputs, FP32/FP16/BF16 logits, temperature modes,
+stop/rejection positions, residual fallback, validation order and exact CPU RNG
+state. The decoding-loop and DSV4 reference/block tests additionally cover output
+budgets, committed tokens, cache cropping and context updates.
+
 These checks preserve sample selection, proposal/acceptance math, output schemas
 and launch arguments. They do not replace real NPU/vLLM integration checks.
+
+### Response Regeneration Boundaries
+
+The compatibility script `scripts/response_regeneration/script.py` keeps its
+existing CLI and boundary-sample format. The upstream
+`speculators.cli.regenerate_responses` command is a separate implementation with
+different options/output handling; do not silently route one through the other.
+
+Within the compatibility script, `_regeneration_sampling_params` copies sampling
+options and applies thinking overrides, `_chat_completion_payload` preserves
+script-owned request fields, and `_next_cached_tool_result` pairs one generated
+call with one cached source result. Tool calls are never executed. The async
+`regenerate_conversation` loop still commits each valid sample before checking
+whether a tool result can be paired. Missing results, parallel calls and name
+mismatches keep that call sample but truncate all remaining turns. A cached
+result with `content=None` is not the same as a missing result.
+
+Retry/backoff stays in `_post_chat` via the shared `with_retries` decorator, not
+around the conversation loop. `worker` writes samples only after regeneration
+finishes, including clean truncation; a regeneration failure writes only an error
+record with the count of completed generations. Cancellation propagates while
+finishing the queue item. Successful request statistics include retry latency;
+completion-token totals count the published samples, not failed conversations.
+
+Run the compatibility and upstream regressions together with CPU dependencies:
+
+```bash
+PYTHONPATH=src:hs_connectors/src python -m pytest --noconftest -p no:cacheprovider -o addopts='' tests/unit/scripts/test_response_regeneration.py tests/unit/scripts/test_response_regeneration_contracts.py tests/unit/scripts/test_upstream_response_regeneration.py
+```
+
+These tests use fake HTTP responses and no network. They cover payload ownership,
+thinking options, sequential tool chains, boundary snapshots, resume identities,
+partial failures, request retries, statistics and cancellation/queue cleanup.
 
 ### Running All Tests
 

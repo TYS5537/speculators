@@ -389,55 +389,19 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
         :param kwargs: Additional keyword arguments passed to the model constructor
             and loading process.
         :return: A SpeculatorModel instance of the appropriate subclass, loaded with
-            the pretrained weights and configuration.
+            the pretrained weights and configuration. With ``output_loading_info``,
+            returns the model and HF loading diagnostics after all post-load hooks.
         """
-        if not config:
-            if not pretrained_model_name_or_path:
-                raise ValueError(
-                    "Either `config` or `pretrained_model_name_or_path` must be "
-                    "provided to load a SpeculatorModel."
-                )
-            # Auto-convert external (non-speculators) checkpoints so one
-            # `from_pretrained` pathway finetunes both formats. Detect format
-            # once here and only invoke the converter when needed.
-            config_dict, _ = PretrainedConfig.get_config_dict(
-                pretrained_model_name_or_path, cache_dir=cache_dir
-            )
-            if "speculators_model_type" not in config_dict:
-                from speculators.convert.entrypoints import (  # noqa: PLC0415
-                    maybe_convert_external_checkpoint,
-                )
-
-                pretrained_model_name_or_path = maybe_convert_external_checkpoint(
-                    pretrained_model_name_or_path,
-                    verifier=verifier,
-                    cache_dir=cache_dir,
-                    config_dict=config_dict,
-                )
-            config = cls.config_class.from_pretrained(
-                pretrained_model_name_or_path,
-                cache_dir=cache_dir,
-                force_download=force_download,
-                local_files_only=local_files_only,
-                token=token,
-                revision=revision,
-            )
-
-        if not isinstance(config, SpeculatorModelConfig):
-            raise TypeError(
-                f"Expected config to be an instance of SpeculatorModelConfig, "
-                f"got {type(config)}."
-            )
-
-        from speculators.models.mmuse.compat import (  # noqa: PLC0415
-            migrate_legacy_model_config,
+        pretrained_model_name_or_path, config = cls._resolve_pretrained_config(
+            pretrained_model_name_or_path,
+            config=config,
+            cache_dir=cache_dir,
+            force_download=force_download,
+            local_files_only=local_files_only,
+            token=token,
+            revision=revision,
+            verifier=verifier,
         )
-
-        config_dict = config.to_dict()
-        migrated = migrate_legacy_model_config(config_dict)
-        if migrated is not config_dict:
-            config = SpeculatorModelConfig.from_dict(migrated)
-
         if not pretrained_model_name_or_path and not kwargs.get("state_dict"):
             raise ValueError(
                 "Either `pretrained_model_name_or_path` or `state_dict` must be "
@@ -487,6 +451,84 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
             output_loading_info=True,
             **kwargs,
         )
+        model, loading_info = cls._finalize_pretrained_load(loaded, t2d, d2t)
+        return (model, loading_info) if requested_loading_info else model
+
+    @classmethod
+    def _resolve_pretrained_config(
+        cls,
+        pretrained_model_name_or_path: str | os.PathLike | None,
+        *,
+        config: PretrainedConfig | str | os.PathLike | None,
+        cache_dir: str | os.PathLike | None,
+        force_download: bool,
+        local_files_only: bool,
+        token: str | bool | None,
+        revision: str,
+        verifier: str | None,
+    ) -> tuple[str | os.PathLike | None, SpeculatorModelConfig]:
+        """Resolve checkpoint format and identity before dispatch or weight loading.
+
+        Conversion may replace the checkpoint path. Legacy MMuse migration changes
+        only the config identity; an explicit config skips external-format detection.
+        Keep this stage before the weight-source check to preserve error ordering.
+        """
+        if not config:
+            if not pretrained_model_name_or_path:
+                raise ValueError(
+                    "Either `config` or `pretrained_model_name_or_path` must be "
+                    "provided to load a SpeculatorModel."
+                )
+            config_dict, _ = PretrainedConfig.get_config_dict(
+                pretrained_model_name_or_path, cache_dir=cache_dir
+            )
+            if "speculators_model_type" not in config_dict:
+                from speculators.convert.entrypoints import (  # noqa: PLC0415
+                    maybe_convert_external_checkpoint,
+                )
+
+                pretrained_model_name_or_path = maybe_convert_external_checkpoint(
+                    pretrained_model_name_or_path,
+                    verifier=verifier,
+                    cache_dir=cache_dir,
+                    config_dict=config_dict,
+                )
+            config = cls.config_class.from_pretrained(
+                pretrained_model_name_or_path,
+                cache_dir=cache_dir,
+                force_download=force_download,
+                local_files_only=local_files_only,
+                token=token,
+                revision=revision,
+            )
+
+        if not isinstance(config, SpeculatorModelConfig):
+            raise TypeError(
+                f"Expected config to be an instance of SpeculatorModelConfig, "
+                f"got {type(config)}."
+            )
+
+        from speculators.models.mmuse.compat import (  # noqa: PLC0415
+            migrate_legacy_model_config,
+        )
+
+        config_dict = config.to_dict()
+        migrated = migrate_legacy_model_config(config_dict)
+        if migrated is not config_dict:
+            config = SpeculatorModelConfig.from_dict(migrated)
+        return pretrained_model_name_or_path, config
+
+    @staticmethod
+    def _finalize_pretrained_load(
+        loaded: "SpeculatorModel | tuple[SpeculatorModel, dict]",
+        t2d: torch.Tensor | None,
+        d2t: torch.Tensor | None,
+    ) -> "tuple[SpeculatorModel, dict]":
+        """Restore mappings, verifier weights, then model-specific missing weights.
+
+        HF diagnostics retain their identity and are returned only after the hooks
+        succeed. Accept model-only results for compatible custom HF loaders.
+        """
         if isinstance(loaded, tuple):
             model, loading_info = loaded
         else:
@@ -499,7 +541,7 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
         prepare_missing = getattr(model, "_prepare_missing_checkpoint_weights", None)
         if prepare_missing is not None:
             prepare_missing(loading_info)
-        return (model, loading_info) if requested_loading_info else model
+        return model, loading_info
 
     @classmethod
     def registered_model_class_from_config(

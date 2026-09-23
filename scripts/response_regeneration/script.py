@@ -512,6 +512,61 @@ def _sample_from_response(
     return sample, assistant_msg, tool_calls
 
 
+def _regeneration_sampling_params(
+    sampling_params: dict[str, Any], enable_thinking: bool | None
+) -> dict[str, Any]:
+    """Copy request options and apply thinking overrides without changing inputs."""
+    effective_sampling_params = dict(sampling_params)
+    if enable_thinking is not None:
+        raw_chat_template_kwargs = effective_sampling_params.get("chat_template_kwargs")
+        if raw_chat_template_kwargs is not None and not isinstance(
+            raw_chat_template_kwargs, dict
+        ):
+            raise ValueError("chat_template_kwargs must be a JSON object")
+        chat_template_kwargs = dict(raw_chat_template_kwargs or {})
+        chat_template_kwargs["enable_thinking"] = enable_thinking
+        effective_sampling_params["chat_template_kwargs"] = chat_template_kwargs
+    return effective_sampling_params
+
+
+def _chat_completion_payload(
+    *,
+    prefix: list[dict[str, Any]],
+    tools: list | None,
+    model: str,
+    max_tokens: int,
+    sampling_params: dict[str, Any],
+) -> dict[str, Any]:
+    """Build one request, preserving owned keys and the live conversation prefix."""
+    payload: dict[str, Any] = {
+        # Spread first: the keys below must not be overridden by sampling params.
+        **sampling_params,
+        "model": model,
+        "messages": prefix,
+        "max_tokens": max_tokens,
+        "return_token_ids": True,  # prompt_token_ids + completion token_ids
+    }
+    if tools:
+        payload["tools"] = tools
+        payload["tool_choice"] = "auto"
+    return payload
+
+
+def _next_cached_tool_result(
+    tool_calls: list, tool_results: deque[tuple[Any, list[str]]]
+) -> dict[str, Any] | None:
+    """Consume one matching cached result, or return None to truncate; never execute."""
+    # TODO(regen): support parallel/multi tool calls. Until then no 1:1 pairing
+    # is possible, so the caller keeps the committed call sample and truncates.
+    if len(tool_calls) != 1 or not tool_results:
+        return None
+    content, result_names = tool_results.popleft()
+    call_name = (tool_calls[0].get("function") or {}).get("name")
+    if result_names and call_name not in result_names:
+        return None
+    return _tool_result_message(tool_calls[0], content)
+
+
 async def regenerate_conversation(
     post_fn,
     item: dict[str, Any],
@@ -541,16 +596,9 @@ async def regenerate_conversation(
     tool_results = deque(item.get("tool_results") or [])
     conv_id = item["primary_id"]
 
-    effective_sampling_params = dict(sampling_params)
-    if enable_thinking is not None:
-        raw_chat_template_kwargs = effective_sampling_params.get("chat_template_kwargs")
-        if raw_chat_template_kwargs is not None and not isinstance(
-            raw_chat_template_kwargs, dict
-        ):
-            raise ValueError("chat_template_kwargs must be a JSON object")
-        chat_template_kwargs = dict(raw_chat_template_kwargs or {})
-        chat_template_kwargs["enable_thinking"] = enable_thinking
-        effective_sampling_params["chat_template_kwargs"] = chat_template_kwargs
+    effective_sampling_params = _regeneration_sampling_params(
+        sampling_params, enable_thinking
+    )
 
     prefix: list[dict[str, Any]] = []
     truncated = False
@@ -565,18 +613,13 @@ async def regenerate_conversation(
         # Tool-call loop: a tool call splices a cached result and continues;
         # a final answer ends the turn.
         while True:
-            payload: dict[str, Any] = {
-                # Spread first: the keys below are ours to own and must not be
-                # overridden by user-supplied sampling params.
-                **effective_sampling_params,
-                "model": model,
-                "messages": prefix,
-                "max_tokens": max_tokens,
-                "return_token_ids": True,  # prompt_token_ids + completion token_ids
-            }
-            if tools:
-                payload["tools"] = tools
-                payload["tool_choice"] = "auto"
+            payload = _chat_completion_payload(
+                prefix=prefix,
+                tools=tools,
+                model=model,
+                max_tokens=max_tokens,
+                sampling_params=effective_sampling_params,
+            )
 
             data = await post_fn(payload)
             sample, assistant_msg, tool_calls = _sample_from_response(
@@ -594,25 +637,14 @@ async def regenerate_conversation(
             if not tool_calls:
                 break  # final answer: this user turn is done
 
-            # To continue past a tool call we need exactly one call and a cached
-            # result to pair with it; otherwise keep this (committed) call row
-            # and truncate.
-            # TODO(regen): support parallel/multi tool calls -- a turn with >1
-            # call truncates here (dropped ~16/50 rows in a Hermes validation run).
-            if len(tool_calls) != 1 or not tool_results:
+            # Commit the call sample before pairing; even a clean truncation
+            # keeps that row. A tool message whose content is None is still valid.
+            tool_message = _next_cached_tool_result(tool_calls, tool_results)
+            if tool_message is None:
                 truncated = True
                 break
 
-            content, result_names = tool_results.popleft()
-            call_name = (tool_calls[0].get("function") or {}).get("name")
-            # Splice only if the regenerated call is for the tool this cached
-            # result answers; a different tool cannot be paired coherently, so
-            # keep the committed call row and truncate.
-            if result_names and call_name not in result_names:
-                truncated = True
-                break
-
-            prefix.append(_tool_result_message(tool_calls[0], content))
+            prefix.append(tool_message)
 
         if truncated:
             break

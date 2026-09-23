@@ -257,18 +257,32 @@ def aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
         base_total_output_tokens = sum(
             int(row.get("base_total_output_tokens", 0)) for row in rows
         )
-        base_tps = base_total_output_tokens / base_elapsed_s
-        summary.update(
-            {
-                "base_elapsed_s": base_elapsed_s,
-                "base_output_tokens_per_second": base_tps,
-                "base_total_output_tokens": base_total_output_tokens,
-                "speedup_vs_base": (
-                    summary["output_tokens_per_second"] / base_tps if base_tps else 0.0
-                ),
-            }
+        add_base_speedup_metrics(
+            summary,
+            base_elapsed_s=base_elapsed_s,
+            base_total_output_tokens=base_total_output_tokens,
         )
     return summary
+
+
+def add_base_speedup_metrics(
+    row: dict[str, Any],
+    *,
+    base_elapsed_s: float,
+    base_total_output_tokens: int,
+) -> None:
+    """Update a summary in place using the caller's measured/aggregated base time."""
+    base_tps = base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
+    row.update(
+        {
+            "base_elapsed_s": base_elapsed_s,
+            "base_output_tokens_per_second": base_tps,
+            "base_total_output_tokens": base_total_output_tokens,
+            "speedup_vs_base": (
+                row["output_tokens_per_second"] / base_tps if base_tps else 0.0
+            ),
+        }
+    )
 
 
 def summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str, Any]:

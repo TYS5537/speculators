@@ -60,9 +60,9 @@ python scripts/train.py \
   --dflash-gated-layer-fusion
 ```
 
-MMuse inherits DSpark's training defaults (block size 7, five decoder layers,
-10 epochs, CE/TV weights 0.1/0.9). Extensions remain opt-in; choosing MMuse alone
-does not silently enable Correction or change its parameters. Extension flags
+With the legacy recipe, MMuse inherits DSpark's training defaults (block size 7,
+five decoder layers, 10 epochs, CE/TV weights 0.1/0.9). Extensions remain opt-in;
+choosing MMuse alone does not silently enable Correction or change its parameters. Extension flags
 retain their existing names, including the `dflash-` and `dflash2-` prefixes.
 Passing them with a baseline type for a fresh run produces an error directing you
 to MMuse. When restoring, the saved model type determines which options apply.
@@ -100,23 +100,31 @@ handling. Reading a config alone does not construct modules or run these full
 cross-option checks. Decoder/vocabulary-dependent checks remain in the modules
 that know those dimensions.
 
-`src/speculators/train/cli.py` owns parser construction, algorithm-specific default
-resolution and post-parse validation as separate steps. `scripts/train.py` retains
-the zero-argument `parse_args()` entry point. The reusable `parse_train_args(argv)`
-uses the same argument list for initial parsing and all explicit-option tracking;
+`src/speculators/train/legacy_cli.py` owns historical parser construction,
+algorithm-specific default resolution and post-parse validation as separate steps.
+`scripts/train.py` retains the zero-argument `parse_args()` entry point. The reusable
+`parse_train_args(argv)` uses the same argument list for initial parsing and all explicit-option tracking;
 omitting `argv` continues to use the process command line. Validation order and
 the distinction between parser errors and ordinary validation exceptions are
 preserved.
 
-Default resolution dispatches the DSpark paper recipe only for DSpark/MMuse,
+The upstream typed YAML/CLI lives in `src/speculators/train/config/`, while
+`src/speculators/train/cli.py` runs the shared training workflow and re-exports
+legacy parser helpers for compatibility. The old script selects typed parsing
+when `--config`, `--dump-config`, or `--training-recipe` is supplied. Legacy script
+arguments are adapted into the same `TrainConfig` without treating parser defaults
+as explicit checkpoint overrides. See [upstream integration](../../developer/upstream_alignment.md)
+for recipe selection and migration boundaries.
+
+Legacy default resolution dispatches the DSpark paper recipe only for DSpark/MMuse,
 then fills shared decoder/normalization/Muon values only where they are `None`.
 The recipe uses explicit-option tracking, not comparison with parser defaults:
 an explicit value equal to a parser default still wins. Omitted decay gamma is
 derived from the resolved block size. Alias normalization and checkpoint override
 tracking stay in the finalizer; applying defaults does not enable MMuse extensions.
 
-`src/speculators/train/mmuse_args.py` registers the MMuse backbone/Selector and
-Correction CLI options using one defaults mapping supplied by the parser builder.
+`src/speculators/train/mmuse_args.py` registers the legacy MMuse backbone/Selector
+and Correction CLI options using one defaults mapping supplied by the parser builder.
 The two groups retain their original order around DSpark's baseline head options,
 including Boolean disable flags and the mutually exclusive greedy/global search
 switches. Hidden-state backends register their options when each parser is built.
@@ -260,6 +268,15 @@ and two-rank CPU Gloo success and failure when that backend is available.
 
 Generic `SpeculatorModelConfig.from_pretrained` and
 `SpeculatorModel.from_pretrained` resolve the model type from the saved config.
+Model loading keeps three separate responsibilities in `src/speculators/model.py`:
+`_resolve_pretrained_config` handles upstream external-checkpoint conversion and
+legacy model identity migration; `from_pretrained` dispatches the concrete model
+and delegates weight loading to Transformers; `_finalize_pretrained_load` restores
+vocabulary mappings, verifier weights and model-specific missing weights in that
+order. Loading diagnostics keep the same object and are returned only after those
+hooks succeed. Errors still stop subsequent hooks; checkpoint keys, weight
+ownership and public arguments are unchanged.
+
 The existing `scripts/evaluate/dspark_offline_eval.py` and both debug probes accept
 DSpark and MMuse without renaming the scripts or changing baseline evaluation.
 

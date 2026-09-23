@@ -2,11 +2,11 @@
 
 # ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
 
-import ast
 import importlib.util
 import sys
 from pathlib import Path
-from types import SimpleNamespace
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -31,38 +31,7 @@ def evaluator():
     return module
 
 
-@pytest.fixture(scope="module")
-def loader_code():
-    # Execute the actual loader block without importing Transformers or a target.
-    tree = ast.parse(EVALUATOR.read_text(encoding="utf-8"))
-    run = next(
-        node
-        for node in tree.body
-        if isinstance(node, ast.FunctionDef) and node.name == "_run"
-    )
-    start = next(
-        index
-        for index, node in enumerate(run.body)
-        if isinstance(node, ast.Assign)
-        and any(
-            isinstance(target, ast.Name) and target.id == "draft_dtype"
-            for target in node.targets
-        )
-    )
-    stop = next(
-        index
-        for index in range(start, len(run.body))
-        if isinstance(run.body[index], ast.Expr)
-        and isinstance(run.body[index].value, ast.Call)
-        and isinstance(run.body[index].value.func, ast.Name)
-        and run.body[index].value.func.id == "_ensure_loaded_vocab_mappings"
-    )
-    return compile(
-        ast.Module(body=run.body[start:stop], type_ignores=[]), str(EVALUATOR), "exec"
-    )
-
-
-def load_draft(loader_code, *, target_dtype, checkpoint_dtype, backend="hf"):
+def load_draft(evaluator, monkeypatch, *, target_dtype, checkpoint_dtype, backend="hf"):
     calls = []
 
     class TinyDraft(torch.nn.Module):
@@ -88,30 +57,53 @@ def load_draft(loader_code, *, target_dtype, checkpoint_dtype, backend="hf"):
         def _fuse_target_hidden(self, hidden_states):
             return self.fc(hidden_states)
 
-    namespace = {
-        "torch": torch,
-        "SpeculatorModel": TinyDraft,
-        "args": SimpleNamespace(draft_model="local-checkpoint", dtype="auto"),
-        "draft_config": object(),
-        "target_backend": backend,
-        "target_model": None
-        if backend == "dsv4-vllm"
-        else SimpleNamespace(dtype=target_dtype),
-        "device": torch.device("cpu"),
-        "d2t": None,
-        "t2d": None,
-    }
-    exec(loader_code, namespace)  # noqa: S102 -- Compiled local loader statements.
-    return namespace["draft_model"], calls
+    args = SimpleNamespace(
+        draft_model="local-checkpoint",
+        dtype="auto",
+        device="cpu",
+        sample_from_anchor=None,
+        draft_attn_impl="auto",
+        d2t_path=None,
+        t2d_path=None,
+    )
+    config = SimpleNamespace(transformer_layer_config=SimpleNamespace())
+    report = {"model_path": "local-target"} if backend == "dsv4-vllm" else None
+    setup = evaluator._TargetSetup(backend, {}, report, None)
+    monkeypatch.setattr(evaluator, "_load_draft_config", lambda _path: config)
+    monkeypatch.setattr(
+        evaluator, "_load_vocab_mapping_tensors", lambda **kwargs: (None, None)
+    )
+    checked_mapping = Mock()
+    monkeypatch.setattr(evaluator, "_ensure_loaded_vocab_mappings", checked_mapping)
+    contract = ModuleType("speculators_dsv4.eval_contract")
+    contract.bind_draft_verifier = Mock()
+    monkeypatch.setitem(sys.modules, contract.__name__, contract)
+    draft, returned_config = evaluator._load_evaluation_draft(
+        args,
+        setup,
+        None if backend == "dsv4-vllm" else SimpleNamespace(dtype=target_dtype),
+        torch.device("cpu"),
+        model_class=TinyDraft,
+    )
+    assert returned_config is config
+    checked_mapping.assert_called_once_with(draft, args)
+    if backend == "dsv4-vllm":
+        contract.bind_draft_verifier.assert_called_once_with(config, report)
+    else:
+        contract.bind_draft_verifier.assert_not_called()
+    return draft, calls
 
 
 @pytest.mark.parametrize("target_dtype", [torch.bfloat16, torch.float32])
 @pytest.mark.parametrize("checkpoint_dtype", [torch.bfloat16, torch.float32])
 def test_hf_draft_matches_loaded_target_and_accepts_its_hidden_states(
-    evaluator, loader_code, target_dtype, checkpoint_dtype
+    evaluator, monkeypatch, target_dtype, checkpoint_dtype
 ):
     draft, calls = load_draft(
-        loader_code, target_dtype=target_dtype, checkpoint_dtype=checkpoint_dtype
+        evaluator,
+        monkeypatch,
+        target_dtype=target_dtype,
+        checkpoint_dtype=checkpoint_dtype,
     )
     assert calls == [{"torch_dtype": target_dtype}]
     assert not draft.training
@@ -127,9 +119,10 @@ def test_hf_draft_matches_loaded_target_and_accepts_its_hidden_states(
     assert torch.isfinite(logits).all()
 
 
-def test_dsv4_draft_stays_bf16_without_a_local_target(loader_code):
+def test_dsv4_draft_stays_bf16_without_a_local_target(evaluator, monkeypatch):
     draft, calls = load_draft(
-        loader_code,
+        evaluator,
+        monkeypatch,
         target_dtype=None,
         checkpoint_dtype=torch.float32,
         backend="dsv4-vllm",
@@ -140,10 +133,13 @@ def test_dsv4_draft_stays_bf16_without_a_local_target(loader_code):
 
 @pytest.mark.parametrize("sparse", [False, True])
 def test_bf16_correction_still_computes_previous_softmax_in_fp32(
-    loader_code, monkeypatch, sparse
+    evaluator, monkeypatch, sparse
 ):
     draft, _ = load_draft(
-        loader_code, target_dtype=torch.bfloat16, checkpoint_dtype=torch.float32
+        evaluator,
+        monkeypatch,
+        target_dtype=torch.bfloat16,
+        checkpoint_dtype=torch.float32,
     )
     definitions = load_module(
         "dspark_dtype_head_test",

@@ -18,6 +18,9 @@ test-fast:
 # All MMuse unit tests + shared checkpointing/training contracts; CPU dependencies.
 test-mmuse:
 	PYTHONPATH=src:hs_connectors/src $(PYTHON) -m pytest --noconftest -p no:cacheprovider -o addopts='' \
+		tests/unit/test_model.py \
+		tests/unit/convert/test_entrypoints.py \
+		tests/unit/models/test_checkpoint_key_ownership.py \
 		$(MMUSE_MODEL_TESTS) \
 		tests/unit/models/test_activation_checkpointing.py \
 		$(MMUSE_TRAIN_TESTS) \
@@ -25,6 +28,8 @@ test-mmuse:
 		tests/unit/train/test_draft_config_init.py \
 		tests/unit/train/test_rope_config.py \
 		tests/unit/train/test_vocab_mapping_startup.py \
+		tests/unit/train/test_upstream_alignment.py \
+		tests/unit/train/config \
 		tests/integration/train/test_mmuse_training_resume.py
 
 # Lightweight gate: no training dependencies, no new or growing lint debt.

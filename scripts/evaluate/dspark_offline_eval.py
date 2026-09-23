@@ -283,6 +283,67 @@ def _ensure_loaded_vocab_mappings(draft_model, args: argparse.Namespace) -> None
     draft_model.load_vocab_mappings(t2d, d2t)
 
 
+def _compute_draft_acceptance(
+    *,
+    proposal: DraftProposal,
+    target_probs,
+    draft_token_count: int,
+) -> tuple[Any | None, Any | None, Any | None, int]:
+    """Return the full prefix mask, probability diagnostics and accepted count."""
+    if draft_token_count <= 0:
+        return None, None, None, 0
+    if proposal.draft_probs is None:
+        raise ValueError("draft_probs is required when draft_token_count > 0")
+    proposed_tokens = proposal.verify_input_ids[:, 1:]
+    selected_target_probs = gather_token_probs(
+        target_probs[:, :-1, :],
+        proposed_tokens,
+    )
+    selected_draft_probs = gather_token_probs(
+        proposal.draft_probs,
+        proposed_tokens,
+    )
+    accept_probs = _rejection_acceptance_probs(
+        selected_target_probs,
+        selected_draft_probs,
+    )
+    support_accept_rates = torch.minimum(
+        proposal.draft_probs[:, :draft_token_count, :],
+        target_probs[:, :draft_token_count, :],
+    ).sum(dim=-1)
+    # Do not skip greedy or post-EOS positions: RNG advances for the full proposal.
+    accept_mask = (torch.rand_like(accept_probs) < accept_probs).to(torch.int64)
+    accept_prefix_mask = accept_mask.cumprod(dim=1)
+    accepted_draft_tokens = int(accept_prefix_mask.sum(dim=1)[0].item())
+    return (
+        accept_prefix_mask,
+        accept_probs,
+        support_accept_rates,
+        accepted_draft_tokens,
+    )
+
+
+def _accepted_stop_prefix_length(
+    *,
+    verify_input_ids,
+    accepted_draft_tokens: int,
+    stop_token_ids: list[int] | None,
+) -> int | None:
+    """Find the first stop within accepted draft tokens, excluding the anchor."""
+    if not stop_token_ids or accepted_draft_tokens <= 0:
+        return None
+    accepted_slice = verify_input_ids[0, 1 : accepted_draft_tokens + 1]
+    stop_tensor = torch.tensor(
+        stop_token_ids,
+        device=accepted_slice.device,
+        dtype=accepted_slice.dtype,
+    )
+    eos_hits = torch.isin(accepted_slice, stop_tensor).nonzero(as_tuple=True)[0]
+    if eos_hits.numel() > 0:
+        return int(eos_hits[0].item()) + 1
+    return None
+
+
 def verify_draft_tokens(
     *,
     target_model,
@@ -316,49 +377,28 @@ def verify_draft_tokens(
     )
     target_probs = logits_to_probs(target_output.logits, float(temperature))
 
-    accept_prefix_mask = None
-    accept_probs = None
-    support_accept_rates = None
-    if draft_token_count > 0:
-        if proposal.draft_probs is None:
-            raise ValueError("draft_probs is required when draft_token_count > 0")
-        proposed_tokens = proposal.verify_input_ids[:, 1:]
-        selected_target_probs = gather_token_probs(
-            target_probs[:, :-1, :],
-            proposed_tokens,
-        )
-        selected_draft_probs = gather_token_probs(
-            proposal.draft_probs,
-            proposed_tokens,
-        )
-        accept_probs = _rejection_acceptance_probs(
-            selected_target_probs,
-            selected_draft_probs,
-        )
-        support_accept_rates = torch.minimum(
-            proposal.draft_probs[:, :draft_token_count, :],
-            target_probs[:, :draft_token_count, :],
-        ).sum(dim=-1)
-        accept_mask = (torch.rand_like(accept_probs) < accept_probs).to(torch.int64)
-        accept_prefix_mask = accept_mask.cumprod(dim=1)
-        accepted_draft_tokens = int(accept_prefix_mask.sum(dim=1)[0].item())
-    else:
-        accepted_draft_tokens = 0
+    (
+        accept_prefix_mask,
+        accept_probs,
+        support_accept_rates,
+        accepted_draft_tokens,
+    ) = _compute_draft_acceptance(
+        proposal=proposal,
+        target_probs=target_probs,
+        draft_token_count=draft_token_count,
+    )
 
     effective_proposal_length = draft_token_count
     terminated_by_stop_token = False
-    if stop_token_ids and accepted_draft_tokens > 0:
-        accepted_slice = proposal.verify_input_ids[0, 1 : accepted_draft_tokens + 1]
-        stop_tensor = torch.tensor(
-            stop_token_ids,
-            device=accepted_slice.device,
-            dtype=accepted_slice.dtype,
-        )
-        eos_hits = torch.isin(accepted_slice, stop_tensor).nonzero(as_tuple=True)[0]
-        if eos_hits.numel() > 0:
-            accepted_draft_tokens = int(eos_hits[0].item()) + 1
-            effective_proposal_length = accepted_draft_tokens
-            terminated_by_stop_token = True
+    stop_prefix_length = _accepted_stop_prefix_length(
+        verify_input_ids=proposal.verify_input_ids,
+        accepted_draft_tokens=accepted_draft_tokens,
+        stop_token_ids=stop_token_ids,
+    )
+    if stop_prefix_length is not None:
+        accepted_draft_tokens = stop_prefix_length
+        effective_proposal_length = accepted_draft_tokens
+        terminated_by_stop_token = True
 
     # Keep probability diagnostics aligned with the EOS-truncated proposal.
     if effective_proposal_length < draft_token_count:
@@ -367,6 +407,8 @@ def verify_draft_tokens(
         if support_accept_rates is not None:
             support_accept_rates = support_accept_rates[:, :effective_proposal_length]
 
+    # Keep the continuation draw after an accepted stop too. The outer decoder
+    # discards that token, but skipping the draw would change later RNG state.
     if draft_token_count > 0 and accepted_draft_tokens < draft_token_count:
         next_token = sample_residual(
             target_probs[:, accepted_draft_tokens, :],
@@ -1113,6 +1155,81 @@ def _timed_generate(runner, prompt: str, stop_token_ids: list[int] | None):
     return response, time.perf_counter() - start_time
 
 
+def _warmup_dataset(
+    *,
+    dataset: str,
+    path: Path,
+    indexed_records: list[tuple[int, dict[str, Any]]],
+    runner: DSparkOfflineRunner,
+    base_runner: BaseModelOfflineRunner | None,
+    args: argparse.Namespace,
+    stop_token_ids: list[int] | None,
+) -> None:
+    """Warm up paired throughput runs, then reset RNG before any measured work."""
+    if base_runner is None:
+        return
+    warmup_samples = int(args.throughput_warmup_samples)
+    if warmup_samples < 0:
+        raise ValueError("--throughput-warmup-samples must be >= 0")
+    warmup_records = indexed_records[:warmup_samples]
+    if warmup_records:
+        logger.info(
+            "[%s] warming up DSpark and base model with %d sample(s)",
+            dataset,
+            len(warmup_records),
+        )
+    for idx, record in warmup_records:
+        prompt = _prompt_from_record(
+            record,
+            runner.tokenizer,
+            source=f"{path}:{idx}",
+            args=args,
+        )
+        runner.generate_one(prompt, stop_token_ids)
+        base_runner.generate_one(prompt, stop_token_ids)
+    _synchronize_device(runner.device)
+    torch.manual_seed(args.seed)
+
+
+def _log_dataset_progress(
+    *,
+    dataset: str,
+    processed: int,
+    total: int,
+    stats: EvalStats,
+    elapsed: float,
+    paired: bool,
+    base_elapsed_s: float,
+    base_total_output_tokens: int,
+) -> None:
+    """Report a caller-timed snapshot without reading the clock or changing stats."""
+    out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
+    if not paired:
+        logger.info(
+            "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | acc_len=%.3f",
+            dataset,
+            processed,
+            total,
+            stats.total_output_tokens,
+            out_tps,
+            stats.acceptance_length,
+        )
+    else:
+        base_tps = base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
+        speedup = out_tps / base_tps if base_tps else 0.0
+        logger.info(
+            "[%s] %d/%d samples | DSpark=%.2f tok/s | "
+            "base=%.2f tok/s | speedup=%.3fx | acc_len=%.3f",
+            dataset,
+            processed,
+            total,
+            out_tps,
+            base_tps,
+            speedup,
+            stats.acceptance_length,
+        )
+
+
 def _evaluate_dataset(
     *,
     path: Path,
@@ -1149,29 +1266,18 @@ def _evaluate_dataset(
     base_elapsed_s = 0.0
     base_total_output_tokens = 0
 
-    if base_runner is not None:
-        warmup_samples = int(args.throughput_warmup_samples)
-        if warmup_samples < 0:
-            raise ValueError("--throughput-warmup-samples must be >= 0")
-        warmup_records = indexed_records[:warmup_samples]
-        if warmup_records:
-            logger.info(
-                "[%s] warming up DSpark and base model with %d sample(s)",
-                dataset,
-                len(warmup_records),
-            )
-        for idx, record in warmup_records:
-            prompt = _prompt_from_record(
-                record,
-                runner.tokenizer,
-                source=f"{path}:{idx}",
-                args=args,
-            )
-            runner.generate_one(prompt, stop_token_ids)
-            base_runner.generate_one(prompt, stop_token_ids)
-        _synchronize_device(runner.device)
-        torch.manual_seed(args.seed)
+    _warmup_dataset(
+        dataset=dataset,
+        path=path,
+        indexed_records=indexed_records,
+        runner=runner,
+        base_runner=base_runner,
+        args=args,
+        stop_token_ids=stop_token_ids,
+    )
 
+    # Keep the wall-clock boundary before progress construction. Paired runs
+    # instead accumulate only the synchronized generation times below.
     start_time = time.perf_counter()
     iterator = indexed_records
     if tqdm is not None and not args.no_progress:
@@ -1225,48 +1331,25 @@ def _evaluate_dataset(
                 if base_runner is not None
                 else time.perf_counter() - start_time
             )
-            out_tps = stats.total_output_tokens / elapsed if elapsed else 0.0
-            if base_runner is None:
-                logger.info(
-                    "[%s] %d/%d samples | out_tok=%d | tok/s=%.2f | acc_len=%.3f",
-                    dataset,
-                    processed,
-                    len(indexed_records),
-                    stats.total_output_tokens,
-                    out_tps,
-                    stats.acceptance_length,
-                )
-            else:
-                base_tps = (
-                    base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
-                )
-                speedup = out_tps / base_tps if base_tps else 0.0
-                logger.info(
-                    "[%s] %d/%d samples | DSpark=%.2f tok/s | "
-                    "base=%.2f tok/s | speedup=%.3fx | acc_len=%.3f",
-                    dataset,
-                    processed,
-                    len(indexed_records),
-                    out_tps,
-                    base_tps,
-                    speedup,
-                    stats.acceptance_length,
-                )
+            _log_dataset_progress(
+                dataset=dataset,
+                processed=processed,
+                total=len(indexed_records),
+                stats=stats,
+                elapsed=elapsed,
+                paired=base_runner is not None,
+                base_elapsed_s=base_elapsed_s,
+                base_total_output_tokens=base_total_output_tokens,
+            )
 
     if base_runner is None:
         stats.elapsed_s = time.perf_counter() - start_time
     row = _summary_row(dataset, len(indexed_records), stats)
     if base_runner is not None:
-        base_tps = base_total_output_tokens / base_elapsed_s if base_elapsed_s else 0.0
-        row.update(
-            {
-                "base_elapsed_s": base_elapsed_s,
-                "base_output_tokens_per_second": base_tps,
-                "base_total_output_tokens": base_total_output_tokens,
-                "speedup_vs_base": (
-                    row["output_tokens_per_second"] / base_tps if base_tps else 0.0
-                ),
-            }
+        _eval_reporting.add_base_speedup_metrics(
+            row,
+            base_elapsed_s=base_elapsed_s,
+            base_total_output_tokens=base_total_output_tokens,
         )
     return row, artifacts
 
@@ -1384,8 +1467,28 @@ def _prepare_hs_http(args, target_backend):
     return args.hs_http_endpoint
 
 
-def _run(args: argparse.Namespace, resources: ExitStack) -> None:
-    global torch, DynamicCache  # noqa: PLW0603 -- Load backends after worker dispatch.
+@dataclass(frozen=True)
+class _TargetSetup:
+    """Validated target metadata; no loaded model or service client."""
+
+    backend: str
+    target_config: dict
+    report: dict | None
+    hs_http_endpoint: str | None
+
+
+@dataclass(frozen=True)
+class _LoadedEvaluation:
+    """References shared by runner construction and evaluation, without ownership."""
+
+    target_model: Any
+    draft_model: Any
+    tokenizer: Any
+    draft_config: Any
+
+
+def _prepare_target_backend(args: argparse.Namespace) -> _TargetSetup:
+    """Validate transport/cache contracts and publish metadata before dispatch."""
     target_backend = getattr(args, "target_backend", "hf")
     hs_http_endpoint = _prepare_hs_http(args, target_backend)
     target_config = _validate_target_cache_support(args.verifier_model, target_backend)
@@ -1403,12 +1506,27 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
             raise ValueError("DSV4 evaluation requires --dtype bfloat16")
         report = inspect_checkpoint(args.verifier_model)
         _write_backend_metadata(args, report)
+    return _TargetSetup(target_backend, target_config, report, hs_http_endpoint)
+
+
+def _run(args: argparse.Namespace, resources: ExitStack) -> None:
+    setup = _prepare_target_backend(args)
     if (
         getattr(args, "ascend_devices", None)
         and getattr(args, "worker_shard_index", None) is None
     ):
         run_ascend_data_parallel(args)
         return
+    models = _load_evaluation_models(args, setup, resources)
+    _log_loaded_draft(models.draft_model, models.draft_config)
+    _evaluate_loaded_models(args, models)
+
+
+def _load_evaluation_models(
+    args: argparse.Namespace, setup: _TargetSetup, resources: ExitStack
+) -> _LoadedEvaluation:
+    """Load models only in a single-device process, after parent dispatch."""
+    global torch, DynamicCache  # noqa: PLW0603 -- Existing decoding helpers use these.
 
     import torch as torch_module  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
@@ -1423,7 +1541,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
 
     target_model = None
-    if target_backend == "hf":
+    if setup.backend == "hf":
         tokenizer = AutoTokenizer.from_pretrained(
             args.verifier_model,
             trust_remote_code=args.trust_remote_code,
@@ -1438,11 +1556,32 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
             .eval()
         )
 
+    draft_model, draft_config = _load_evaluation_draft(
+        args, setup, target_model, device, model_class=SpeculatorModel
+    )
+    if setup.backend == "dsv4-vllm":
+        target_model, tokenizer = _load_dsv4_target(args, setup, draft_model, resources)
+    return _LoadedEvaluation(target_model, draft_model, tokenizer, draft_config)
+
+
+def _load_evaluation_draft(
+    args: argparse.Namespace,
+    setup: _TargetSetup,
+    target_model,
+    device,
+    *,
+    model_class,
+):
+    """Bind target identity and overrides before loading/casting draft weights.
+
+    The caller imports the model class before seeding, retaining the original
+    import/RNG order. Keep precision resolution after config and vocabulary checks.
+    """
     draft_config = _load_draft_config(args.draft_model)
-    if target_backend == "dsv4-vllm":
+    if setup.backend == "dsv4-vllm":
         from speculators_dsv4.eval_contract import bind_draft_verifier  # noqa: PLC0415
 
-        bind_draft_verifier(draft_config, report)
+        bind_draft_verifier(draft_config, setup.report)
     sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
     if sample_from_anchor is not None:
         draft_config.sample_from_anchor = sample_from_anchor
@@ -1456,10 +1595,8 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     )
     # Use the loaded target's dtype, including the dtype resolved by HF's "auto".
     # Older supported Transformers versions otherwise load the draft in FP32.
-    draft_dtype = (
-        torch.bfloat16 if target_backend == "dsv4-vllm" else target_model.dtype
-    )
-    draft_model = SpeculatorModel.from_pretrained(
+    draft_dtype = torch.bfloat16 if setup.backend == "dsv4-vllm" else target_model.dtype
+    draft_model = model_class.from_pretrained(
         args.draft_model,
         config=draft_config,
         d2t=d2t,
@@ -1469,54 +1606,65 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
     # from_pretrained also refreshes borrowed verifier weights before returning.
     draft_model = draft_model.to(device=device, dtype=draft_dtype).eval()
     _ensure_loaded_vocab_mappings(draft_model, args)
-    if target_backend == "dsv4-vllm":
-        from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
+    return draft_model, draft_config
 
-        import openai  # noqa: PLC0415
 
-        from speculators_dsv4.offline import DSV4OfflineTarget  # noqa: PLC0415
-        from speculators_dsv4.tokenizer import DSV4ServerTokenizer  # noqa: PLC0415
+def _load_dsv4_target(
+    args: argparse.Namespace, setup: _TargetSetup, draft_model, resources: ExitStack
+):
+    """Register each client immediately; the run's ExitStack owns both lifetimes."""
+    from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
 
-        client = openai.OpenAI(
-            base_url=args.vllm_endpoint,
-            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-            timeout=args.target_request_timeout,
-            max_retries=0,
-        )
-        resources.callback(client.close)
-        target_model = DSV4OfflineTarget(
-            draft_model,
-            report,
-            hidden_states_path=args.hidden_states_path,
-            client=client,
-            model_name=args.served_model_name,
-            max_model_len=args.dsv4_max_model_len,
-            timeout=args.target_request_timeout,
-            keep_hidden_states=args.keep_target_hs,
-            verification_mode=args.dsv4_verification_mode,
-            hs_http_endpoint=hs_http_endpoint,
-            hs_http_token=os.environ.get("DSV4_HS_HTTP_TOKEN"),
-        )
-        endpoint = urlsplit(args.vllm_endpoint)
-        root_path = endpoint.path.rstrip("/").removesuffix("/v1")
-        tokenizer_client = openai.OpenAI(
-            base_url=urlunsplit((endpoint.scheme, endpoint.netloc, root_path, "", "")),
-            api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-            timeout=args.target_request_timeout,
-            max_retries=0,
-        )
-        resources.callback(tokenizer_client.close)
-        tokenizer = DSV4ServerTokenizer(
-            tokenizer_client,
-            target_model.model_name,
-            target_model.generation_config.eos_token_id,
-            vocab_size=target_config["vocab_size"],
-        )
-        logger.warning(
-            "DSV4 %s verification uses full-prefix recomputation and native target "
-            "probabilities. Reported elapsed time is NOT online speculative speed.",
-            args.dsv4_verification_mode,
-        )
+    import openai  # noqa: PLC0415
+
+    from speculators_dsv4.offline import DSV4OfflineTarget  # noqa: PLC0415
+    from speculators_dsv4.tokenizer import DSV4ServerTokenizer  # noqa: PLC0415
+
+    client = openai.OpenAI(
+        base_url=args.vllm_endpoint,
+        api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+        timeout=args.target_request_timeout,
+        max_retries=0,
+    )
+    resources.callback(client.close)
+    target_model = DSV4OfflineTarget(
+        draft_model,
+        setup.report,
+        hidden_states_path=args.hidden_states_path,
+        client=client,
+        model_name=args.served_model_name,
+        max_model_len=args.dsv4_max_model_len,
+        timeout=args.target_request_timeout,
+        keep_hidden_states=args.keep_target_hs,
+        verification_mode=args.dsv4_verification_mode,
+        hs_http_endpoint=setup.hs_http_endpoint,
+        hs_http_token=os.environ.get("DSV4_HS_HTTP_TOKEN"),
+    )
+    endpoint = urlsplit(args.vllm_endpoint)
+    root_path = endpoint.path.rstrip("/").removesuffix("/v1")
+    tokenizer_client = openai.OpenAI(
+        base_url=urlunsplit((endpoint.scheme, endpoint.netloc, root_path, "", "")),
+        api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
+        timeout=args.target_request_timeout,
+        max_retries=0,
+    )
+    resources.callback(tokenizer_client.close)
+    tokenizer = DSV4ServerTokenizer(
+        tokenizer_client,
+        target_model.model_name,
+        target_model.generation_config.eos_token_id,
+        vocab_size=setup.target_config["vocab_size"],
+    )
+    logger.warning(
+        "DSV4 %s verification uses full-prefix recomputation and native target "
+        "probabilities. Reported elapsed time is NOT online speculative speed.",
+        args.dsv4_verification_mode,
+    )
+    return target_model, tokenizer
+
+
+def _log_loaded_draft(draft_model, draft_config) -> None:
+    """Validate the sequential head and report the loaded architecture."""
     if draft_model.correction_head is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
@@ -1550,6 +1698,16 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
         sys.modules[type(draft_model).__module__].__file__,
     )
 
+
+def _evaluate_loaded_models(
+    args: argparse.Namespace, models: _LoadedEvaluation
+) -> None:
+    """Construct runners and execute the unchanged dataset/reporting pipeline."""
+    target_model, draft_model, tokenizer = (
+        models.target_model,
+        models.draft_model,
+        models.tokenizer,
+    )
     runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
     base_runner = (
         BaseModelOfflineRunner(target_model, tokenizer, args)
