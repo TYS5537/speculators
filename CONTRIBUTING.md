@@ -97,6 +97,29 @@ To ensure consistency and quality of the codebase, we use [ruff](https://github.
 
 ### Code Quality and Style
 
+For the lightweight Python lint/format gate (no model dependencies required):
+
+```bash
+python -m pip install ruff==0.15.20
+make lint
+```
+
+Ruff's version is pinned in `pyproject.toml` so local and CI checks use the same
+rules. `make lint` scans the whole repository and checks formatting. It permits
+only the existing C901 complexity entries in
+`scripts/quality/lint_baseline.json`, keyed by file and qualified function name,
+not line numbers. New findings, increased complexity, stale entries and tool
+failures fail the gate. When simplifying a listed function, lower its recorded
+complexity or remove its entry once Ruff no longer reports it. Do not refresh the
+baseline to absorb new warnings; it is a refactoring backlog, not a general ignore
+list. Deliberate import/API-boundary exceptions remain narrowly explained beside
+the code.
+
+`make lint-strict` runs unfiltered Ruff checks and currently reports that backlog.
+The dedicated Lint workflow runs the lightweight gate on every push and pull
+request. The full quality checks below also run the gate before checking Markdown
+and types; passing `make lint` alone does not mean those additional checks passed.
+
 To run all quality checks (linting, formatting, type checking):
 
 ```bash
@@ -153,16 +176,16 @@ uses temporary files, local fixtures and a loopback test service; it does not
 download model weights or start actual training or vLLM services. It complements,
 but does not replace, real-model, GPU/NPU and distributed integration tests.
 
-### Muse CPU Model and Training Resume
+### MMuse CPU Model and Training Resume
 
 With the project dependencies and pytest installed, run:
 
 ```bash
-make test-muse
+make test-mmuse
 ```
 
-This entry point automatically includes `tests/unit/models/test_muse_*.py` and
-`tests/unit/train/test_muse_*.py`. New CPU Muse unit-test modules following those
+This entry point automatically includes `tests/unit/models/test_mmuse_*.py` and
+`tests/unit/train/test_mmuse_*.py`. New CPU MMuse unit-test modules following those
 names join the suite without another Makefile or workflow edit. Shared activation
 checkpointing, CLI/draft initialization, RoPE configuration, vocabulary startup
 and the training-resume integration test remain explicitly included; unrelated
@@ -172,7 +195,7 @@ Keep accelerator and external-service tests in separate integration targets.
 Coverage includes architecture/configuration round trips, Correction caching and
 LM-head fusion, metrics, optional backbone features, parallel anchor/gradient
 contracts, rollout feedback/input contracts, and CLI/checkpoint overrides. It also
-trains a tiny real Muse model with the production Trainer, AdamW, a linear scheduler
+trains a tiny real MMuse model with the production Trainer, AdamW, a linear scheduler
 and the single-device checkpointer. It checks that restoring an epoch-boundary
 checkpoint preserves model/optimizer/scheduler state and training progress, and that resumed
 training agrees with an uninterrupted reference run. Parameters use BF16 so the
@@ -183,7 +206,7 @@ vLLM service or accelerator is required.
 This is a deterministic training-resume check, not a claim of exact FP32
 master-weight, mid-epoch, validation/best-checkpoint or distributed replay.
 
-The `Muse CPU tests` GitHub workflow runs this target separately from the fast
+The `MMuse CPU tests` GitHub workflow runs this target separately from the fast
 standalone suite. Its numerical baseline is Python 3.12, CPU PyTorch 2.12.1 and
 Transformers 4.57.6; it is not a GPU/NPU or dependency-version compatibility matrix.
 To reproduce that environment on Linux, install uv and run:
@@ -192,7 +215,7 @@ To reproduce that environment on Linux, install uv and run:
 uv venv --python 3.12 .venv
 source .venv/bin/activate
 UV_TORCH_BACKEND=cpu uv pip install ./hs_connectors . "pytest~=9.1.1" "torch==2.12.1" "transformers==4.57.6"
-HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 make test-muse
+HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 make test-mmuse
 ```
 
 The target uses `--noconftest` to avoid importing unrelated end-to-end service
@@ -200,6 +223,35 @@ fixtures. It imports real model and training modules, rather than extracting
 their source. Normal Linux imports are required because the training stack's
 hidden-state connector imports `fcntl`; native Windows is not a supported
 environment for this target.
+
+### Offline Evaluation Boundaries
+
+The existing `scripts/evaluate/dspark_offline_eval.py` command remains the entry
+point for DSpark/MMuse evaluation. Its model loading, decoding, verification and
+per-request timing stay together for now. The lightweight `src/speculators_eval/`
+package owns the backend-independent parts:
+
+- `data.py`: dataset discovery, stable identities, deterministic sample caps,
+  prompt formatting and sample sharding.
+- `reporting.py`: acceptance counters, weighted summaries and CSV/JSON artifacts.
+- `parallel.py`: worker arguments, device-isolated child launch, failure cleanup
+  and shard aggregation. The caller supplies the original script entrypoint.
+
+Keep these modules independent of `speculators`, Torch and Transformers imports:
+the parent process must be able to inspect data and launch workers without
+initializing model backends. The script re-exports its existing data/reporting
+helpers for compatibility. New integrations should import their owning modules;
+tests should patch dependencies where they are used, not the compatibility aliases.
+
+`make test-fast` includes package/import boundaries and worker lifecycle checks.
+With the CPU model dependencies installed, also run the evaluator regressions:
+
+```bash
+PYTHONPATH=src:hs_connectors/src python -m pytest --noconftest -p no:cacheprovider -o addopts='' tests/unit/evaluate/test_dspark_offline*.py tests/unit/evaluate/test_dsv4_offline_target.py tests/unit/evaluate/test_dsv4_block_connector.py
+```
+
+These checks preserve sample selection, proposal/acceptance math, output schemas
+and launch arguments. They do not replace real NPU/vLLM integration checks.
 
 ### Running All Tests
 

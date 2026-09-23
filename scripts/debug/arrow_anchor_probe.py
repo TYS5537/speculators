@@ -26,7 +26,8 @@ log = logging.getLogger("arrow_anchor_probe")
 
 
 def _load_hidden_state_sample(torch, data, sample_index: int, hidden_states_path: Path):
-    from safetensors.torch import load_file
+    # The optional tensor loader must not initialize a backend for --help.
+    from safetensors.torch import load_file  # noqa: PLC0415
 
     row = data[int(sample_index)]
     input_ids = torch.as_tensor(row["input_ids"], dtype=torch.long)
@@ -305,11 +306,12 @@ def _print_offline_proposal(torch, eval_impl, tokenizer, runner, sample, anchor,
 
 
 def run(args):
-    import torch
-    from datasets import load_from_disk
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+    # Import model dependencies only after argument parsing (including --help).
+    import torch  # noqa: PLC0415
+    from datasets import load_from_disk  # noqa: PLC0415
+    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
 
-    from speculators.model import SpeculatorModel
+    from speculators.model import SpeculatorModel  # noqa: PLC0415
 
     torch.manual_seed(args.seed)
     eval_impl = load_eval_impl(torch)
@@ -338,17 +340,25 @@ def run(args):
     if args.draft_attn_impl != "auto":
         cfg.transformer_layer_config._attn_implementation = args.draft_attn_impl
     d2t, t2d = load_vocab_maps(torch, args)
-    draft = SpeculatorModel.from_pretrained(
-        args.draft_model,
-        config=cfg,
-        d2t=d2t,
-        t2d=t2d,
-    ).to(device).eval()
-    target = AutoModelForCausalLM.from_pretrained(
-        args.verifier_model,
-        torch_dtype=dtype_of(torch, args.dtype),
-        trust_remote_code=args.trust_remote_code,
-    ).to(device).eval()
+    draft = (
+        SpeculatorModel.from_pretrained(
+            args.draft_model,
+            config=cfg,
+            d2t=d2t,
+            t2d=t2d,
+        )
+        .to(device)
+        .eval()
+    )
+    target = (
+        AutoModelForCausalLM.from_pretrained(
+            args.verifier_model,
+            torch_dtype=dtype_of(torch, args.dtype),
+            trust_remote_code=args.trust_remote_code,
+        )
+        .to(device)
+        .eval()
+    )
     runner = eval_impl.DSparkOfflineRunner(
         target,
         draft,

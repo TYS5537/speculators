@@ -10,6 +10,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from speculators_eval import parallel as eval_parallel
+
 
 def _load_module():
     path = Path(__file__).parents[3] / "scripts" / "evaluate" / "dspark_offline_eval.py"
@@ -224,10 +226,14 @@ def test_data_parallel_parent_restores_nested_ids_from_flat_worker_outputs(
             )
 
         @staticmethod
+        def poll():
+            return 0
+
+        @staticmethod
         def wait():
             return 0
 
-    monkeypatch.setattr(module.subprocess, "Popen", Worker)
+    monkeypatch.setattr(eval_parallel.subprocess, "Popen", Worker)
     module.run_ascend_data_parallel(args)
 
     assert worker_directories == [

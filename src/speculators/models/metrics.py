@@ -245,8 +245,7 @@ def neg_log_acceptance_loss(
     # negative numbers (and lose gradient precision) for extremely low overlap.
     offset = log_overlap_terms.amax(dim=-1, keepdim=True).detach()
     elementwise_loss = -(
-        offset.squeeze(-1)
-        + torch.logsumexp(log_overlap_terms - offset, dim=-1)
+        offset.squeeze(-1) + torch.logsumexp(log_overlap_terms - offset, dim=-1)
     )
 
     return elementwise_loss  # noqa: RET504

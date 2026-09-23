@@ -13,7 +13,7 @@ from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash import core as dflash_core
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
-from speculators.models.muse import MuseDraftModel, MuseSpeculatorConfig
+from speculators.models.mmuse import MMuseDraftModel, MMuseSpeculatorConfig
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
@@ -39,8 +39,8 @@ def _make_model(
     )
     transformer_config._attn_implementation = attention_impl
     enhanced = features or correction
-    algorithm = "muse" if enhanced else "dflash"
-    config_class = MuseSpeculatorConfig if enhanced else DFlashSpeculatorConfig
+    algorithm = "mmuse" if enhanced else "dflash"
+    config_class = MMuseSpeculatorConfig if enhanced else DFlashSpeculatorConfig
     feature_kwargs = (
         {
             "markov_rank": 0,
@@ -86,7 +86,7 @@ def _make_model(
         **feature_kwargs,
         **correction_kwargs,
     )
-    model_class = MuseDraftModel if enhanced else DFlashDraftModel
+    model_class = MMuseDraftModel if enhanced else DFlashDraftModel
     model = model_class(config).train()
     with torch.no_grad():
         # These normally come from the target; an unloaded model uses NaN sentinels.
@@ -265,7 +265,7 @@ def test_switch_is_runtime_only_and_inherited(correction):
         for name, value in model.state_dict().items():
             torch.testing.assert_close(value, original_state[name], rtol=0, atol=0)
     assert DSparkDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
-    assert MuseDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
+    assert MMuseDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
 
 
 @pytest.mark.parametrize("attention_impl", ["eager", "sdpa"])

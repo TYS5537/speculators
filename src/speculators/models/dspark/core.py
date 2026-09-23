@@ -21,7 +21,7 @@ __all__ = ["DSparkDraftModel"]
 
 @SpeculatorModel.register("dspark")
 class DSparkDraftModel(DFlashDraftModel):
-    """The baseline sequential Markov drafter; experimental heads live in MUSE."""
+    """The baseline sequential Markov drafter; experimental heads live in MMUSE."""
 
     config_class: ClassVar[type[DSparkSpeculatorConfig]] = DSparkSpeculatorConfig  # type: ignore[misc,assignment]
 
@@ -30,7 +30,7 @@ class DSparkDraftModel(DFlashDraftModel):
         self._init_sequential_heads(config)
 
     def _init_sequential_heads(self, config: DSparkSpeculatorConfig) -> None:
-        """Initialize the baseline heads; MUSE overrides this extension point."""
+        """Initialize the baseline heads; MMUSE overrides this extension point."""
         hidden_size = config.transformer_layer_config.hidden_size
         self.markov_head: MarkovHead | None = None
         # Kept as an empty capability for shared evaluators, not an architecture.

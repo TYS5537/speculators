@@ -7,6 +7,7 @@ import json
 import math
 import sys
 import threading
+from contextlib import ExitStack
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
@@ -14,7 +15,7 @@ import pytest
 import torch
 from safetensors.torch import save_file
 
-from speculators_dsv4 import HS_FORMAT
+from speculators_dsv4 import HS_FORMAT, contract
 from speculators_dsv4 import offline as backend
 from speculators_dsv4.contract import MANIFEST, make_manifest
 from speculators_dsv4.hs_http_server import HiddenStatesServer
@@ -24,14 +25,17 @@ ROOT = Path(__file__).resolve().parents[3]
 
 @pytest.mark.parametrize("mode", ["reference", "block"])
 @pytest.mark.parametrize("keep", [False, True])
+@pytest.mark.parametrize("model_name", [None, "served-target"])
 def test_real_http_transport_preserves_reference_and_block_tensors(
-    target_fixture, tmp_path, mode, keep
+    target_fixture, tmp_path, mode, keep, model_name
 ):
     report = target_fixture.report
     layers = target_fixture.draft.target_layer_ids
     remote, local = tmp_path / "http-server", tmp_path / "downloads"
     remote.mkdir()
-    (remote / MANIFEST).write_text(json.dumps(make_manifest(report, layers)))
+    remote_report = {**report, "model_path": "/server-only/models/dsv4"}
+    (remote / MANIFEST).write_text(json.dumps(make_manifest(remote_report, layers)))
+    served_name = model_name or remote_report["model_path"]
     training_cache = remote / "hs_0.safetensors"
     training_cache.write_bytes(b"training cache must survive")
     token = "fixture-secret-0123456789abcdef0123456789"
@@ -43,6 +47,7 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
     paths = []
 
     def create(**kwargs):
+        assert kwargs["model"] == served_name
         prefix = kwargs["prompt"]
         request_id = kwargs["extra_body"]["request_id"]
         assert request_id.startswith("hshttp-")
@@ -83,7 +88,7 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
         save_file(packet, str(path))
         return SimpleNamespace(
             id=f"cmpl-{request_id}",
-            model="served-target",
+            model=served_name,
             choices=[choice],
             kv_transfer_params=transfer,
         )
@@ -94,13 +99,14 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
             layers,
             hidden_states_path=local,
             client=SimpleNamespace(completions=SimpleNamespace(create=create)),
-            model_name="served-target",
+            model_name=model_name,
             max_model_len=64,
             hs_http_endpoint=f"http://127.0.0.1:{server.server_port}",
             hs_http_token=token,
             verification_mode=mode,
             keep_hidden_states=keep,
         )
+        assert target.model_name == served_name
         cache = target.new_cache()
         for tokens in ([2, 0], [1, 3, 4], [0, 2]):
             start = len(cache.tokens)
@@ -140,6 +146,81 @@ def _load_evaluator():
     return module
 
 
+def test_eval_run_binds_local_verifier_before_loading_weights(
+    target_fixture, tmp_path, monkeypatch
+):
+    evaluator = _load_evaluator()
+    report = target_fixture.report
+    training_path = "/training-host/models/dsv4"
+    layers = target_fixture.draft.target_layer_ids
+    saved_contract = {
+        **make_manifest({**report, "model_path": training_path}, layers),
+        "runtime_quantization": {"method": None},
+    }
+    saved = {
+        "target_hidden_state_format": HS_FORMAT,
+        "aux_hidden_state_layer_ids": layers,
+        "target_training_contract": saved_contract,
+        "speculators_config": {"verifier": {"name_or_path": training_path}},
+    }
+    config = SimpleNamespace(
+        to_dict=lambda: saved,
+        speculators_config=SimpleNamespace(
+            verifier=SimpleNamespace(name_or_path=training_path)
+        ),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "eval",
+            "--target-backend",
+            "dsv4-vllm",
+            "--verifier-model",
+            report["model_path"],
+            "--draft-model",
+            str(tmp_path / "draft"),
+            "--datasets-root",
+            str(tmp_path / "dataset"),
+            "--output-dir",
+            str(tmp_path / "output"),
+            "--hidden-states-path",
+            str(tmp_path / "hs"),
+            "--vllm-endpoint",
+            "http://target.fixture/v1",
+            "--device",
+            "cpu",
+            "--dtype",
+            "bfloat16",
+        ],
+    )
+    args = evaluator.parse_args()
+    monkeypatch.setattr(
+        evaluator, "_validate_target_cache_support", lambda *args: report["config"]
+    )
+    monkeypatch.setattr(contract, "inspect_checkpoint", lambda *args: report)
+    monkeypatch.setattr(evaluator, "_load_draft_config", lambda *args: config)
+    monkeypatch.setattr(
+        evaluator, "_load_vocab_mapping_tensors", lambda **kwargs: (None, None)
+    )
+    monkeypatch.setattr(evaluator, "_resolve_draft_attn_impl", lambda *args: None)
+
+    def load(_path, **kwargs):
+        assert (
+            kwargs["config"].speculators_config.verifier.name_or_path
+            == report["model_path"]
+        )
+        assert saved["speculators_config"]["verifier"]["name_or_path"] == training_path
+        assert saved_contract["model_path"] == training_path
+        raise RuntimeError("test stopped before loading real weights")
+
+    model_module = ModuleType("speculators.model")
+    model_module.SpeculatorModel = SimpleNamespace(from_pretrained=load)
+    monkeypatch.setitem(sys.modules, "speculators.model", model_module)
+    with ExitStack() as resources, pytest.raises(RuntimeError, match="test stopped"):
+        evaluator._run(args, resources)
+
+
 class TinyDraft(torch.nn.Module):
     def __init__(self, model_path):
         super().__init__()
@@ -175,7 +256,7 @@ def target_fixture(tmp_path, monkeypatch):
             "eos_token_id": 4,
         },
     }
-    monkeypatch.setattr(backend, "ensure_manifest", lambda *args, **kwargs: None)
+    monkeypatch.setattr(backend, "read_eval_manifest", lambda _path, expected: expected)
     draft = TinyDraft(model_path)
     target = backend.DSV4OfflineTarget(
         draft_model=draft,

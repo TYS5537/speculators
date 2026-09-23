@@ -28,13 +28,12 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from uuid import uuid4
 
-from speculators_dsv4 import HS_FORMAT
 from speculators_dsv4.contract import (
     ensure_manifest,
     inspect_checkpoint,
     make_manifest,
-    validate_layers,
 )
+from speculators_dsv4.eval_contract import validate_draft_target
 from speculators_dsv4.managed_process import start_process, stop_process
 
 logger = logging.getLogger(__name__)
@@ -250,21 +249,7 @@ def _device_config(args):
 def _draft_layers(args, report):
     config_path = args.draft_model.resolve() / "config.json"
     config = json.loads(config_path.read_text(encoding="utf-8"))
-    if config.get("target_hidden_state_format") != HS_FORMAT:
-        raise ValueError("Draft checkpoint must use the DSV4 hidden-state format")
-    target_path = (
-        config.get("speculators_config", {}).get("verifier", {}).get("name_or_path")
-    )
-    if (
-        not target_path
-        or Path(target_path).resolve() != Path(report["model_path"]).resolve()
-    ):
-        raise ValueError("Draft checkpoint and --verifier-model paths must match")
-    layers = config.get("aux_hidden_state_layer_ids")
-    if not isinstance(layers, list):
-        raise ValueError("Draft checkpoint must specify its auxiliary HS layer IDs")
-    validate_layers(layers)
-    return layers
+    return validate_draft_target(config, report)
 
 
 def _child_env(devices):
@@ -487,7 +472,7 @@ def build_plan(args, *, run_id=None, port=None):
 
 
 class _NoRedirect(HTTPRedirectHandler):
-    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002, PLR0917 -- urllib override.
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ARG002 -- urllib override.
         raise RuntimeError("Refusing readiness redirect away from the managed target")
 
 

@@ -147,7 +147,7 @@ def test_bf16_correction_still_computes_previous_softmax_in_fp32(
     )
     definitions = load_module(
         "dspark_dtype_head_test",
-        ROOT / "src/speculators/models/muse/correction.py",
+        ROOT / "src/speculators/models/mmuse/correction.py",
     )
     head = definitions.CausalCorrectionHead(
         input_hidden_size=4,

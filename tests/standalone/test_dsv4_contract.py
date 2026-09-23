@@ -5,6 +5,8 @@
 import copy
 import json
 import math
+import os
+import shutil
 import struct
 import tempfile
 import unittest
@@ -106,6 +108,27 @@ class ContractTests(unittest.TestCase):
     def inspect_tiny(self, *, require_bf16=False):
         with patch("speculators_dsv4.contract.validate_config"):
             return inspect_checkpoint(self.root, require_bf16=require_bf16)
+
+    def test_relocation_preserves_signature_only_with_original_shard_timestamps(self):
+        self.fixture()
+        original = self.inspect_tiny()
+        relocated = self.root / "relocated"
+        relocated.mkdir()
+        for name in ("config.json", "model.safetensors"):
+            shutil.copy2(self.root / name, relocated / name)
+        with patch("speculators_dsv4.contract.validate_config"):
+            copied = inspect_checkpoint(relocated)
+            self.assertNotEqual(original["model_path"], copied["model_path"])
+            self.assertEqual(
+                original["checkpoint_signature"], copied["checkpoint_signature"]
+            )
+            shard = relocated / "model.safetensors"
+            info = shard.stat()
+            os.utime(shard, ns=(info.st_atime_ns, info.st_mtime_ns + 2_000_000_000))
+            changed = inspect_checkpoint(relocated)
+        self.assertNotEqual(
+            original["checkpoint_signature"], changed["checkpoint_signature"]
+        )
 
     def test_config_accepts_original_quantized_checkpoint_geometry(self):
         validate_config(valid_config())

@@ -298,7 +298,7 @@ def compute_metrics(  # noqa: C901
             ),
             decay_mix=ssal_decay_weight if adaptive_loss == "ssal" else 0.0,
         )
-        decay_fn = lambda pos, **_kw: draft_weights  # noqa: E731
+        decay_fn = lambda _pos, **_kw: draft_weights  # noqa: E731
 
     final_draft_loss, term_losses = compound_loss(
         logits, targets, loss_mask, pos_idx, loss_config=loss_config, decay_fn=decay_fn

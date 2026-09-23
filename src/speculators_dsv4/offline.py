@@ -17,7 +17,8 @@ from uuid import uuid4
 
 from speculators_dsv4 import HS_FORMAT
 from speculators_dsv4.block_protocol import BLOCK_PROTOCOL_VERSION, BLOCK_REQUEST_KEY
-from speculators_dsv4.contract import ensure_manifest, make_manifest, validate_layers
+from speculators_dsv4.contract import make_manifest, validate_layers
+from speculators_dsv4.eval_contract import read_eval_manifest
 
 _LOGPROB_POSITIVE_TOLERANCE = 1e-6
 _TOKEN_BATCH_NDIM = 2
@@ -205,12 +206,15 @@ class DSV4OfflineTarget:
                 self.hidden_states_path,
                 timeout=timeout,
             )
-            self.http_transfer.validate_manifest(manifest)
+            remote_manifest = self.http_transfer.validate_manifest(manifest)
         else:
-            ensure_manifest(self.hidden_states_path, manifest)
+            remote_manifest = read_eval_manifest(self.hidden_states_path, manifest)
         self.packet_layer_ids = [*self.layer_ids, manifest["teacher_hs_id"]]
         if max_model_len <= 1 or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Invalid target context limit or request timeout")
+        # vLLM defaults to the SERVER's model path, not the evaluator's local copy.
+        if model_name is None:
+            model_name = remote_manifest.get("model_path")
         if not isinstance(model_name, str) or not model_name.strip():
             raise ValueError("Target model alias must be a nonempty string")
         if verification_mode not in ("reference", "block"):

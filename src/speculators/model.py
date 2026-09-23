@@ -418,7 +418,7 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
                 f"got {type(config)}."
             )
 
-        from speculators.models.muse.compat import (  # noqa: PLC0415
+        from speculators.models.mmuse.compat import (  # noqa: PLC0415
             migrate_legacy_model_config,
         )
 
@@ -433,12 +433,12 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
                 "provided to load a SpeculatorModel."
             )
 
-        legacy_muse_loader = (
-            config.speculators_model_type == "muse"
+        legacy_mmuse_loader = (
+            config.speculators_model_type == "mmuse"
             and cls.config_class.model_fields["speculators_model_type"].default
             == "dspark"
         )
-        if cls is SpeculatorModel or legacy_muse_loader:
+        if cls is SpeculatorModel or legacy_mmuse_loader:
             # generic call to from_pretrained on this class, need to resolve the
             # specific model class to use for loading based on the config and registry
             model_class = cls.registered_model_class_from_config(config)

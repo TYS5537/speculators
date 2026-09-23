@@ -68,7 +68,7 @@ TRAIN_CMD=(env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   --draft-config examples/train/dsv4_flash_dense_config.json \
   --target-layer-ids 1 11 21 30 40 \
   --mask-token-id 128799 \
-  --speculator-type muse \
+  --speculator-type mmuse \
   --epochs 10 --lr 6e-5 --optimizer muon --scheduler-type linear \
   --logger tensorboard --log-dir "$LOG_DIR/tensorboard" --total-seq-len 3072 \
   --block-size 7 --max-anchors 512 --draft-attn-impl sdpa \

@@ -12,6 +12,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
+from speculators_eval import parallel as eval_parallel
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -138,7 +140,7 @@ class EvalWorkerTests(unittest.TestCase):
                     self.args.max_samples = limit
                     with (
                         patch.object(
-                            self.module.subprocess,
+                            eval_parallel.subprocess,
                             "Popen",
                             side_effect=self.fake_completed_worker,
                         ) as launch,
@@ -182,7 +184,7 @@ class EvalWorkerTests(unittest.TestCase):
             with self.subTest(devices=devices):
                 self.args.ascend_devices = devices
                 with (
-                    patch.object(self.module.subprocess, "Popen") as launch,
+                    patch.object(eval_parallel.subprocess, "Popen") as launch,
                     self.assertRaises(ValueError),
                 ):
                     self.module.run_ascend_data_parallel(self.args)
@@ -223,12 +225,12 @@ class EvalWorkerTests(unittest.TestCase):
         failed = Mock(poll=Mock(return_value=7))
         with (
             patch.object(
-                self.module.subprocess,
+                eval_parallel.subprocess,
                 "Popen",
                 side_effect=[healthy, failed] + [healthy] * 6,
             ),
-            patch.object(self.module, "_stop_eval_worker") as stop,
-            patch.object(self.module.time, "sleep") as sleep,
+            patch.object(eval_parallel, "stop_eval_worker") as stop,
+            patch.object(eval_parallel.time, "sleep") as sleep,
             self.assertRaisesRegex(RuntimeError, "worker failures"),
         ):
             self.module.run_ascend_data_parallel(self.args)
@@ -243,7 +245,7 @@ class EvalWorkerTests(unittest.TestCase):
                 child = Mock(poll=Mock(return_value=None))
                 with (
                     patch.object(
-                        self.module.subprocess, "Popen", side_effect=[child, error]
+                        eval_parallel.subprocess, "Popen", side_effect=[child, error]
                     ),
                     self.assertRaises(type(error)),
                 ):

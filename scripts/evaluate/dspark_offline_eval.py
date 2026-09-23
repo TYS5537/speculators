@@ -11,19 +11,43 @@ token is slot 1.
 from __future__ import annotations
 
 import argparse
-import csv
 import json
 import logging
 import os
-import random
-import subprocess
 import sys
 import time
+from collections.abc import Callable  # noqa: TC003 -- Runtime type hints.
 from contextlib import ExitStack
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Callable
+from typing import Any
+
+from speculators_eval import data as _eval_data
+from speculators_eval import parallel as _eval_parallel
+from speculators_eval import reporting as _eval_reporting
+
+# Keep the script's existing helper API while the package owns implementation.
+_load_jsonl = _eval_data.load_jsonl
+_select_eval_records = _eval_data.select_eval_records
+_prompt_from_record = _eval_data.prompt_from_record
+_discover_datasets = _eval_data.discover_datasets
+_dataset_id = _eval_data.dataset_id
+_split_csv = _eval_data.split_csv
+_shard_records = _eval_data.shard_records
+_dataset_output_path = _eval_reporting.dataset_output_path
+_aggregate_rows = _eval_reporting.aggregate_rows
+_summary_row = _eval_reporting.summary_row
+_write_outputs = _eval_reporting.write_outputs
+_read_worker_row = _eval_reporting.read_worker_row
+_read_worker_artifacts = _eval_reporting.read_worker_artifacts
+_target_worker_args = _eval_parallel.target_worker_args
+_stop_eval_worker = _eval_parallel.stop_eval_worker
+_wait_eval_workers = _eval_parallel.wait_eval_workers
+EvalStats = _eval_reporting.EvalStats
+PROMPT_FIELDS = _eval_data.PROMPT_FIELDS
+DEEPSPEC_EVAL_SAMPLE_LIMITS = _eval_data.DEEPSPEC_EVAL_SAMPLE_LIMITS
+RESULT_COLUMNS = _eval_reporting.RESULT_COLUMNS
 
 try:
     from tqdm import tqdm
@@ -33,56 +57,7 @@ except ImportError:  # pragma: no cover - optional dependency
 logger = logging.getLogger("dspark_offline_eval")
 torch = None
 DynamicCache = None
-
-PROMPT_FIELDS = (
-    "prompt",
-    "input",
-    "question",
-    "instruction",
-    "text",
-    "problem",
-    "problem_statement",
-    "question_content",
-)
-RESULT_COLUMNS = [
-    "dataset",
-    "num_requests",
-    "elapsed_s",
-    "requests_per_second",
-    "output_tokens_per_second",
-    "total_output_tokens",
-    "base_elapsed_s",
-    "base_output_tokens_per_second",
-    "base_total_output_tokens",
-    "speedup_vs_base",
-    "num_proposals",
-    "num_proposed_draft_tokens",
-    "num_accepted_draft_tokens",
-    "draft_length",
-    "acceptance_length",
-    "accepted_draft_length",
-    "position_accept_rates",
-    "position_accept_prob_means",
-    "position_support_accept_rate_means",
-    "position_accept_prob_sums",
-    "position_support_accept_rate_sums",
-    "position_accepted_counts",
-    "position_proposed_counts",
-]
-
-# Keep the default offline-evaluation workload aligned with DeepSpec-Ascend's
-# top-level eval.py. An explicit --max-samples overrides these per-dataset caps.
-DEEPSPEC_EVAL_SAMPLE_LIMITS = {
-    "gsm8k": 500,
-    "math500": 500,
-    "aime25": 30,
-    "humaneval": 164,
-    "mbpp": 256,
-    "livecodebench": 500,
-    "mt-bench": 80,
-    "alpaca": 500,
-    "arena-hard-v2": 500,
-}
+_TOKEN_LOGIT_RANK = 2
 
 
 @dataclass
@@ -104,152 +79,6 @@ class VerificationResult:
     effective_proposal_length: int
     terminated_by_stop_token: bool = False
     committed_tokens: Any | None = None
-
-
-@dataclass
-class EvalStats:
-    elapsed_s: float = 0.0
-    total_output_tokens: int = 0
-    num_proposals: int = 0
-    num_proposed_draft_tokens: int = 0
-    num_accepted_draft_tokens: int = 0
-    position_proposed_counts: list[int] = field(default_factory=list)
-    position_accepted_counts: list[int] = field(default_factory=list)
-    position_accept_prob_sums: list[float] = field(default_factory=list)
-    position_support_accept_rate_sums: list[float] = field(default_factory=list)
-
-    @property
-    def acceptance_length(self) -> float:
-        if self.num_proposals == 0:
-            return 1.0
-        return 1.0 + self.num_accepted_draft_tokens / self.num_proposals
-
-    @property
-    def draft_length(self) -> float:
-        if self.num_proposals == 0:
-            return 0.0
-        return self.num_proposed_draft_tokens / self.num_proposals
-
-    @property
-    def accepted_draft_length(self) -> float:
-        if self.num_proposals == 0:
-            return 0.0
-        return self.num_accepted_draft_tokens / self.num_proposals
-
-    @property
-    def position_accept_rates(self) -> list[float]:
-        return [
-            accepted / proposed if proposed else 0.0
-            for accepted, proposed in zip(
-                self.position_accepted_counts,
-                self.position_proposed_counts,
-                strict=True,
-            )
-        ]
-
-    @property
-    def position_accept_prob_means(self) -> list[float]:
-        return [
-            value / proposed if proposed else 0.0
-            for value, proposed in zip(
-                self.position_accept_prob_sums,
-                self.position_proposed_counts,
-                strict=True,
-            )
-        ]
-
-    @property
-    def position_support_accept_rate_means(self) -> list[float]:
-        return [
-            value / proposed if proposed else 0.0
-            for value, proposed in zip(
-                self.position_support_accept_rate_sums,
-                self.position_proposed_counts,
-                strict=True,
-            )
-        ]
-
-    def add_response(self, response: SimpleNamespace) -> None:
-        self.total_output_tokens += int(response.num_output_tokens)
-        proposal_lengths = getattr(response, "proposal_lengths", [])
-        accepted_lengths = getattr(response, "accepted_draft_lengths", [])
-        accept_prob_lists = getattr(response, "accept_prob_lists", [])
-        support_accept_rate_lists = getattr(response, "support_accept_rate_lists", [])
-        self.num_proposals += len(proposal_lengths)
-        self.num_proposed_draft_tokens += sum(int(x) for x in proposal_lengths)
-        self.num_accepted_draft_tokens += sum(int(x) for x in accepted_lengths)
-        for proposal_len, accepted_len in zip(
-            proposal_lengths,
-            accepted_lengths,
-            strict=True,
-        ):
-            self.add_proposal_positions(int(proposal_len), int(accepted_len))
-        for proposal_len, accept_probs, support_accept_rates in zip(
-            proposal_lengths,
-            accept_prob_lists,
-            support_accept_rate_lists,
-            strict=True,
-        ):
-            self.add_proposal_probability_stats(
-                int(proposal_len),
-                accept_probs,
-                support_accept_rates,
-            )
-
-    def add_proposal_positions(self, proposal_len: int, accepted_len: int) -> None:
-        if accepted_len > proposal_len:
-            raise ValueError(
-                f"accepted_len must not exceed proposal_len: {accepted_len}"
-            )
-        missing = proposal_len - len(self.position_proposed_counts)
-        if missing > 0:
-            self.position_proposed_counts.extend([0] * missing)
-            self.position_accepted_counts.extend([0] * missing)
-        for pos in range(proposal_len):
-            self.position_proposed_counts[pos] += 1
-            if pos < accepted_len:
-                self.position_accepted_counts[pos] += 1
-
-    def add_proposal_probability_stats(
-        self,
-        proposal_len: int,
-        accept_probs: list[float],
-        support_accept_rates: list[float] | None,
-    ) -> None:
-        if len(accept_probs) != proposal_len:
-            raise ValueError("accept_probs length does not match proposal_len")
-        if (
-            support_accept_rates is not None
-            and len(support_accept_rates) != proposal_len
-        ):
-            raise ValueError("support_accept_rates length does not match proposal_len")
-
-        missing = proposal_len - len(self.position_accept_prob_sums)
-        if missing > 0:
-            self.position_accept_prob_sums.extend([0.0] * missing)
-            self.position_support_accept_rate_sums.extend([0.0] * missing)
-        for pos in range(proposal_len):
-            self.position_accept_prob_sums[pos] += float(accept_probs[pos])
-            if support_accept_rates is not None:
-                self.position_support_accept_rate_sums[pos] += float(
-                    support_accept_rates[pos]
-                )
-
-
-def _parse_count_list(value: Any) -> list[int]:
-    if isinstance(value, str):
-        value = json.loads(value) if value else []
-    if not isinstance(value, list):
-        return []
-    return [int(item) for item in value]
-
-
-def _parse_float_list(value: Any) -> list[float]:
-    if isinstance(value, str):
-        value = json.loads(value) if value else []
-    if not isinstance(value, list):
-        return []
-    return [float(item) for item in value]
 
 
 def logits_to_probs(logits, temperature: float):
@@ -325,245 +154,6 @@ def resolve_stop_token_ids(target_model, tokenizer) -> list[int] | None:
     if isinstance(eos_token_id, int):
         return [int(eos_token_id)]
     return list(dict.fromkeys(int(token_id) for token_id in eos_token_id))
-
-
-def _load_jsonl(path: Path) -> list[dict[str, Any]]:
-    records: list[dict[str, Any]] = []
-    with path.open(encoding="utf-8") as f:
-        for line_no, line in enumerate(f, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            item = json.loads(line)
-            if not isinstance(item, dict):
-                raise ValueError(f"{path}:{line_no}: expected JSON object")
-            records.append(item)
-    return records
-
-
-def _canonical_dataset_name(name: str) -> str:
-    normalized = name.strip().lower().replace("_", "-")
-    aliases = {
-        "aime-25": "aime25",
-        "human-eval": "humaneval",
-        "live-code-bench": "livecodebench",
-        "math-500": "math500",
-    }
-    return aliases.get(normalized, normalized)
-
-
-def _select_eval_records(
-    records: list[dict[str, Any]],
-    *,
-    dataset_name: str,
-    max_samples: int | None,
-    seed: int,
-) -> list[dict[str, Any]]:
-    limit = (
-        int(max_samples)
-        if max_samples is not None
-        else DEEPSPEC_EVAL_SAMPLE_LIMITS.get(_canonical_dataset_name(dataset_name))
-    )
-    if limit is None or len(records) <= limit:
-        return records
-    if limit < 0:
-        raise ValueError("--max-samples must be >= 0")
-
-    selected = list(records)
-    random.Random(int(seed)).shuffle(selected)
-    return selected[:limit]
-
-
-def _string_turns(value: Any) -> list[str] | None:
-    if isinstance(value, str) and value.strip():
-        return [value]
-    if isinstance(value, list) and all(isinstance(item, str) for item in value):
-        turns = [item for item in value if item.strip()]
-        return turns or None
-    return None
-
-
-def _messages_from_conversations(value: Any) -> list[dict[str, str]] | None:
-    if not isinstance(value, list):
-        return None
-    messages: list[dict[str, str]] = []
-    role_map = {
-        "human": "user",
-        "user": "user",
-        "gpt": "assistant",
-        "assistant": "assistant",
-        "system": "system",
-    }
-    for item in value:
-        if not isinstance(item, dict):
-            return None
-        raw_role = item.get("from", item.get("role"))
-        raw_content = item.get("value", item.get("content"))
-        if not isinstance(raw_role, str) or not isinstance(raw_content, str):
-            return None
-        role = role_map.get(raw_role)
-        content = raw_content.strip()
-        if role is None or not content:
-            return None
-        if role == "assistant":
-            break
-        messages.append({"role": role, "content": content})
-    return messages or None
-
-
-def _chat_template_kwargs(args: argparse.Namespace | None) -> dict[str, Any]:
-    if args is None:
-        return {}
-    enable_thinking = getattr(args, "enable_thinking", "false")
-    if enable_thinking == "default":
-        return {}
-    return {"enable_thinking": enable_thinking == "true"}
-
-
-def _looks_like_chatml(text: str) -> bool:
-    return "<|im_start|>" in text or "<|im_end|>" in text
-
-
-def _format_raw_prompt(
-    prompt: str,
-    tokenizer,
-    *,
-    args: argparse.Namespace | None,
-) -> str:
-    mode = getattr(args, "raw_prompt_mode", "auto") if args is not None else "auto"
-    if mode == "raw" or (mode == "auto" and _looks_like_chatml(prompt)):
-        return prompt
-    return tokenizer.apply_chat_template(
-        [{"role": "user", "content": prompt}],
-        tokenize=False,
-        add_generation_prompt=True,
-        **_chat_template_kwargs(args),
-    )
-
-
-def _prompt_from_record(
-    record: dict[str, Any],
-    tokenizer,
-    *,
-    source: str,
-    args: argparse.Namespace | None = None,
-) -> str:
-    turns = _string_turns(record.get("turns"))
-    if turns is not None:
-        # Match DeepSpec's DSpark evaluation protocol: rows with `turns` contain
-        # user turns, and acceptance eval uses only the first turn.
-        return _format_raw_prompt(turns[0], tokenizer, args=args)
-
-    messages = record.get("messages")
-    if isinstance(messages, list):
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **_chat_template_kwargs(args),
-        )
-
-    messages = _messages_from_conversations(record.get("conversations"))
-    if messages is not None:
-        return tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
-            **_chat_template_kwargs(args),
-        )
-
-    turns = _string_turns(record.get("prompt"))
-    if turns is not None:
-        return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
-
-    instruction = _string_turns(record.get("instruction"))
-    if instruction is not None:
-        # Alpaca-style records split the request across these two fields.
-        # Format once after combining them; `output` is the reference answer.
-        turns = instruction + (_string_turns(record.get("input")) or [])
-        return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
-
-    for field in PROMPT_FIELDS:
-        turns = _string_turns(record.get(field))
-        if turns is not None:
-            return _format_raw_prompt("\n\n".join(turns), tokenizer, args=args)
-
-    keys = ", ".join(sorted(record.keys()))
-    supported = ", ".join(["turns", "messages", "conversations", *PROMPT_FIELDS])
-    raise ValueError(
-        f"{source}: record has no supported prompt field ({supported}); keys=[{keys}]"
-    )
-
-
-def _discover_datasets(root: Path, names: list[str] | None) -> list[Path]:
-    paths = [root] if root.is_file() else sorted(root.rglob("*.jsonl"))
-    if names:
-        wanted = set(names)
-        paths = [
-            path
-            for path in paths
-            if (
-                path.stem in wanted
-                or path.name in wanted
-                or str(path) in wanted
-                or _dataset_id(path, root) in wanted
-            )
-        ]
-    if not paths:
-        raise FileNotFoundError(f"No JSONL datasets found under {root}")
-    return paths
-
-
-def _dataset_id(path: Path, root: Path) -> str:
-    """Keep dataset identities unique within a recursively discovered root."""
-    # Preserve logical input names, including symlink aliases: workers receive
-    # the same logical single-file path and name their artifacts from its stem.
-    root = Path(os.path.abspath(root))
-    path = Path(os.path.abspath(path))
-    if root.is_file():
-        if path != root:
-            raise ValueError(f"Dataset {path} does not match the input file {root}")
-        return path.stem
-    try:
-        relative = path.relative_to(root)
-    except ValueError as exc:
-        raise ValueError(f"Dataset {path} is outside the input root {root}") from exc
-    return relative.with_suffix("").as_posix()
-
-
-def _dataset_output_path(directory: Path, dataset: str, suffix: str = "") -> Path:
-    """Map a root-relative identity to an output without escaping its directory."""
-    parts = dataset.split("/")
-    if any(part in {"", ".", ".."} or "\\" in part or ":" in part for part in parts):
-        raise ValueError(f"Invalid root-relative dataset identity: {dataset!r}")
-    path = directory.joinpath(*parts[:-1], parts[-1] + suffix)
-    if not path.resolve().is_relative_to(directory.resolve()):
-        raise ValueError(f"Dataset output escapes its directory: {dataset!r}")
-    return path
-
-
-def _split_csv(value: str | None) -> list[str]:
-    if not value:
-        return []
-    return [item.strip() for item in value.split(",") if item.strip()]
-
-
-def _shard_records(
-    records: list[dict[str, Any]],
-    *,
-    shard_index: int | None,
-    num_shards: int,
-) -> list[tuple[int, dict[str, Any]]]:
-    indexed_records = list(enumerate(records, start=1))
-    if shard_index is None or num_shards <= 1:
-        return indexed_records
-    if shard_index < 0 or shard_index >= num_shards:
-        raise ValueError(f"shard_index must be in [0, {num_shards})")
-    return [
-        item
-        for zero_based_index, item in enumerate(indexed_records)
-        if zero_based_index % num_shards == shard_index
-    ]
 
 
 def _draft_sample_from_anchor(draft) -> bool:
@@ -777,7 +367,7 @@ def verify_draft_tokens(
         if support_accept_rates is not None:
             support_accept_rates = support_accept_rates[:, :effective_proposal_length]
 
-    if 0 < draft_token_count and accepted_draft_tokens < draft_token_count:
+    if draft_token_count > 0 and accepted_draft_tokens < draft_token_count:
         next_token = sample_residual(
             target_probs[:, accepted_draft_tokens, :],
             proposal.draft_probs[:, accepted_draft_tokens, :],
@@ -1042,13 +632,13 @@ def generate_base_model_sample(
 
 
 def _load_draft_config(model_path):
-    """Resolve baseline DSpark and Muse (including legacy enhanced DSpark)."""
+    """Resolve baseline DSpark and MMuse (including legacy enhanced DSpark)."""
     from speculators.config import SpeculatorModelConfig  # noqa: PLC0415
 
     config = SpeculatorModelConfig.from_pretrained(model_path)
-    if config.speculators_model_type not in ("dspark", "muse"):
+    if config.speculators_model_type not in ("dspark", "mmuse"):
         raise ValueError(
-            "This evaluator supports DSpark and Muse checkpoints; "
+            "This evaluator supports DSpark and MMuse checkpoints; "
             f"received {config.speculators_model_type!r}."
         )
     return config
@@ -1094,7 +684,7 @@ class DSparkOfflineRunner:
     def _target_logits_to_draft_vocab(self, target_logits):
         """Select the draft-vocabulary logits without another LM-head call."""
         draft = self.draft_model
-        if target_logits.ndim != 2:
+        if target_logits.ndim != _TOKEN_LOGIT_RANK:
             raise ValueError("Target logits for the current anchor must be rank-2")
         if not draft.use_draft_vocab:
             if target_logits.shape[-1] != draft.draft_vocab_size:
@@ -1523,114 +1113,6 @@ def _timed_generate(runner, prompt: str, stop_token_ids: list[int] | None):
     return response, time.perf_counter() - start_time
 
 
-def _aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
-    position_proposed_counts: list[int] = []
-    position_accepted_counts: list[int] = []
-    position_accept_prob_sums: list[float] = []
-    position_support_accept_rate_sums: list[float] = []
-    for row in rows:
-        proposed = _parse_count_list(row.get("position_proposed_counts", []))
-        accepted = _parse_count_list(row.get("position_accepted_counts", []))
-        accept_prob_sums = _parse_float_list(row.get("position_accept_prob_sums", []))
-        support_sums = _parse_float_list(
-            row.get("position_support_accept_rate_sums", [])
-        )
-        size = max(len(position_proposed_counts), len(proposed))
-        if len(position_proposed_counts) < size:
-            position_proposed_counts.extend(
-                [0] * (size - len(position_proposed_counts))
-            )
-            position_accepted_counts.extend(
-                [0] * (size - len(position_accepted_counts))
-            )
-            position_accept_prob_sums.extend(
-                [0.0] * (size - len(position_accept_prob_sums))
-            )
-            position_support_accept_rate_sums.extend(
-                [0.0] * (size - len(position_support_accept_rate_sums))
-            )
-        for idx, count in enumerate(proposed):
-            position_proposed_counts[idx] += count
-        for idx, count in enumerate(accepted):
-            position_accepted_counts[idx] += count
-        for idx, value in enumerate(accept_prob_sums):
-            position_accept_prob_sums[idx] += value
-        for idx, value in enumerate(support_sums):
-            position_support_accept_rate_sums[idx] += value
-
-    stats = EvalStats(
-        elapsed_s=max((float(row["elapsed_s"]) for row in rows), default=0.0),
-        total_output_tokens=sum(int(row["total_output_tokens"]) for row in rows),
-        num_proposals=sum(int(row["num_proposals"]) for row in rows),
-        num_proposed_draft_tokens=sum(
-            int(row["num_proposed_draft_tokens"]) for row in rows
-        ),
-        num_accepted_draft_tokens=sum(
-            int(row["num_accepted_draft_tokens"]) for row in rows
-        ),
-        position_proposed_counts=position_proposed_counts,
-        position_accepted_counts=position_accepted_counts,
-        position_accept_prob_sums=position_accept_prob_sums,
-        position_support_accept_rate_sums=position_support_accept_rate_sums,
-    )
-    num_requests = sum(int(row["num_requests"]) for row in rows)
-    summary = _summary_row(dataset, num_requests, stats)
-    base_elapsed_s = max(
-        (float(row.get("base_elapsed_s", 0.0)) for row in rows),
-        default=0.0,
-    )
-    if base_elapsed_s:
-        base_total_output_tokens = sum(
-            int(row.get("base_total_output_tokens", 0)) for row in rows
-        )
-        base_tps = base_total_output_tokens / base_elapsed_s
-        summary.update(
-            {
-                "base_elapsed_s": base_elapsed_s,
-                "base_output_tokens_per_second": base_tps,
-                "base_total_output_tokens": base_total_output_tokens,
-                "speedup_vs_base": (
-                    summary["output_tokens_per_second"] / base_tps if base_tps else 0.0
-                ),
-            }
-        )
-    return summary
-
-
-def _summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str, Any]:
-    return {
-        "dataset": dataset,
-        "num_requests": num_requests,
-        "elapsed_s": stats.elapsed_s,
-        "requests_per_second": num_requests / stats.elapsed_s if stats.elapsed_s else 0,
-        "output_tokens_per_second": (
-            stats.total_output_tokens / stats.elapsed_s if stats.elapsed_s else 0
-        ),
-        "total_output_tokens": stats.total_output_tokens,
-        "base_elapsed_s": 0.0,
-        "base_output_tokens_per_second": 0.0,
-        "base_total_output_tokens": 0,
-        "speedup_vs_base": 0.0,
-        "num_proposals": stats.num_proposals,
-        "num_proposed_draft_tokens": stats.num_proposed_draft_tokens,
-        "num_accepted_draft_tokens": stats.num_accepted_draft_tokens,
-        "draft_length": stats.draft_length,
-        "acceptance_length": stats.acceptance_length,
-        "accepted_draft_length": stats.accepted_draft_length,
-        "position_accept_rates": json.dumps(stats.position_accept_rates),
-        "position_accept_prob_means": json.dumps(stats.position_accept_prob_means),
-        "position_support_accept_rate_means": json.dumps(
-            stats.position_support_accept_rate_means
-        ),
-        "position_accept_prob_sums": json.dumps(stats.position_accept_prob_sums),
-        "position_support_accept_rate_sums": json.dumps(
-            stats.position_support_accept_rate_sums
-        ),
-        "position_accepted_counts": json.dumps(stats.position_accepted_counts),
-        "position_proposed_counts": json.dumps(stats.position_proposed_counts),
-    }
-
-
 def _evaluate_dataset(
     *,
     path: Path,
@@ -1789,71 +1271,6 @@ def _evaluate_dataset(
     return row, artifacts
 
 
-def _write_outputs(
-    output_dir: Path,
-    rows: list[dict[str, Any]],
-    artifacts_by_dataset: dict[str, list[dict[str, Any]]],
-) -> None:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    with (output_dir / "summary.csv").open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=RESULT_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    with (output_dir / "summary.json").open("w", encoding="utf-8") as f:
-        json.dump(rows, f, indent=2)
-    if not artifacts_by_dataset:
-        return
-    artifacts_dir = output_dir / "artifacts"
-    artifacts_dir.mkdir(exist_ok=True)
-    for dataset, artifacts in artifacts_by_dataset.items():
-        artifact_path = _dataset_output_path(artifacts_dir, dataset, ".jsonl")
-        artifact_path.parent.mkdir(parents=True, exist_ok=True)
-        with artifact_path.open("w", encoding="utf-8") as f:
-            for artifact in artifacts:
-                f.write(json.dumps(artifact) + "\n")
-
-
-def _read_worker_row(output_dir: Path) -> dict[str, Any]:
-    with (output_dir / "summary.json").open(encoding="utf-8") as f:
-        rows = json.load(f)
-    if not isinstance(rows, list) or len(rows) != 1:
-        raise ValueError(f"{output_dir}/summary.json must contain one result row")
-    return rows[0]
-
-
-def _read_worker_artifacts(output_dir: Path, dataset: str) -> list[dict[str, Any]]:
-    path = _dataset_output_path(output_dir / "artifacts", dataset, ".jsonl")
-    if not path.exists():
-        return []
-    return _load_jsonl(path)
-
-
-def _target_worker_args(args: argparse.Namespace) -> list[str]:
-    if getattr(args, "target_backend", "hf") != "dsv4-vllm":
-        return []
-    result = [
-        "--target-backend",
-        "dsv4-vllm",
-        "--vllm-endpoint",
-        args.vllm_endpoint,
-        "--hidden-states-path",
-        str(args.hidden_states_path),
-        "--dsv4-max-model-len",
-        str(args.dsv4_max_model_len),
-        "--dsv4-verification-mode",
-        getattr(args, "dsv4_verification_mode", "reference"),
-        "--target-request-timeout",
-        str(args.target_request_timeout),
-    ]
-    if args.served_model_name:
-        result.extend(["--served-model-name", args.served_model_name])
-    if args.keep_target_hs:
-        result.append("--keep-target-hs")
-    if getattr(args, "hs_http_endpoint", None):
-        result.extend(["--hs-http-endpoint", args.hs_http_endpoint])
-    return result
-
-
 def _worker_command(
     args: argparse.Namespace,
     *,
@@ -1862,150 +1279,18 @@ def _worker_command(
     num_shards: int,
     output_dir: Path,
 ) -> list[str]:
-    cmd = [
-        sys.executable,
-        str(Path(__file__).resolve()),
-        "--verifier-model",
-        args.verifier_model,
-        "--draft-model",
-        args.draft_model,
-        "--datasets-root",
-        str(dataset_path),
-        "--output-dir",
-        str(output_dir),
-        "--max-new-tokens",
-        str(args.max_new_tokens),
-        "--temperature",
-        str(args.temperature),
-        "--seed",
-        str(args.seed),
-        "--enable-thinking",
-        args.enable_thinking,
-        "--raw-prompt-mode",
-        args.raw_prompt_mode,
-        "--device",
-        args.device,
-        "--dtype",
-        args.dtype,
-        "--draft-attn-impl",
-        args.draft_attn_impl,
-        "--log-every",
-        str(args.log_every),
-        "--worker-shard-index",
-        str(shard_index),
-        "--worker-num-shards",
-        str(num_shards),
-        "--no-progress",
-    ]
-    if args.max_samples is not None:
-        cmd.extend(["--max-samples", str(args.max_samples)])
-    if args.d2t_path is not None:
-        cmd.extend(["--d2t-path", str(args.d2t_path)])
-    if args.t2d_path is not None:
-        cmd.extend(["--t2d-path", str(args.t2d_path)])
-    if args.skip_artifacts:
-        cmd.append("--skip-artifacts")
-    if args.trust_remote_code:
-        cmd.append("--trust-remote-code")
-    if args.sample_from_anchor is not None:
-        cmd.extend(["--sample-from-anchor", str(args.sample_from_anchor).lower()])
-    cmd.extend(_target_worker_args(args))
-    if args.measure_base_speedup:
-        cmd.extend(
-            [
-                "--measure-base-speedup",
-                "--throughput-warmup-samples",
-                str(args.throughput_warmup_samples),
-            ]
-        )
-    return cmd
-
-
-def _stop_eval_worker(process) -> None:
-    """Reap only our child; managed launches also own its surrounding group."""
-    if process.poll() is None:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait(timeout=5)
-
-
-def _wait_eval_workers(processes, dataset: str) -> None:
-    while True:
-        statuses = [(index, process.poll()) for index, _, process in processes]
-        failed = [(index, code) for index, code in statuses if code not in (None, 0)]
-        if failed:
-            raise RuntimeError(f"{dataset} worker failures: {failed}")
-        if all(code is not None for _, code in statuses):
-            for _, _, process in processes:
-                process.wait()
-            return
-        time.sleep(0.25)
+    return _eval_parallel.worker_command(
+        args,
+        entrypoint=Path(__file__),
+        dataset_path=dataset_path,
+        shard_index=shard_index,
+        num_shards=num_shards,
+        output_dir=output_dir,
+    )
 
 
 def run_ascend_data_parallel(args: argparse.Namespace) -> None:
-    devices = _split_csv(args.ascend_devices)
-    if not devices:
-        raise ValueError("--ascend-devices must contain at least one device id")
-    if getattr(args, "target_backend", "hf") == "dsv4-vllm":
-        from speculators_dsv4.eval_launcher import parse_devices  # noqa: PLC0415
-
-        devices = [str(device) for device in parse_devices(args.ascend_devices)]
-        if args.device != "npu:0":
-            raise ValueError("DSV4 data-parallel workers require --device npu:0")
-    dataset_paths = _discover_datasets(
-        args.datasets_root,
-        _split_csv(args.datasets) or None,
-    )
-    rows: list[dict[str, Any]] = []
-    artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
-    for dataset_path in dataset_paths:
-        dataset_start = time.perf_counter()
-        dataset = _dataset_id(dataset_path, args.datasets_root)
-        shard_root = _dataset_output_path(args.output_dir / "_shards", dataset)
-        processes = []
-        with ExitStack() as workers:
-            for shard_index, visible_device in enumerate(devices):
-                shard_output_dir = shard_root / f"shard_{shard_index}"
-                cmd = _worker_command(
-                    args,
-                    dataset_path=dataset_path,
-                    shard_index=shard_index,
-                    num_shards=len(devices),
-                    output_dir=shard_output_dir,
-                )
-                env = os.environ.copy()
-                env["ASCEND_RT_VISIBLE_DEVICES"] = visible_device
-                process = subprocess.Popen(cmd, env=env)
-                workers.callback(_stop_eval_worker, process)
-                processes.append((shard_index, shard_output_dir, process))
-            _wait_eval_workers(processes, dataset)
-        shard_rows = [
-            _read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
-        ]
-        row = _aggregate_rows(dataset, shard_rows)
-        if not args.measure_base_speedup:
-            row["elapsed_s"] = time.perf_counter() - dataset_start
-            row["requests_per_second"] = (
-                row["num_requests"] / row["elapsed_s"] if row["elapsed_s"] else 0
-            )
-            row["output_tokens_per_second"] = (
-                row["total_output_tokens"] / row["elapsed_s"] if row["elapsed_s"] else 0
-            )
-        rows.append(row)
-        if not args.skip_artifacts:
-            artifacts = []
-            for _, shard_output_dir, _ in processes:
-                artifacts.extend(
-                    # Each worker receives a single-file root, so its local
-                    # artifact keeps the flat stem; the parent restores the ID.
-                    _read_worker_artifacts(shard_output_dir, dataset_path.stem)
-                )
-            artifacts.sort(key=lambda item: int(item.get("source_index", 0)))
-            artifacts_by_dataset[dataset] = artifacts
-        _write_outputs(args.output_dir, rows, artifacts_by_dataset)
+    _eval_parallel.run_ascend_data_parallel(args, entrypoint=Path(__file__))
 
 
 def _resolve_draft_attn_impl(device: str, draft_attn_impl: str) -> str | None:
@@ -2100,7 +1385,7 @@ def _prepare_hs_http(args, target_backend):
 
 
 def _run(args: argparse.Namespace, resources: ExitStack) -> None:
-    global torch, DynamicCache
+    global torch, DynamicCache  # noqa: PLW0603 -- Load backends after worker dispatch.
     target_backend = getattr(args, "target_backend", "hf")
     hs_http_endpoint = _prepare_hs_http(args, target_backend)
     target_config = _validate_target_cache_support(args.verifier_model, target_backend)
@@ -2155,18 +1440,9 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
 
     draft_config = _load_draft_config(args.draft_model)
     if target_backend == "dsv4-vllm":
-        from speculators_dsv4 import HS_FORMAT  # noqa: PLC0415
+        from speculators_dsv4.eval_contract import bind_draft_verifier  # noqa: PLC0415
 
-        if getattr(draft_config, "target_hidden_state_format", "standard") != HS_FORMAT:
-            raise ValueError(
-                "Select a draft checkpoint trained with the DSV4 HS format"
-            )
-        saved_target = draft_config.speculators_config.verifier.name_or_path
-        if (
-            not saved_target
-            or Path(saved_target).resolve() != Path(args.verifier_model).resolve()
-        ):
-            raise ValueError("Draft checkpoint and --verifier-model paths must match")
+        bind_draft_verifier(draft_config, report)
     sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
     if sample_from_anchor is not None:
         draft_config.sample_from_anchor = sample_from_anchor
@@ -2208,13 +1484,12 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
             max_retries=0,
         )
         resources.callback(client.close)
-        model_name = args.served_model_name or args.verifier_model
         target_model = DSV4OfflineTarget(
             draft_model,
             report,
             hidden_states_path=args.hidden_states_path,
             client=client,
-            model_name=model_name,
+            model_name=args.served_model_name,
             max_model_len=args.dsv4_max_model_len,
             timeout=args.target_request_timeout,
             keep_hidden_states=args.keep_target_hs,
@@ -2233,7 +1508,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
         resources.callback(tokenizer_client.close)
         tokenizer = DSV4ServerTokenizer(
             tokenizer_client,
-            model_name,
+            target_model.model_name,
             target_model.generation_config.eos_token_id,
             vocab_size=target_config["vocab_size"],
         )
@@ -2310,7 +1585,7 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Offline DSpark/Muse evaluation on JSONL data.",
+        description="Offline DSpark/MMuse evaluation on JSONL data.",
     )
     parser.add_argument("--verifier-model", required=True)
     parser.add_argument("--draft-model", required=True)

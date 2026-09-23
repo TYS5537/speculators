@@ -543,9 +543,7 @@ async def regenerate_conversation(
 
     effective_sampling_params = dict(sampling_params)
     if enable_thinking is not None:
-        raw_chat_template_kwargs = effective_sampling_params.get(
-            "chat_template_kwargs"
-        )
+        raw_chat_template_kwargs = effective_sampling_params.get("chat_template_kwargs")
         if raw_chat_template_kwargs is not None and not isinstance(
             raw_chat_template_kwargs, dict
         ):

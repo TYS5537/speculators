@@ -1,12 +1,12 @@
 #!/bin/bash
-# Online DSpark/MUSE Trainer for Qwen3-8B on Ascend NPU
+# Online DSpark/MMUSE Trainer for Qwen3-8B on Ascend NPU
 #
 # Trains against prepared Arrow data and an already-running vLLM server.
-# DSpark uses the baseline Markov/confidence heads; MUSE supports the extensions.
+# DSpark uses the baseline Markov/confidence heads; MMUSE supports the extensions.
 #
 # Usage: Keep copies beside common/, modify the configuration variables, then run:
 #   bash examples/train/dspark_qwen3_8b_trainer.sh
-#   SPECULATOR_TYPE=muse bash examples/train/dspark_qwen3_8b_trainer.sh
+#   SPECULATOR_TYPE=mmuse bash examples/train/dspark_qwen3_8b_trainer.sh
 #
 # Note: This assumes your environment has torch_npu and an Ascend-compatible
 # vLLM installation that supports hidden-state extraction.
@@ -28,6 +28,10 @@ LOGGER="tensorboard"
 
 # DSpark-specific parameters
 SPECULATOR_TYPE="${SPECULATOR_TYPE:-dspark}"
+# Preserve old launch commands without dropping their enhancement arguments.
+if [[ "$SPECULATOR_TYPE" == muse ]]; then
+    SPECULATOR_TYPE=mmuse
+fi
 BLOCK_SIZE=7
 MAX_ANCHORS=512
 NUM_LAYERS=5
@@ -37,7 +41,7 @@ DRAFT_ATTN_IMPL="sdpa"     # Use eager/sdpa on hardware without flex attention.
 
 # ---- Sequential head selection ------------------------------------------------
 # The paper baseline uses the Markov head. Set this to
-# (--enable-correction-head) and SPECULATOR_TYPE=muse for a Correction experiment.
+# (--enable-correction-head) and SPECULATOR_TYPE=mmuse for a Correction experiment.
 MARKOV_RANK=256
 MARKOV_HEAD_TYPE="vanilla"   # vanilla | gated | rnn
 CORRECTION_HEAD_ARGS=()
@@ -100,7 +104,7 @@ SSAL_CURRICULUM_START=0.1
 SSAL_CURRICULUM_END=0.6
 
 # ---- DFlash backbone experiments ---------------------------------------------
-# Optional MUSE backbone experiments. Set SPECULATOR_TYPE=muse to enable them.
+# Optional MMUSE backbone experiments. Set SPECULATOR_TYPE=mmuse to enable them.
 # All are disabled here to preserve the DSpark baseline.
 DFLASH_CONTEXT_RESIDUAL_ARGS=(--no-dflash-context-residual)
 DFLASH_BLOCK_POSITION_ARGS=(--no-dflash-block-position-embedding)
@@ -117,10 +121,10 @@ DFLASH2_SELECTOR_TOP_K=16
 DFLASH2_SELECTOR_SEARCH_MODE=greedy
 DFLASH2_SELECTOR_LOSS_WEIGHT=1.0
 
-# Do not pass even disabled/default MUSE options to the baseline CLI: explicit
-# architecture options belong to MUSE, independently of their values.
-MUSE_ARGS=()
-if [[ "$SPECULATOR_TYPE" == muse ]]; then
+# Do not pass even disabled/default MMUSE options to the baseline CLI: explicit
+# architecture options belong to MMUSE, independently of their values.
+MMUSE_ARGS=()
+if [[ "$SPECULATOR_TYPE" == mmuse ]]; then
     case "$DFLASH2_SELECTOR_SEARCH_MODE" in
         greedy|global) ;;
         *)
@@ -141,7 +145,7 @@ if [[ "$SPECULATOR_TYPE" == muse ]]; then
         exit 2
     fi
 
-    MUSE_ARGS=(
+    MMUSE_ARGS=(
         "${CORRECTION_HEAD_ARGS[@]}"
         --correction-output-mode "$CORRECTION_OUTPUT_MODE"
         --correction-hidden-size "$CORRECTION_HIDDEN_SIZE"
@@ -222,7 +226,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --target-layer-ids $TARGET_LAYER_IDS \
     --markov-rank "$MARKOV_RANK" \
     --markov-head-type "$MARKOV_HEAD_TYPE" \
-    "${MUSE_ARGS[@]}" \
+    "${MMUSE_ARGS[@]}" \
     "${CONFIDENCE_HEAD_ARGS[@]}" \
     "${CONFIDENCE_SEQUENTIAL_FEATURE_ARGS[@]}" \
     --loss-fn "$LOSS_FN" \

@@ -14,7 +14,9 @@ REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 
-: "${VERIFIER_MODEL:?Set VERIFIER_MODEL to the same shared DSV4 checkpoint as the HS server}"
+# Local copy of the target checkpoint; its directory may differ from the server's.
+# Preserve shard timestamps when copying: they are part of the checkpoint signature.
+: "${VERIFIER_MODEL:?Set VERIFIER_MODEL to the local matching DSV4 checkpoint}"
 : "${DRAFT_MODEL:?Set DRAFT_MODEL to the trained DSV4 DSpark checkpoint}"
 : "${DATASETS_ROOT:?Set DATASETS_ROOT to a JSONL file or directory of JSONL files}"
 # HTTP mode needs no shared HS mount. HS_PATH then holds temporary local downloads.

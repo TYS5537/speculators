@@ -8,15 +8,21 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
 )
 from speculators.models.metrics import resolve_loss_config
-from speculators.models.muse.config import muse_option_defaults, validate_muse_options
+from speculators.models.mmuse.config import (
+    mmuse_option_defaults,
+    validate_mmuse_options,
+)
 from speculators.train.draft_config import DRAFT_ARCH_CONFIGS
+from speculators.train.mmuse_args import (
+    add_mmuse_backbone_args,
+    add_mmuse_correction_args,
+)
 from speculators.train.model_config import (
     DECODER_SHAPING_FLAGS,
-    MUSE_MODEL_CONFIG_FIELDS,
+    MMUSE_MODEL_CONFIG_FIELDS,
     PRETRAINED_MODEL_CONFIG_FLAGS,
     validate_draft_init_args,
 )
-from speculators.train.muse_args import add_muse_backbone_args, add_muse_correction_args
 from speculators.utils.argparse_utils import explicitly_provided_dests
 
 DSPARK_PAPER_LOSS_FN = '{"ce": 0.1, "tv": 0.9}'
@@ -40,7 +46,7 @@ def _checkpoint_freq(value: str) -> float:
 def build_train_parser() -> argparse.ArgumentParser:
     """Declare training options without parsing or applying algorithm defaults."""
     parser = argparse.ArgumentParser()
-    muse_defaults = muse_option_defaults()
+    mmuse_defaults = mmuse_option_defaults()
     parser.add_argument("--verifier-name-or-path", type=str, required=True)
     parser.add_argument(
         "--trust-remote-code",
@@ -52,7 +58,8 @@ def build_train_parser() -> argparse.ArgumentParser:
         type=str,
         default="eagle3",
         help="Type of speculator model to train "
-        "(eagle3, dflash, dspark, muse, peagle, mtp)",
+        "(eagle3, dflash, dspark, mmuse, peagle, mtp); "
+        "muse is a legacy alias for mmuse",
     )
     parser.add_argument(
         "--from-pretrained",
@@ -417,8 +424,8 @@ def build_train_parser() -> argparse.ArgumentParser:
         default=0.5,
         help="Smoothing constant for D-PACE loss (default: 0.5)",
     )
-    add_muse_backbone_args(parser, muse_defaults)
-    # DSpark baseline heads and Muse-specific Correction extensions.
+    add_mmuse_backbone_args(parser, mmuse_defaults)
+    # DSpark baseline heads and MMuse-specific Correction extensions.
     parser.add_argument(
         "--markov-rank",
         type=int,
@@ -432,7 +439,7 @@ def build_train_parser() -> argparse.ArgumentParser:
         choices=["vanilla", "gated", "rnn"],
         help="DSpark: sequential head variant (default: vanilla).",
     )
-    add_muse_correction_args(parser, muse_defaults)
+    add_mmuse_correction_args(parser, mmuse_defaults)
     parser.add_argument(
         "--enable-confidence-head",
         action=argparse.BooleanOptionalAction,
@@ -662,20 +669,29 @@ def build_train_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _apply_dspark_paper_defaults(args: argparse.Namespace, provided: set[str]) -> None:
+    """Fill the DSpark/MMuse recipe in order, retaining explicit CLI values.
+
+    Resolve block size before deriving gamma; the shared defaults and validation
+    still run afterwards. This helper neither normalizes aliases nor tracks flags.
+    """
+    if "block_size" not in provided:
+        args.block_size = DSPARK_PAPER_BLOCK_SIZE
+    if "dflash_decay_gamma" not in provided:
+        # The paper uses the proposal length gamma in w_k=exp(-(k-1)/gamma).
+        args.dflash_decay_gamma = float(args.block_size)
+    if "epochs" not in provided:
+        args.epochs = DSPARK_PAPER_EPOCHS
+    if "loss_fn" not in provided:
+        args.loss_fn = DSPARK_PAPER_LOSS_FN
+    if "num_layers" not in provided:
+        args.num_layers = DSPARK_PAPER_NUM_LAYERS
+
+
 def _apply_training_defaults(args: argparse.Namespace, provided: set[str]) -> None:
     """Apply the selected algorithm defaults without replacing explicit options."""
-    if args.speculator_type in ("dspark", "muse"):
-        if "block_size" not in provided:
-            args.block_size = DSPARK_PAPER_BLOCK_SIZE
-        if "dflash_decay_gamma" not in provided:
-            # The paper uses the proposal length gamma in w_k=exp(-(k-1)/gamma).
-            args.dflash_decay_gamma = float(args.block_size)
-        if "epochs" not in provided:
-            args.epochs = DSPARK_PAPER_EPOCHS
-        if "loss_fn" not in provided:
-            args.loss_fn = DSPARK_PAPER_LOSS_FN
-        if "num_layers" not in provided:
-            args.num_layers = DSPARK_PAPER_NUM_LAYERS
+    if args.speculator_type in ("dspark", "mmuse"):
+        _apply_dspark_paper_defaults(args, provided)
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:
@@ -699,16 +715,16 @@ def _validate_training_args(
         if args.from_pretrained:
             # The remaining values will come from the checkpoint, not parser
             # defaults. Check only explicitly supplied scalars at this stage.
-            validate_muse_options(
+            validate_mmuse_options(
                 {
                     field: getattr(args, field)
                     for field in args._provided_model_config_dests  # noqa: SLF001
-                    & MUSE_MODEL_CONFIG_FIELDS
+                    & MMUSE_MODEL_CONFIG_FIELDS
                 },
                 partial=True,
             )
-        elif args.speculator_type == "muse":
-            validate_muse_options(vars(args))
+        elif args.speculator_type == "mmuse":
+            validate_mmuse_options(vars(args))
     except ValueError as error:
         parser.error(str(error))
     if args.per_position_loss_weight == "dpace":
@@ -724,13 +740,15 @@ def finalize_train_args(
     argv: list[str] | None = None,
 ) -> argparse.Namespace:
     """Track explicit options, apply defaults, and validate parsed arguments."""
+    if args.speculator_type == "muse":
+        args.speculator_type = "mmuse"
     if args.dsv4_external_arrow and (
         args.target_hidden_state_format != "deepseek_v4_mean_hc_head"
-        or args.speculator_type not in ("dspark", "muse")
+        or args.speculator_type not in ("dspark", "mmuse")
         or args.legacy_data
     ):
         parser.error(
-            "--dsv4-external-arrow requires DSV4 DSpark/Muse training with Arrow data"
+            "--dsv4-external-arrow requires DSV4 DSpark/MMuse training with Arrow data"
         )
     # This CLI-owned namespace metadata is shared with checkpoint reconciliation.
     args._provided_model_config_dests = explicitly_provided_dests(  # noqa: SLF001
@@ -738,20 +756,20 @@ def finalize_train_args(
     )
     if (
         not args.from_pretrained
-        and args.speculator_type != "muse"
+        and args.speculator_type != "mmuse"
         and (
             args._provided_model_config_dests  # noqa: SLF001
-            & MUSE_MODEL_CONFIG_FIELDS
+            & MMUSE_MODEL_CONFIG_FIELDS
         )
     ):
         parser.error(
             "Correction, backbone enhancement and Selector options now belong to "
-            "Muse; use --speculator-type muse. DFlash and DSpark select the "
+            "MMuse; use --speculator-type mmuse. DFlash and DSpark select the "
             "baseline architectures."
         )
 
     # Preserve the shared CLI defaults for every other algorithm while making a
-    # bare DSpark/Muse runs inherit the DSpark paper training recipe. Muse's
+    # bare DSpark/MMuse runs inherit the DSpark paper training recipe. MMuse's
     # optional architecture extensions remain explicit opt-ins.
     dspark_default_dests = {
         "block_size",

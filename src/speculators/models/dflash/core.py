@@ -38,7 +38,7 @@ _compiled_create_block_mask = torch.compile(create_block_mask)
 def _reject_enhanced_baseline_features(
     algorithm: str, options: dict | DFlashSpeculatorConfig
 ) -> None:
-    """Reject Muse-only options before a baseline factory can discard them."""
+    """Reject MMuse-only options before a baseline factory can discard them."""
     if algorithm not in {"dflash", "dspark"}:
         return
     get_option = (
@@ -71,7 +71,7 @@ def _reject_enhanced_baseline_features(
     if enabled_features:
         raise ValueError(
             "DFlash and DSpark are baseline architectures; these features "
-            f"require the muse architecture: {', '.join(enabled_features)}"
+            f"require the mmuse architecture: {', '.join(enabled_features)}"
         )
 
 

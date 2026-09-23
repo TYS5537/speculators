@@ -132,6 +132,7 @@ def map_draft_to_target(eval_impl, draft, draft_id: int) -> int:
 
 
 def topk_rows(torch, eval_impl, draft, logits, probs, tokenizer, top_k: int):
+    del torch  # Retain the debug helpers' existing dependency-injection signature.
     k = min(int(top_k), probs.shape[-1])
     top_probs, top_draft_ids = probs.float().topk(k, dim=-1)
     rows = []

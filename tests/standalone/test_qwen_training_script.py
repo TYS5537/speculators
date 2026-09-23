@@ -58,7 +58,7 @@ def _shell_environment(overrides=None):
     return environment
 
 
-def muse_options(args):
+def mmuse_options(args):
     prefixes = (
         "--correction-",
         "--enable-correction-head",
@@ -140,13 +140,13 @@ class QwenTrainingScriptTests(unittest.TestCase):
                 self.assert_option(args, "--lr", "6e-4")
                 self.assertIn("--enable-confidence-head", args)
                 self.assertIn("--confidence-head-with-markov", args)
-                self.assertEqual(muse_options(args), [])
+                self.assertEqual(mmuse_options(args), [])
                 self.assertNotIn("", args)
 
-    def test_muse_keeps_default_enhancement_configuration(self):
-        result, args = self.run_script("muse")
+    def test_mmuse_keeps_default_enhancement_configuration(self):
+        result, args = self.run_script("mmuse")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assert_option(args, "--speculator-type", "muse")
+        self.assert_option(args, "--speculator-type", "mmuse")
         for option, value in (
             ("--correction-output-mode", "hidden"),
             ("--correction-hidden-size", "512"),
@@ -160,7 +160,7 @@ class QwenTrainingScriptTests(unittest.TestCase):
             ("--dflash2-selector-loss-weight", "1.0"),
         ):
             self.assert_option(args, option, value)
-        self.assertEqual(len(muse_options(args)), 27)
+        self.assertEqual(len(mmuse_options(args)), 27)
         self.assertIn("--no-correction-hidden-feedback", args)
         self.assertIn("--no-dflash-gated-layer-fusion", args)
         self.assertIn("--no-dflash2-candidate-selector", args)
@@ -169,8 +169,15 @@ class QwenTrainingScriptTests(unittest.TestCase):
         self.assertNotIn("--enable-correction-head", args)
         self.assertNotIn("", args)
 
+    def test_legacy_muse_alias_keeps_identical_enhancement_arguments(self):
+        result, canonical = self.run_script("mmuse")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result, legacy = self.run_script("muse")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(legacy, canonical)
+
     def test_shared_ascend_environment_is_exported_to_launch_command(self):
-        for model_type in ("dspark", "muse"):
+        for model_type in ("dspark", "mmuse"):
             with self.subTest(model_type=model_type):
                 result, _ = self.run_script(model_type)
                 self.assertEqual(result.returncode, 0, result.stderr)
@@ -242,7 +249,7 @@ class QwenTrainingScriptTests(unittest.TestCase):
                 self.assertEqual(control.returncode, 0, control.stderr)
                 self.assertEqual(marker.read_text(), "startup\n")
                 marker.unlink()
-                result, args = self.run_script("muse")
+                result, args = self.run_script("mmuse")
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("torchrun", args)
                 self.assertFalse(marker.exists())
@@ -250,9 +257,9 @@ class QwenTrainingScriptTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertFalse(marker.exists())
 
-    def test_muse_preserves_enabled_correction_and_selector_settings(self):
+    def test_mmuse_preserves_enabled_correction_and_selector_settings(self):
         result, args = self.run_script(
-            "muse",
+            "mmuse",
             (
                 (
                     "CORRECTION_HEAD_ARGS=()",
@@ -274,7 +281,7 @@ class QwenTrainingScriptTests(unittest.TestCase):
         self.assertNotIn("--no-dflash2-candidate-selector", args)
         self.assertNotIn("--dflash2-selector-greedy", args)
 
-    def test_selector_validation_only_applies_to_muse(self):
+    def test_selector_validation_only_applies_to_mmuse(self):
         for replacements in (
             (
                 (
@@ -302,8 +309,8 @@ class QwenTrainingScriptTests(unittest.TestCase):
             with self.subTest(replacements=replacements):
                 result, args = self.run_script("dspark", replacements)
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertEqual(muse_options(args), [])
-                result, args = self.run_script("muse", replacements)
+                self.assertEqual(mmuse_options(args), [])
+                result, args = self.run_script("mmuse", replacements)
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertEqual(args, [])
 

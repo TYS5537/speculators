@@ -18,9 +18,9 @@ Predicts all draft tokens in a single forward pass using block-based prediction 
 
 Finetunes the model's native multi-token prediction head on domain-specific data. Available for models with built-in MTP support (e.g. Qwen3-Next, Qwen3.5).
 
-## [DSpark and Muse](muse.md)
+## [DSpark and MMuse](mmuse.md)
 
-DSpark adds sequential heads and acceptance confidence to DFlash. Muse isolates the optional backbone, Selector, Correction and collaboration extensions from both baselines. See the model boundaries, training flags and checkpoint migration notes before switching an existing run.
+DSpark adds sequential heads and acceptance confidence to DFlash. MMuse isolates the optional backbone, Selector, Correction and collaboration extensions from both baselines. See the model boundaries, training flags and checkpoint migration notes before switching an existing run.
 
 ## Choosing an Algorithm
 

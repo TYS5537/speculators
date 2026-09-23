@@ -1118,6 +1118,7 @@ read -rsp 'Same HS HTTP token: ' DSV4_HS_HTTP_TOKEN; echo
 export DSV4_HS_HTTP_TOKEN
 export VLLM_ENDPOINT=http://10.0.0.10:8001/v1
 export HS_HTTP_ENDPOINT=http://10.0.0.10:8002  # No /v1 suffix here.
+export VERIFIER_MODEL=/eval/models/dsv4      # Local copy; server path may differ.
 export HS_PATH=/eval/local/hs-downloads       # Local temporary downloads, not NFS.
 export VERIFICATION_MODE=reference
 export EVAL_NPU=0                            # An evaluation-only device.
@@ -1131,10 +1132,24 @@ The Python equivalent is `--hs-http-endpoint URL`. The secret comes only from
 inherit it. `OPENAI_API_KEY`, if needed by vLLM, remains a separate credential.
 
 Only HS storage becomes remote: the evaluator still needs local access to the
-draft checkpoint and the matching verifier checkpoint/IO weights. Existing
-model-path and checkpoint-signature checks remain strict. Copies must retain
-the same expected absolute model path and signature-relevant file metadata;
-this is not a model-path migration or remote weight-loading feature.
+draft checkpoint and the matching verifier checkpoint/IO weights. Set
+`VERIFIER_MODEL` to the **evaluation host's local directory**; it may differ from
+both the server's directory and the training path saved in the draft. Evaluation
+checks the checkpoint signature and HS fields, not equality of host-local model
+paths. The draft's borrowed weights are loaded from this local directory without
+rewriting its saved config or the server's HS manifest. This also applies to
+shared-file evaluation and the single-host launcher's draft loading; it does not
+relax training/resume checks or change the shared HS path requirement in file mode.
+
+The existing fingerprint includes shard sizes, headers and **nanosecond mtimes**,
+as well as config/quantization metadata; it is not a full tensor-content hash.
+Copy identical checkpoints with timestamps preserved (for example `rsync -a`),
+on filesystems that retain their precision. Timestamp changes still fail closed;
+do not edit manifests to bypass a mismatch. Relocating a draft's saved verifier
+path requires its `target_training_contract`; legacy drafts without that recorded
+identity retain the previous same-path behavior and require separately audited
+provenance before migration. No target restart or HS manifest regeneration is
+needed solely to use a different local model path.
 
 The sidecar exposes only `cmpl-hshttp-<random-request-id>-0[...].safetensors`,
 never directory listings, `hs_<index>` training caches, or ordinary completion
@@ -1238,7 +1253,9 @@ the longest target request uses at most this total minus one input token, plus t
 one API output token used for HS export. No extra full draft block needs to be
 reserved, and server-side truncation must remain disabled.
 `TARGET_REQUEST_TIMEOUT` defaults to 120 seconds. Set
-`SERVED_MODEL_NAME` only when the service uses a custom alias. This example uses
+`SERVED_MODEL_NAME` when the service uses a custom alias. When omitted, evaluation
+uses the **server's model path from the verified HS manifest**, not the local
+`VERIFIER_MODEL`, for both completion and tokenizer requests. This example uses
 dedicated evaluation devices; `EVAL_NPU` accepts one ID or a comma-separated list.
 For multiple IDs, the shell forwards `--ascend-devices` to the evaluator, which
 runs one draft worker per NPU against the same endpoint. Unlike the managed
@@ -1403,8 +1420,8 @@ pytest tests/unit/evaluate/test_dspark_offline_eval.py \
   tests/unit/evaluate/test_dsv4_block_connector.py \
   tests/unit/evaluate/test_dsv4_teacher_parity.py
 
-pytest tests/unit/models/test_muse_optional_features.py \
-  tests/unit/models/test_muse_core.py \
+pytest tests/unit/models/test_mmuse_optional_features.py \
+  tests/unit/models/test_mmuse_core.py \
   tests/unit/train/test_trainer_scheduler.py
 
 pytest tests/unit/train/test_checkpoint_transactions.py \

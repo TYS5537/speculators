@@ -16,6 +16,7 @@ from urllib.error import HTTPError, URLError
 
 from speculators_dsv4 import HS_FORMAT
 from speculators_dsv4 import eval_launcher as launcher
+from speculators_dsv4.contract import make_manifest
 
 
 class LauncherFixture(unittest.TestCase):
@@ -315,12 +316,37 @@ class PlanningTests(LauncherFixture):
             self.root / "other"
         )
         self.write_draft_config()
-        with self.assertRaisesRegex(ValueError, "paths must match"):
+        with self.assertRaisesRegex(ValueError, "requires target_training_contract"):
             self.plan()
         self.config["speculators_config"]["verifier"]["name_or_path"] = str(self.model)
         self.config["aux_hidden_state_layer_ids"] = [1, 43]
         self.write_draft_config()
         with self.assertRaises(ValueError):
+            self.plan()
+
+    def test_relocated_verifier_is_bound_by_signature_without_editing_saved_config(
+        self,
+    ):
+        original_path = "/training-host/models/dsv4"
+        self.config["speculators_config"]["verifier"]["name_or_path"] = original_path
+        self.config["target_training_contract"] = {
+            **make_manifest(
+                {**self.report, "model_path": original_path},
+                self.config["aux_hidden_state_layer_ids"],
+            ),
+            "runtime_quantization": {"method": None},
+        }
+        self.write_draft_config()
+        config_path = self.draft / "config.json"
+        original = config_path.read_bytes()
+        plan = self.plan()
+        self.assertEqual(
+            self.flag(plan.eval_command, "--verifier-model"), str(self.model)
+        )
+        self.assertEqual(config_path.read_bytes(), original)
+        self.config["target_training_contract"]["checkpoint_signature"] = "wrong"
+        self.write_draft_config()
+        with self.assertRaisesRegex(ValueError, "mismatch"):
             self.plan()
 
     def test_dry_run_prints_safe_plan_without_launching_or_making_directories(self):

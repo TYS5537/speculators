@@ -39,7 +39,7 @@ from speculators.train.draft_config import (
 from speculators.train.logger import setup_metric_logger, setup_root_logger
 from speculators.train.model_config import (
     DECODER_SHAPING_FLAGS,  # noqa: F401 -- Backward-compatible script export.
-    MUSE_MODEL_CONFIG_FIELDS,  # noqa: F401 -- Backward-compatible script export.
+    MMUSE_MODEL_CONFIG_FIELDS,  # noqa: F401 -- Backward-compatible script export.
     PRETRAINED_MODEL_CONFIG_FLAGS,  # noqa: F401 -- Backward-compatible script export.
     PRETRAINED_RUNTIME_CONFIG_FIELDS,  # noqa: F401 -- Backward-compatible script export.
     reconcile_pretrained_config_args,
@@ -274,7 +274,7 @@ def main(args: argparse.Namespace):  # noqa: C901
 
     draft_model = build_draft_model(args, model_class, t2d, d2t, draft_vocab_size)
     # Saved configs are authoritative, including enhanced legacy DSpark configs
-    # migrated to Muse. Use the resolved class for preprocessing/trainer policy.
+    # migrated to MMuse. Use the resolved class for preprocessing/trainer policy.
     model_class = type(draft_model)
     args.speculator_type = draft_model.config.speculators_model_type
 

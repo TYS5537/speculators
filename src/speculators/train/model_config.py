@@ -5,7 +5,7 @@ import logging
 
 from transformers import PretrainedConfig
 
-from speculators.models.muse.config import MUSE_OPTION_FIELDS, validate_muse_options
+from speculators.models.mmuse.config import MMUSE_OPTION_FIELDS, validate_mmuse_options
 
 # CLI flags that synthesize the draft decoder shape. They conflict with both
 # --from-pretrained and --draft-config, each of which fully defines the draft.
@@ -73,7 +73,7 @@ PRETRAINED_RUNTIME_CONFIG_FIELDS = {
     "dflash2_selector_search_mode",
 }
 
-MUSE_MODEL_CONFIG_FIELDS = MUSE_OPTION_FIELDS
+MMUSE_MODEL_CONFIG_FIELDS = MMUSE_OPTION_FIELDS
 
 
 def plan_pretrained_config_overrides(
@@ -123,12 +123,12 @@ def reconcile_pretrained_config_args(
 ) -> None:
     """Validate the complete checkpoint/CLI merge, then commit it to both objects."""
     provided = set(getattr(args, "_provided_model_config_dests", set()))
-    muse_overrides = provided & MUSE_MODEL_CONFIG_FIELDS
-    if muse_overrides and getattr(config, "speculators_model_type", None) != "muse":
+    mmuse_overrides = provided & MMUSE_MODEL_CONFIG_FIELDS
+    if mmuse_overrides and getattr(config, "speculators_model_type", None) != "mmuse":
         raise ValueError(
             "Correction, backbone enhancement and Selector options require a "
-            "Muse checkpoint; --from-pretrained cannot add them to a baseline "
-            "checkpoint. Start a fresh model with --speculator-type muse."
+            "MMuse checkpoint; --from-pretrained cannot add them to a baseline "
+            "checkpoint. Start a fresh model with --speculator-type mmuse."
         )
 
     inherited_args, runtime_overrides = plan_pretrained_config_overrides(
@@ -138,13 +138,13 @@ def reconcile_pretrained_config_args(
     # Validate the final saved-config/CLI combination before mutating either
     # object. Parser defaults are not checkpoint values, and an invalid runtime
     # override must not leave an otherwise reusable config partially changed.
-    if getattr(config, "speculators_model_type", None) == "muse":
+    if getattr(config, "speculators_model_type", None) == "mmuse":
         candidate = {
             field: getattr(config, field)
             for field in PRETRAINED_MODEL_CONFIG_FLAGS
             if hasattr(config, field)
         }
-        validate_muse_options({**candidate, **runtime_overrides})
+        validate_mmuse_options({**candidate, **runtime_overrides})
 
     for dest, value in inherited_args.items():
         setattr(args, dest, value)

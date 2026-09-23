@@ -19,6 +19,8 @@ from urllib.parse import urlsplit
 from urllib.request import HTTPRedirectHandler, ProxyHandler, Request, build_opener
 from uuid import uuid4
 
+from speculators_dsv4.eval_contract import validate_eval_manifest
+
 PROTOCOL_VERSION = 1
 REQUEST_PREFIX = "hshttp-"
 FILE_PATTERN = re.compile(r"cmpl-hshttp-[0-9a-f]{32}-0(?:-[0-9a-f]{8})?\.safetensors")
@@ -156,13 +158,9 @@ class HttpHiddenStates:
         actual = info.get("manifest")
         if not isinstance(actual, dict):
             raise ValueError("Missing HS HTTP manifest")
-        actual = dict(actual)
-        # Same policy as the file consumer: validate checkpoint/HS identity, while
-        # the target owns its runtime quantization override.
-        actual.pop("runtime_quantization", None)
-        if actual != expected:
-            raise ValueError("DSV4 HS contract/target mismatch over HTTP")
+        validate_eval_manifest(actual, expected)
         self.remote_directory = _remote_path(info.get("hidden_states_path"))
+        return actual
 
     def _filename(self, handle, request_id):
         path = _remote_path(handle)

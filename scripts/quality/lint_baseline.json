@@ -1,0 +1,35 @@
+{
+  "version": 1,
+  "entries": [
+    {
+      "path": "scripts/evaluate/dspark_offline_eval.py",
+      "symbol": "verify_draft_tokens",
+      "complexity": 11,
+      "reason": "Split verification branches only with acceptance and stop-token regression coverage."
+    },
+    {
+      "path": "scripts/evaluate/dspark_offline_eval.py",
+      "symbol": "_evaluate_dataset",
+      "complexity": 14,
+      "reason": "Separate dataset execution from evaluation reporting in a dedicated refactor."
+    },
+    {
+      "path": "scripts/evaluate/dspark_offline_eval.py",
+      "symbol": "_run",
+      "complexity": 17,
+      "reason": "Separate target initialization while preserving worker and resource lifetimes."
+    },
+    {
+      "path": "scripts/response_regeneration/script.py",
+      "symbol": "regenerate_conversation",
+      "complexity": 11,
+      "reason": "Split asynchronous conversation regeneration with tool-call and retry coverage."
+    },
+    {
+      "path": "src/speculators/model.py",
+      "symbol": "SpeculatorModel.from_pretrained",
+      "complexity": 12,
+      "reason": "Split checkpoint loading only with legacy identity and vocabulary migration coverage."
+    }
+  ]
+}

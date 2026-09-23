@@ -31,7 +31,11 @@ class HttpTransportTests(unittest.TestCase):
         self.remote = self.root / "remote"
         self.remote.mkdir()
         self.local = self.root / "local"
-        self.manifest = {"format": HS_FORMAT, "checkpoint_signature": "fixture"}
+        self.manifest = {
+            "format": HS_FORMAT,
+            "checkpoint_signature": "fixture",
+            "model_path": "/server/models/dsv4",
+        }
         (self.remote / MANIFEST).write_text(json.dumps(self.manifest))
         self.server = HiddenStatesServer(("127.0.0.1", 0), self.remote, TOKEN)
         self.thread = threading.Thread(
@@ -238,6 +242,24 @@ class HttpTransportTests(unittest.TestCase):
             with self.client.artifact(str(path), request_id):
                 self.fail("Unexpected download")
         self.assertTrue(path.exists())
+
+    def test_model_path_can_differ_but_remaining_identity_is_strict(self):
+        expected = {**self.manifest, "model_path": str(self.root / "local-model")}
+        original = (self.remote / MANIFEST).read_bytes()
+        actual = self.client.validate_manifest(expected)
+        self.assertEqual(actual["model_path"], "/server/models/dsv4")
+        for changed in (
+            {"checkpoint_signature": "wrong"},
+            {"format": "wrong"},
+            {"auxiliary_hs_ids": [1, 2]},
+            {"unexpected": True},
+        ):
+            with (
+                self.subTest(changed=changed),
+                self.assertRaisesRegex(ValueError, "mismatch"),
+            ):
+                self.client.validate_manifest({**expected, **changed})
+        self.assertEqual((self.remote / MANIFEST).read_bytes(), original)
 
     def test_invalid_endpoints_and_tokens(self):
         for endpoint in (

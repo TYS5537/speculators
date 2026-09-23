@@ -553,7 +553,9 @@ def test_real_connector_packet_to_offline_target_prefill_and_suffix(
             "eos_token_id": 4,
         },
     }
-    monkeypatch.setattr(offline_backend, "ensure_manifest", lambda *args: None)
+    monkeypatch.setattr(
+        offline_backend, "read_eval_manifest", lambda _path, expected: expected
+    )
     recorded = []
 
     def create(**kwargs):

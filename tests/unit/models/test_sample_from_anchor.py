@@ -5,7 +5,7 @@ from transformers import AutoConfig
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark import DSparkSpeculatorConfig
-from speculators.models.muse import MuseSpeculatorConfig
+from speculators.models.mmuse import MMuseSpeculatorConfig
 
 
 class TestSampleFromAnchorDFlash:
@@ -44,9 +44,9 @@ class TestSampleFromAnchorDSpark:
         assert not config.sample_from_anchor
 
 
-class TestSampleFromAnchorMuse:
+class TestSampleFromAnchorMMuse:
     def test_defaults_match_dspark_with_optional_extensions_off(self):
-        config = MuseSpeculatorConfig(draft_vocab_size=128, block_size=4)
+        config = MMuseSpeculatorConfig(draft_vocab_size=128, block_size=4)
         assert config.sample_from_anchor
         assert not config.enable_correction_head
         assert not config.correction_with_markov
