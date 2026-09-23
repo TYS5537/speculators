@@ -101,6 +101,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
                     markov_rank=config.markov_rank,
                     hidden_size=hidden_size,
                     head_type=config.markov_head_type,
+                    init_std=config.markov_init_std,
                 )
                 self.correction_markov_gate = torch.nn.Linear(
                     config.correction_hidden_size, 1
@@ -118,6 +119,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
                 markov_rank=config.markov_rank,
                 hidden_size=hidden_size,
                 head_type=config.markov_head_type,
+                init_std=config.markov_init_std,
             )
 
         self.confidence_head: ConfidenceHead | None = None
@@ -159,6 +161,9 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             }:
                 value = default
             sequential_kwargs[name] = value
+        sequential_kwargs["markov_init_std"] = (
+            0.01 if kwargs.get("training_recipe") == "upstream" else None
+        )
         config = cls.config_class(
             **cls._build_base_config_kwargs("mmuse", verifier_config, **kwargs),
             **sequential_kwargs,
@@ -1409,6 +1414,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
+        tv_loss_fn = kwargs.pop("tv_loss_fn", None)
         correction_output_mode = (
             getattr(self.correction_head, "output_mode", "hidden")
             if self.correction_head is not None
@@ -1587,6 +1593,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             proposal_candidate_logits=proposal_candidate_logits,
             target_log_normalizer=target_log_normalizer,
             target_argmax_ids=target_argmax_ids,
+            tv_loss_fn=tv_loss_fn,
         )
         loss, metrics = self._add_auxiliary_losses(
             loss,

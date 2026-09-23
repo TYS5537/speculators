@@ -115,6 +115,7 @@ class ArrowHSPrefixTests(unittest.TestCase):
         self.generator = Mock(side_effect=self.generate)
         self.namespace = {
             "Dataset": object,
+            "SampleUnavailable": type("SampleUnavailable", (), {}),
             "load_from_disk": self.loader,
             "FileTransfer": Mock(return_value=self.transfer),
             "Path": Path,

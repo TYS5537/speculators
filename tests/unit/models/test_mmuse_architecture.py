@@ -97,6 +97,10 @@ def test_baseline_training_factory_accepts_disabled_legacy_flags(
 ):
     template = _config(DFlashSpeculatorConfig)
     monkeypatch.setattr(
+        "speculators.models.utils.get_verifier_config",
+        lambda *_args, **_kwargs: template.transformer_layer_config,
+    )
+    monkeypatch.setattr(
         VerifierConfig,
         "from_pretrained",
         lambda *_args, **_kwargs: template.speculators_config.verifier,
@@ -117,6 +121,10 @@ def test_baseline_training_factory_accepts_disabled_legacy_flags(
 @pytest.mark.parametrize("feature", ["enable_correction_head", "dflash2_dynamic_conv"])
 def test_mmuse_training_factory_keeps_enabled_features(monkeypatch, feature):
     template = _config(DFlashSpeculatorConfig)
+    monkeypatch.setattr(
+        "speculators.models.utils.get_verifier_config",
+        lambda *_a, **_k: template.transformer_layer_config,
+    )
     monkeypatch.setattr(
         VerifierConfig,
         "from_pretrained",

@@ -68,7 +68,7 @@ def create_train_val_loaders(
     total_seq_len: int,
     hidden_states_dtype: torch.dtype,
     noise_std: float,
-    legacy_data: bool,
+    legacy_data: bool = False,
     transfer: HiddenStatesTransfer | None = None,
     vllm_endpoint: str,
     on_missing: Literal["generate", "skip", "warn", "raise"],
@@ -83,6 +83,8 @@ def create_train_val_loaders(
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
     pretokenized_text_only: bool = False,
+    generation_validation_retries: int | None = None,
+    max_consecutive_generation_failures: int = 20,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -133,6 +135,8 @@ def create_train_val_loaders(
             request_timeout=request_timeout,
             max_retries=max_retries,
             pretokenized_text_only=pretokenized_text_only,
+            generation_validation_retries=generation_validation_retries,
+            max_consecutive_generation_failures=max_consecutive_generation_failures,
         )
         val_dataset = ArrowDataset(
             datapath=data_path,
@@ -148,6 +152,8 @@ def create_train_val_loaders(
             request_timeout=request_timeout,
             max_retries=max_retries,
             pretokenized_text_only=pretokenized_text_only,
+            generation_validation_retries=generation_validation_retries,
+            max_consecutive_generation_failures=max_consecutive_generation_failures,
         )
 
     train_loader = _setup_dataloader(

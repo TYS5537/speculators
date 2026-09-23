@@ -45,6 +45,12 @@ def trainer_module():
         root_logger=logging.getLogger("supervision-test"),
         metric_logger=Mock(),
         MIN_STEP_PCT=0.25,
+        _VAL_SYNC_INTERVAL=50,
+        # Recovery collectives are covered by test_data_recovery; these tests
+        # isolate supervision accounting with no recovery metadata present.
+        BatchRecoveryCoordinator=lambda _phase: SimpleNamespace(
+            consume=lambda batch, **_kwargs: None
+        ),
         with_graceful_shutdown=lambda: lambda function: function,
         _rank0_only=lambda function: function,
         TrainingInterruptedError=RuntimeError,
@@ -55,6 +61,7 @@ def trainer_module():
         "src/speculators/train/utils.py": {"normalize_counted_metrics"},
         "src/speculators/train/trainer.py": {
             "_synchronize_device",
+            "_all_reduce_metrics",
             "_StepTimer",
             "TrainerConfig",
             "Trainer",
@@ -149,7 +156,11 @@ def _set_collectives(module, values, world_size=2):
     remaining = iter(values)
 
     def all_reduce(tensor, **_kwargs):
-        tensor.fill_(next(remaining))
+        value = next(remaining)
+        if isinstance(value, list):
+            tensor.copy_(torch.tensor(value, dtype=tensor.dtype))
+        else:
+            tensor.fill_(value)
 
     module.dist.all_reduce = Mock(side_effect=all_reduce)
     module.dist.get_world_size = lambda: world_size
@@ -238,13 +249,23 @@ def test_training_logs_average_only_supervised_ranks(
 ):
     trainer = _make_trainer(trainer_module, tmp_path, [_batch()], distributed=True)
     trainer.config = trainer.config._replace(log_freq=1)
-    _set_collectives(trainer_module, [active_ranks])
-    trainer_module.dist.reduce = Mock(
-        side_effect=lambda value, **_kwargs: value.mul_(active_ranks)
+    _set_collectives(
+        trainer_module,
+        [
+            active_ranks,
+            [
+                0.0625 * active_ranks,
+                active_ranks,
+                2 * active_ranks,
+                3 * active_ranks,
+                0,
+                1,
+            ],
+        ],
     )
     trainer.train_epoch(0)
     logged = trainer_module.metric_logger.info.call_args.args[0]["train"]
-    assert logged == {"loss": 0.0625, "plain_probe": 3.0}
+    assert logged == {"loss": 0.0625, "plain_probe": 3.0, "error_records": 0.0}
 
 
 def test_supervision_count_overrides_input_mask_and_legacy_falls_back(
@@ -276,12 +297,12 @@ def test_validation_excludes_empty_ranks_without_skipping_collectives(
         trainer_module, tmp_path, [_batch(), _batch(0)], distributed=True
     )
     # First batch has two valid ranks; second has only the remote rank. Each
-    # active batch reduces loss_sum, loss_total, supervision_total, plain_probe.
-    collective = _set_collectives(trainer_module, [2, 1, 2, 4, 6, 1, 9, 1, 2, 6])
+    # active batch packs loss_sum, loss_total, supervision_total, plain_probe.
+    collective = _set_collectives(trainer_module, [2, [1, 2, 4, 6], 1, [9, 1, 2, 6]])
     metrics = trainer.val_epoch(0)
     assert metrics["loss_epoch"] == pytest.approx(10 / 3)
     assert metrics["plain_probe_epoch"] == 4
-    assert collective.call_count == 10
+    assert collective.call_count == 4
 
 
 @pytest.mark.parametrize("distributed", [False, True])

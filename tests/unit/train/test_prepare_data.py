@@ -4,8 +4,8 @@ import pytest
 from datasets import Dataset as HFDataset
 
 from scripts.prepare_data import assert_safe_to_overwrite, parse_args
-from speculators.data_generation import preprocessing as preprocessing_module
-from speculators.data_generation.preprocessing import load_and_preprocess_dataset
+from speculators.data_generation import legacy_preprocessing as preprocessing_module
+from speculators.data_generation.legacy_preprocessing import load_and_preprocess_dataset
 
 
 def test_assert_safe_to_overwrite_allows_prepare_data_artifacts(tmp_path: Path):

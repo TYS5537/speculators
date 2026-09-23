@@ -9,7 +9,7 @@ from unittest.mock import Mock
 import pytest
 
 from scripts import train
-from speculators.train import cli
+from speculators.train import legacy_cli as cli
 
 
 def _argv(*extra):

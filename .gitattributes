@@ -7,3 +7,5 @@
 /examples/train/dspark_dsv4_training_smoke.sh text eol=lf
 /examples/evaluate/dspark_dsv4_offline_eval.sh text eol=lf
 /examples/evaluate/dspark_dsv4_single_eval.sh text eol=lf
+# All shell entrypoints must remain executable on Linux after Windows checkout.
+*.sh text eol=lf

@@ -11,6 +11,7 @@ _CORE_LOGGED_METRICS = frozenset(
         "loss",
         "full_acc",
         "accept_len",
+        "eal",
         "confidence_loss",
         "correction_hidden_aux_loss",
         "dflash2_selector_loss",

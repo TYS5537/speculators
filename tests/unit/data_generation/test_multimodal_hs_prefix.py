@@ -71,6 +71,7 @@ def api(monkeypatch):
     namespace = {
         "torch": torch,
         "Dataset": torch.utils.data.Dataset,
+        "SampleUnavailable": type("SampleUnavailable", (), {}),
         "warnings": warnings,
         "cast": cast,
         "DEFAULT_REQUEST_TIMEOUT": 120,
@@ -217,6 +218,7 @@ def _dataset(api, service, payload, *, cached=False):
     dataset.max_retries = 0
     dataset.start_file_idx = 0
     dataset.pretokenized_text_only = False
+    dataset.generation_recovery = None
     dataset.on_missing = "generate"
     dataset.on_generate = "cache"
     dataset.transfer = SimpleNamespace(
@@ -359,7 +361,7 @@ def test_preprocessing_keeps_the_same_right_prefix_and_complete_messages():
         "_adapt_conv_for_vllm": lambda value: value,
     }
     _definitions(
-        "src/speculators/data_generation/preprocessing.py",
+        "src/speculators/data_generation/legacy_preprocessing.py",
         {"_preprocess_batch"},
         namespace,
     )
@@ -431,7 +433,7 @@ def test_template_end_markers_match_preprocessing(
         "log": logging.getLogger("template-parity"),
     }
     _definitions(
-        "src/speculators/data_generation/preprocessing.py",
+        "src/speculators/data_generation/legacy_preprocessing.py",
         {
             "_normalize_conversation",
             "_adapt_part_for_hf",

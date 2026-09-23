@@ -67,6 +67,7 @@ def test_pretokenized_generic_entry_never_loads_processor(tmp_path, monkeypatch)
         seq_length=2,
         build_dataset_num_proc=None,
         token_freq_path=tmp_path / "freq.pt",
+        skip_token_freq=False,
     )
     assert processor is None
     assert result[0]["input_ids"].tolist() == [1, 2]

@@ -20,7 +20,7 @@ import pytest
 
 from speculators.data_generation import vllm_client
 from speculators.data_generation.configs import DATASET_CONFIGS, DatasetConfig
-from speculators.data_generation.preprocessing import _preprocess_batch
+from speculators.data_generation.legacy_preprocessing import _preprocess_batch
 from speculators.data_generation.vllm_client import InvalidResponseError
 
 

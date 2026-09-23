@@ -25,8 +25,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import shlex
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import URLError
 from urllib.request import urlopen
@@ -35,15 +36,22 @@ from perf_utils import (
     BASE_CSV_COLUMNS,
     CsvWriter,
     acceptance_csv_columns,
-    build_backend_args,
     check_dependencies,
     extract_spec_decode_metrics,
     fetch_metrics,
+    parse_gen_kwargs,
     parse_gen_len_results,
     parse_prometheus_metrics,
     parse_sweep_results,
     print_acceptance_report,
     run_guidellm,
+)
+
+from speculators.provenance import (
+    atomic_write,
+    find_package_repo,
+    git_sha,
+    package_versions,
 )
 
 logger = logging.getLogger("evaluate")
@@ -57,13 +65,17 @@ DEFAULT_MAX_CONCURRENCY = 128
 DEFAULT_MAX_REQUESTS = 200
 DEFAULT_GEN_LEN_RATE = 128
 DEFAULT_SWEEP_RATE = 10
-DEFAULT_DATA_COLUMN_MAPPER = '{"text_column":"prompt"}'
+DEFAULT_DATA_COLUMN_MAPPER = (
+    "kind=generative_column_mapper,column_mappings.text_column=prompt"
+)
 
 # ---------------------------------------------------------------------------
 # SPEED-Bench constants
 # ---------------------------------------------------------------------------
 
-_SPEEDBENCH_COLUMN_MAPPER = '{"text_column":"turns"}'
+_SPEEDBENCH_COLUMN_MAPPER = (
+    "kind=generative_column_mapper,column_mappings.text_column=turns"
+)
 
 
 def _fetch_model_name(target: str) -> str | None:
@@ -84,6 +96,30 @@ def _fetch_model_name(target: str) -> str | None:
 
 def _sanitize_dir_name(name: str) -> str:
     return name.replace("/", "_").replace(" ", "_")
+
+
+def save_eval_provenance(output_dir: Path) -> None:
+    """Write ``eval_command.txt`` into *output_dir*.
+
+    Records the full command line, timestamp, and package versions so the
+    eval can be reproduced.  Best-effort — never blocks the eval on failure.
+    """
+    try:
+        sha = git_sha(find_package_repo("speculators"))
+        versions = package_versions()
+        header = "\n".join(
+            [
+                f"# Timestamp: {datetime.now(timezone.utc).isoformat()}",
+                f"# Git SHA: {sha}",
+                *versions,
+            ]
+        )
+        atomic_write(
+            output_dir / "eval_command.txt",
+            f"{header}\n{shlex.join(sys.argv)}\n",
+        )
+    except OSError:
+        logger.warning("Failed to save eval_command.txt", exc_info=True)
 
 
 def _require_metrics(metrics_url: str) -> list:
@@ -182,7 +218,8 @@ def _run_subset(
             rate=args.gen_len_rate,
             max_requests=None,
             output_path=gen_len_output,
-            backend_args=build_backend_args(args.gen_kwargs, 4096),
+            max_tokens=4096,
+            gen_kwargs=parse_gen_kwargs(args.gen_kwargs),
         )
         mapping = parse_gen_len_results(
             [gen_len_output],
@@ -202,7 +239,8 @@ def _run_subset(
         profile=profile,
         max_requests=args.max_requests,
         output_path=run_output,
-        backend_args=build_backend_args(args.gen_kwargs, max_tokens),
+        max_tokens=max_tokens,
+        gen_kwargs=parse_gen_kwargs(args.gen_kwargs),
     )
     current = _require_metrics(metrics_url)
 
@@ -251,6 +289,15 @@ def run_benchmark(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     artifacts_dir = output_dir / "artifacts"
     artifacts_dir.mkdir(parents=True, exist_ok=True)
+
+    save_eval_provenance(output_dir)
+
+    if not (output_dir / "vllm_command.txt").exists():
+        logger.info(
+            "No vllm_command.txt found. To co-locate vLLM provenance "
+            "with eval results: launch_vllm.py --provenance-dir %s",
+            output_dir,
+        )
 
     acceptance_csv = None
     perf_csv = None
@@ -395,12 +442,17 @@ def main() -> None:
     parser.add_argument(
         "--gen-kwargs",
         default="",
-        help="Flat JSON with generation kwargs, e.g. '{\"temperature\":0.6}'",
+        help=(
+            "JSON with generation kwargs, e.g. '{\"temperature\":0.6}'. "
+            "Nested values are supported, e.g. "
+            '\'{"chat_template_kwargs":{"enable_thinking":false}}\'.'
+        ),
     )
     parser.add_argument(
         "--data-column-mapper",
         default=DEFAULT_DATA_COLUMN_MAPPER,
-        help=f"Column mapping for guidellm (default: {DEFAULT_DATA_COLUMN_MAPPER})",
+        help="Column mapping for guidellm in typed key=value format"
+        f" (default: {DEFAULT_DATA_COLUMN_MAPPER})",
     )
     parser.add_argument(
         "--speedbench-data-dir",
@@ -411,7 +463,6 @@ def main() -> None:
             "Required when --dataset is a speedbench/ spec."
         ),
     )
-
     args = parser.parse_args()
 
     if args.output_dir is None:

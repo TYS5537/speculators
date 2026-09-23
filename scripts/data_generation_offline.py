@@ -313,6 +313,8 @@ async def _feed_queue(to_process, dataset, queue, cancel_event):
 
         dataset_item = dataset[i]
         client_item = build_client_item(dataset_item) | {"idx": i}
+        if "messages" in client_item:
+            client_item.setdefault("continue_final_message", False)
 
         # Check cancel_event while waiting for queue space to avoid
         # deadlocking when all workers have died.

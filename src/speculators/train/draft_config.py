@@ -76,6 +76,7 @@ def create_transformer_layer_config(  # noqa: C901
     full_attention_indices: list[int],
     mrope_full_head_hack: bool = True,
     *,
+    trust_remote_code: bool = False,
     logger: logging.Logger | None = None,
 ) -> PretrainedConfig:
     logger = _LOGGER if logger is None else logger
@@ -94,7 +95,10 @@ def create_transformer_layer_config(  # noqa: C901
         )
 
     config_class = DRAFT_ARCH_CONFIGS[draft_arch]
-    verifier_config = AutoConfig.from_pretrained(verifier_name_or_path)
+    verifier_config = AutoConfig.from_pretrained(
+        verifier_name_or_path,
+        **({"trust_remote_code": True} if trust_remote_code else {}),
+    )
 
     # For multimodal models (Qwen3VL, etc.), extract text_config
     if hasattr(verifier_config, "text_config"):
@@ -219,6 +223,7 @@ def load_draft_transformer_layer_config(
     draft_config: str,
     verifier_name_or_path: str,
     *,
+    trust_remote_code: bool = False,
     logger: logging.Logger | None = None,
 ) -> PretrainedConfig:
     """Load the draft decoder ``transformer_layer_config`` from a config source.
@@ -250,7 +255,10 @@ def load_draft_transformer_layer_config(
     config_class: type[PretrainedConfig] = type(AutoConfig.for_model(model_type))
     draft_config_obj = config_class.from_dict(config_dict)
 
-    verifier_config = get_verifier_config(verifier_name_or_path)
+    verifier_config = get_verifier_config(
+        verifier_name_or_path,
+        **({"trust_remote_code": True} if trust_remote_code else {}),
+    )
     if draft_config_obj.hidden_size != verifier_config.hidden_size:
         raise ValueError(
             f"--draft-config hidden_size ({draft_config_obj.hidden_size}) must match "

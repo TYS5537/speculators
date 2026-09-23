@@ -1,9 +1,10 @@
 import json
+import logging
 import math
 import os
 import random
 import warnings
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
@@ -23,6 +24,14 @@ from speculators.data_generation.vllm_client import (
     generate_hidden_states,
 )
 from speculators.train.noise_transforms import TransformTensors
+from speculators.train.recovery import (
+    RECOVERY_METADATA_KEY,
+    GenerationRecoveryGuard,
+    RecoveryMetadata,
+    SampleUnavailable,
+)
+
+logger = logging.getLogger("speculators")
 
 BatchType = dict[str, Any]
 
@@ -115,7 +124,9 @@ def _has_multimodal_content(messages: list[dict]) -> bool:
     return any(isinstance(m.get("content"), list) for m in messages)
 
 
-def build_client_item(dataset_item: dict) -> ClientItem:
+def build_client_item(
+    dataset_item: dict, *, legacy_final_message: bool = False
+) -> ClientItem:
     """Build a request payload for vLLM hidden-state extraction.
 
     When ``messages`` is included, ``generate_hidden_states`` uses the Chat
@@ -141,6 +152,12 @@ def build_client_item(dataset_item: dict) -> ClientItem:
 
     if "messages" in dataset_item and _has_multimodal_content(dataset_item["messages"]):
         out_dict["messages"] = dataset_item["messages"]
+        if "continue_final_message" in dataset_item:
+            out_dict["continue_final_message"] = bool(
+                dataset_item["continue_final_message"]
+            )
+        elif legacy_final_message:
+            out_dict["continue_final_message"] = False
 
     return cast("ClientItem", out_dict)
 
@@ -166,7 +183,7 @@ class BaseDataset(Dataset):
     def __getitem__(self, index) -> BatchType | None:
         data = self._get_raw_data(index)
 
-        if data is None:
+        if data is None or isinstance(data, SampleUnavailable):
             return data
 
         # data structure: {
@@ -217,8 +234,30 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         pretokenized_text_only: bool = False,
         *,
-        split: Literal["train", "validation"] | None = None,
+        split: Literal["train", "validation", "val"] | None = None,
+        train_ratio: float | None = None,
+        generation_validation_retries: int | None = None,
+        max_consecutive_generation_failures: int = 20,
     ):
+        if train_ratio is not None:
+            if not 0.0 < train_ratio <= 1.0:
+                raise ValueError(
+                    f"train_ratio must be in (0.0, 1.0], got {train_ratio}"
+                )
+            if split_ratio != 1.0:
+                raise ValueError("train_ratio and split_ratio cannot both be supplied")
+            split_ratio = train_ratio
+            split = split or "train"
+        if split == "val":
+            split = "validation"
+        self.generation_recovery = (
+            GenerationRecoveryGuard(
+                retries=generation_validation_retries,
+                max_consecutive_failures=max_consecutive_generation_failures,
+            )
+            if generation_validation_retries is not None
+            else None
+        )
         self.pretokenized_text_only = pretokenized_text_only
         if pretokenized_text_only and max_len < 1:
             raise ValueError("External Arrow requires a positive training max_len")
@@ -231,15 +270,37 @@ class ArrowDataset(BaseDataset):
             self.data = self.data.with_format(
                 "torch", columns=["input_ids", "loss_mask"], output_all_columns=False
             )
+        self._select_split(split, split_ratio)
+
+        self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
+        self.vllm_endpoint = vllm_endpoint
+        self.on_missing = on_missing
+        self.on_generate = on_generate
+        self.client: openai.OpenAI | None = None
+        self.model = model
+        self.request_timeout = request_timeout
+        self.max_retries = max_retries
+
+        # Delay super init so that `_compute_approx_lengths` has required data
+        super().__init__(max_len, transform, hidden_states_dtype)
+
+    def _select_split(self, split, split_ratio):
+        """Keep old signed-ratio and new named splits on the same boundary."""
         self.start_file_idx = 0
         if split is not None:
-            if split not in ("train", "validation") or not 0.0 < split_ratio < 1.0:
+            if split not in ("train", "validation") or not 0.0 < split_ratio <= 1.0:
                 raise ValueError(
                     "Named splits need train/validation and ratio in (0, 1)"
                 )
+            if split == "validation" and split_ratio == 1.0:
+                raise ValueError("train_ratio=1.0 leaves no validation split")
             # Both views use this same positive ratio and integer boundary.
             # Reconstructing it as 1 + (ratio - 1) can round down by one row.
             split_idx = int(len(self.data) * split_ratio)
+            if split_idx == 0 or (
+                split == "validation" and split_idx == len(self.data)
+            ):
+                raise ValueError(f"{split} split is empty")
             if split == "train":
                 self.data = self.data.select(range(split_idx))
             else:
@@ -258,26 +319,14 @@ class ArrowDataset(BaseDataset):
         else:
             raise ValueError("split_ratio must be in range (-1.0, 1.0] excluding 0.0.")
 
-        self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
-        self.vllm_endpoint = vllm_endpoint
-        self.on_missing = on_missing
-        self.on_generate = on_generate
-        self.client: openai.OpenAI | None = None
-        self.model = model
-        self.request_timeout = request_timeout
-        self.max_retries = max_retries
-
-        # Delay super init so that `_compute_approx_lengths` has required data
-        super().__init__(max_len, transform, hidden_states_dtype)
-
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
 
     def _setup_client(self):
-        self.client = openai.OpenAI(
+        client = openai.OpenAI(
             base_url=self.vllm_endpoint, api_key="EMPTY", max_retries=0
         )
-        list_models = self.client.models.list()
+        list_models = client.models.list()
         model_id = list_models.data[0].id
         if self.model and self.model != model_id:
             raise ValueError(
@@ -287,6 +336,7 @@ class ArrowDataset(BaseDataset):
             )
         self.model = model_id
         self.transfer.setup()
+        self.client = client
 
     def __len__(self):
         return len(self.data)
@@ -338,12 +388,90 @@ class ArrowDataset(BaseDataset):
         check_hidden_states(prefix, input_ids.tolist())
         return prefix
 
+    def _generate_hidden_states_once(
+        self,
+        index: int,
+        dataset_item: dict,
+        client_item: ClientItem,
+    ) -> dict[str, torch.Tensor]:
+        handle: str | None = None
+        try:
+            if not self.client:
+                self._setup_client()
+            handle = generate_hidden_states(
+                self.client,  # type:ignore[arg-type]
+                self.model,  # type:ignore[arg-type]
+                client_item,
+                timeout=self.request_timeout,
+                max_retries=self.max_retries,
+            )
+
+            loaded_hs = self.transfer.get_generated(handle)
+            if loaded_hs is None:
+                raise ValueError(f"Failed to load hidden states for handle {handle}")
+
+            # Covers token/shape mismatches and non-finite values. The Mooncake
+            # transfer performs manifest/checksum validation first.
+            if self.pretokenized_text_only:
+                loaded_hs = self._align_text_hs(
+                    loaded_hs,
+                    dataset_item["input_ids"],
+                    self._map_to_file_idx(index),
+                    allow_prefix=False,
+                )
+            else:
+                loaded_hs = align_hidden_states(
+                    loaded_hs,
+                    dataset_item["input_ids"].tolist(),
+                    allow_prefix="messages" in client_item,
+                )
+
+            file_idx = self._map_to_file_idx(index)
+            if self.on_generate == "cache":
+                self.transfer.cache(handle, file_idx)
+            else:
+                try:
+                    self.transfer.delete(handle)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.warning(
+                        "Loaded a valid hidden-state sample but failed to delete "
+                        "handle %s: %s",
+                        handle,
+                        cleanup_error,
+                    )
+            return loaded_hs
+        except Exception:
+            if handle is not None:
+                try:
+                    self.transfer.delete(handle)
+                except Exception as cleanup_error:  # noqa: BLE001
+                    logger.warning(
+                        "Failed to clean generated hidden-state handle %s: %s",
+                        handle,
+                        cleanup_error,
+                    )
+            raise
+
+    def _generate_recoverable_hs(self, index):
+        dataset_item = self._get_dataset_item(index)
+        client_item = build_client_item(dataset_item)
+        # Token/shape errors on retokenized multimodal inputs remain fatal.
+        if "messages" in client_item:
+            return self._generate_hidden_states_once(index, dataset_item, client_item)
+        return self.generation_recovery.run(
+            lambda: self._generate_hidden_states_once(index, dataset_item, client_item),
+            description=f"Hidden-state round trip failed for dataset index {index}",
+        )
+
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
+        if self.generation_recovery is not None and not self.pretokenized_text_only:
+            return self._generate_recoverable_hs(index)
         if not self.client:
             self._setup_client()
 
         dataset_item = self._get_dataset_item(index)
-        client_item = build_client_item(dataset_item)
+        # Legacy HF templates kept the final assistant terminator intact.
+        client_item = build_client_item(dataset_item, legacy_final_message=True)
 
         try:
             handle = generate_hidden_states(
@@ -416,7 +544,7 @@ class ArrowDataset(BaseDataset):
                         f"Failed to load hidden states for sample {index}."
                     )
 
-        if loaded_hs is None:
+        if loaded_hs is None or isinstance(loaded_hs, SampleUnavailable):
             return loaded_hs
 
         dataset_item = self._get_dataset_item(index)
@@ -552,16 +680,51 @@ class SampleFileDataset(BaseDataset):
         )
 
 
-def create_collate_fn(
-    max_len: int,
-    hidden_size: int,
-    num_target_layers: int = 3,
-    dtype: torch.dtype = torch.bfloat16,
-    preprocess: Callable[[BatchType], BatchType] | None = None,
-):
-    def collate_fn(batch: list[BatchType | None]) -> BatchType:
-        # Apply per-sample preprocessing and filter failed samples
-        batch = [preprocess(b) if preprocess else b for b in batch if b is not None]
+class CollateFn:
+    """Picklable collate function for use with ``multiprocessing_context='spawn'``."""
+
+    def __init__(
+        self,
+        max_len: int,
+        hidden_size: int,
+        num_target_layers: int = 3,
+        dtype: torch.dtype = torch.bfloat16,
+        preprocess: Callable[[BatchType], BatchType] | None = None,
+    ):
+        self.max_len = max_len
+        self.hidden_size = hidden_size
+        self.num_target_layers = num_target_layers
+        self.dtype = dtype
+        self.preprocess = preprocess
+
+    def _clean_batch(
+        self, batch: Sequence[BatchType | SampleUnavailable | None]
+    ) -> tuple[list[BatchType], list[SampleUnavailable], int]:
+        """Preprocess valid samples and collect unavailable and dropped samples."""
+        preprocess = self.preprocess
+        unavailable = []
+        num_dropped = 0
+        new_batch = []
+        for item in batch:
+            if item is None:
+                num_dropped += 1
+                continue
+            if isinstance(item, SampleUnavailable):
+                unavailable.append(item)
+                num_dropped += 1
+                continue
+
+            new_batch.append(preprocess(item) if preprocess else item)
+
+        return new_batch, unavailable, num_dropped
+
+    def __call__(
+        self, batch: Sequence[BatchType | SampleUnavailable | None]
+    ) -> BatchType:
+        max_len = self.max_len
+        dtype = self.dtype
+
+        batch, unavailable, num_dropped = self._clean_batch(batch)
 
         if not batch:
             # Create empty sample which then gets padded to full
@@ -569,12 +732,17 @@ def create_collate_fn(
             # Match the configured `dtype` so the placeholder doesn't crash
             # downstream layers loaded at a different precision (e.g. bf16
             # weights vs fp32 default placeholders).
-            empty = create_empty_sample(hidden_size, num_target_layers, dtype=dtype)
-            if preprocess:
-                empty = preprocess(empty)
+            empty = create_empty_sample(
+                self.hidden_size, self.num_target_layers, dtype=dtype
+            )
+            if self.preprocess:
+                empty = self.preprocess(empty)
             batch = [empty]
+            locally_empty = True
+        else:
+            locally_empty = False
 
-        collated_data = {}
+        collated_data: BatchType = {}
         for key in batch[0]:  # type: ignore[union-attr]
             if key == "lengths":
                 collated_data[key] = torch.cat([b[key] for b in batch], dim=0)  # type: ignore[index]
@@ -623,6 +791,23 @@ def create_collate_fn(
         # shape: [1, max_len]
         collated_data["document_ids"] = document_ids
 
+        collated_data["error_records"] = num_dropped
+        metadata = RecoveryMetadata.from_unavailable(
+            unavailable,
+            locally_empty=locally_empty,
+        )
+        if metadata.failure_count or metadata.locally_empty:
+            collated_data[RECOVERY_METADATA_KEY] = metadata
+
         return collated_data
 
-    return collate_fn
+
+def create_collate_fn(
+    max_len: int,
+    hidden_size: int,
+    num_target_layers: int = 3,
+    dtype: torch.dtype = torch.bfloat16,
+    preprocess: Callable[[BatchType], BatchType] | None = None,
+):
+    """Compatibility factory for the upstream picklable collator."""
+    return CollateFn(max_len, hidden_size, num_target_layers, dtype, preprocess)

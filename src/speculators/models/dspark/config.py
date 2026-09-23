@@ -58,6 +58,12 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
         ),
     )
 
+    markov_init_std: float | None = Field(
+        default=None,
+        gt=0,
+        description="None preserves legacy initialization; upstream recipes use 0.01.",
+    )
+
     # Confidence head.
     enable_confidence_head: bool = Field(
         default=True,

@@ -40,11 +40,26 @@ from speculators.train.graceful_shutdown import (
     with_graceful_shutdown,
 )
 from speculators.train.optimizers import build_optimizers
+from speculators.train.recovery import BatchRecoveryCoordinator
 from speculators.train.rng import capture_rng_states, restore_rng_states
 from speculators.train.utils import normalize_counted_metrics
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
+
+
+def _all_reduce_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Sum *metrics* across ranks with a single collective.
+
+    Used by both the training and validation metric reductions. Values are
+    returned as float tensors in the same key order.
+    """
+    if not metrics:
+        return {}
+    keys = list(metrics)
+    stacked = torch.stack([metrics[k].float().reshape(()) for k in keys])
+    dist.all_reduce(stacked, op=dist.ReduceOp.SUM)
+    return dict(zip(keys, stacked, strict=True))
 
 
 def _synchronize_device() -> None:
@@ -119,6 +134,7 @@ class _StepTimer:
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
 MIN_STEP_PCT = 0.25
+_VAL_SYNC_INTERVAL = 50
 
 
 class TrainerConfig(NamedTuple):
@@ -146,6 +162,9 @@ class TrainerConfig(NamedTuple):
     log_freq: int = 1
     fsdp_shard: bool = False
     activation_checkpointing: bool = False
+    gradient_checkpointing: bool = False
+    max_steps: int | None = None
+    training_recipe: Literal["legacy", "upstream"] = "legacy"
 
 
 def _resolve_scheduler_steps(
@@ -160,6 +179,10 @@ def _resolve_scheduler_steps(
     to ``num_epochs * train_loader_len``.
     """
     default_total_steps = config.num_epochs * train_loader_len
+    if config.max_steps is not None:
+        if config.max_steps <= 0:
+            raise ValueError("max_steps must be positive")
+        default_total_steps = min(default_total_steps, config.max_steps)
     scheduler_total_steps = (
         config.scheduler_total_steps
         if config.scheduler_total_steps is not None
@@ -396,7 +419,18 @@ class Trainer:
         # Verify model is compatible with training infrastructure
         SpeculatorModel.verify_training_compatible(self.model)
 
-        if self.config.activation_checkpointing:
+        if (
+            self.config.gradient_checkpointing
+            and not self.config.activation_checkpointing
+            and not hasattr(self.model, "set_activation_checkpointing")
+        ):
+            if not self.model.supports_gradient_checkpointing:
+                raise ValueError(
+                    f"{type(self.model).__name__} does not support "
+                    "gradient checkpointing"
+                )
+            self.model.gradient_checkpointing_enable()
+        elif self.config.activation_checkpointing or self.config.gradient_checkpointing:
             enable_checkpointing = getattr(
                 self.model, "set_activation_checkpointing", None
             )
@@ -595,6 +629,8 @@ class Trainer:
         return skip_steps
 
     def _resume_aware_iterator(self):
+        if self._max_steps_reached():
+            return iter(())
         # Iterator construction and skipped data reads can consume random numbers.
         # Restore after those resume-only operations, before the first live batch.
         iterator = iter(self.train_loader)
@@ -635,12 +671,15 @@ class Trainer:
         )
         t_before_fetch = time.perf_counter()
         timer = _StepTimer()
+        recovery = BatchRecoveryCoordinator("training")
         for local_step_rel, batch in enumerate(train_loader, 1):
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
             timer.reset(self.global_step % self.config.log_freq == 0)
 
             timer.mark_value("start", t_before_fetch)
+            recovery.consume(batch, synchronize=True)
+            error_records = batch.pop("error_records", 0)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -692,6 +731,12 @@ class Trainer:
                 continue
             torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
 
+            metrics["error_records_sum"] = torch.tensor(
+                error_records, dtype=torch.float32, device=loss.device
+            )
+            metrics["error_records_total"] = torch.tensor(
+                1.0 if self.rank == 0 else 0.0, device=loss.device
+            )
             timer.mark("bwd")
             self._optimizers_step()
 
@@ -707,8 +752,7 @@ class Trainer:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
                 if self.is_distributed:
-                    for v in metrics.values():
-                        dist.reduce(v, dst=0, op=dist.ReduceOp.SUM)
+                    metrics = _all_reduce_metrics(metrics)
 
                 metrics = {k: v.item() for k, v in metrics.items()}
                 metrics = normalize_counted_metrics(metrics, active_ranks)
@@ -740,6 +784,15 @@ class Trainer:
                 # Avoid saving back to back ay the end of each epoch
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+            # Stop before fetching another batch: data transforms can consume RNG.
+            if self._max_steps_reached():
+                break
+
+    def _maybe_val_sync(self, batch_index: int) -> None:
+        if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
+            return
+        if batch_index > 0 and batch_index % _VAL_SYNC_INTERVAL == 0:
+            dist.barrier()
 
     @torch.no_grad()
     def val_epoch(self, epoch: int) -> dict[str, float] | None:
@@ -754,7 +807,11 @@ class Trainer:
 
         val_metrics: dict[str, float] = {}
         supervised_rank_batches = 0
-        for batch in val_loader:
+        recovery = BatchRecoveryCoordinator("validation")
+        for batch_index, batch in enumerate(val_loader):
+            self._maybe_val_sync(batch_index)
+            recovery.consume(batch, synchronize=True)
+            batch.pop("error_records", None)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
                 if isinstance(v, torch.Tensor)
@@ -778,8 +835,7 @@ class Trainer:
             supervised_rank_batches += active_ranks
             metrics = self._mask_unsupervised_metrics(metrics, local_active)
             if self.is_distributed:
-                for m in metrics.values():
-                    dist.all_reduce(m, op=dist.ReduceOp.SUM)
+                metrics = _all_reduce_metrics(metrics)
 
             for k, v in metrics.items():
                 val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
@@ -921,12 +977,43 @@ class Trainer:
         if self.config.save_best:
             self.checkpointer.cleanup_keep_only_best(best_epoch=epoch)
 
+    def _max_steps_reached(self) -> bool:
+        return (
+            self.config.max_steps is not None
+            and self.global_step >= self.config.max_steps
+        )
+
+    def _save_at_step_limit(self) -> bool:
+        """Publish a resumable partial epoch only after a complete update."""
+        if (
+            self._max_steps_reached()
+            and not self._checkpoint_position["epoch_complete"]
+        ):
+            self.maybe_save_checkpoint("interrupted")
+            return True
+        return False
+
+    def _validate_epoch(self, epoch: int):
+        if self.val_loader is None:
+            root_logger.warning("No val loader, skipping validation epoch")
+            return None
+        root_logger.info(
+            f"Validation epoch {epoch + 1}/{self.config.num_epochs} started"
+        )
+        metrics = self.val_epoch(epoch)
+        root_logger.info(
+            f"Validation epoch {epoch + 1}/{self.config.num_epochs} completed"
+        )
+        return metrics
+
     @with_graceful_shutdown()
     def run_training(self):
         if not getattr(self, "_resume_rng_after_loader", False):
             self._restore_pending_rng()
         n_epochs = self.config.num_epochs
         for epoch in range(self.current_epoch, n_epochs):
+            if self._max_steps_reached():
+                break
             self._validation_rng_states = None
             validation_only = epoch == getattr(self, "_resume_validation_epoch", None)
             self._record_checkpoint_position(
@@ -935,6 +1022,8 @@ class Trainer:
             if not validation_only:
                 root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} started")
                 self.train_epoch(epoch)
+                if self._save_at_step_limit():
+                    break
             self._validation_rng_states = capture_rng_states(self.device_type)
             self._record_checkpoint_position(epoch, 0, complete=True)
             root_logger.info(f"Training epoch {epoch + 1}/{n_epochs} completed")
@@ -948,14 +1037,7 @@ class Trainer:
             if self.is_distributed:
                 dist.barrier()
 
-            val_metrics = None
-
-            if self.val_loader is None:
-                root_logger.warning("No val loader, skipping validation epoch")
-            else:
-                root_logger.info(f"Validation epoch {epoch + 1}/{n_epochs} started")
-                val_metrics = self.val_epoch(epoch)
-                root_logger.info(f"Validation epoch {epoch + 1}/{n_epochs} completed")
+            val_metrics = self._validate_epoch(epoch)
 
             if self.is_distributed:
                 dist.barrier()

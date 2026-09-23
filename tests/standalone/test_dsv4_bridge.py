@@ -972,7 +972,7 @@ class RecipeTests(unittest.TestCase):
         }.items():
             self.assertEqual(args[args.index(name) + 1], value)
         argument_sources = (
-            ROOT / "src/speculators/train/cli.py",
+            ROOT / "src/speculators/train/legacy_cli.py",
             ROOT / "src/speculators/train/mmuse_args.py",
         )
         declared = {

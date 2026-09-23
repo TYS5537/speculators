@@ -5,12 +5,15 @@ from typing import Any
 
 import torch
 
-from speculators.models.metrics import (
+from speculators.losses import (
     LossConfig,
     compound_loss,
-    compute_accuracy_multi_step,
     dflash_loss_decay,
     dpace_loss_decay,
+)
+from speculators.models.metrics import (
+    compute_accepted_length_counts,
+    compute_accuracy_multi_step,
     kl_div_loss,
 )
 
@@ -49,7 +52,8 @@ def compute_metrics(  # noqa: C901
             - loss: Scalar loss value
             - full_acc: Overall accuracy
             - position {i} acc: Accuracy at position i within blocks
-            - eal: Expected Accepted Length (headline speculative-decoding metric)
+            - eal: Expected Accepted Length, the mean per-block accepted run
+              plus the verifier's bonus token (headline metric)
     """
     if loss_config is None:
         loss_config = _DEFAULT_LOSS_CONFIG
@@ -121,15 +125,16 @@ def compute_metrics(  # noqa: C901
     metrics["full_acc_sum"] = correct_per_pos[start_pos:].sum()
     metrics["full_acc_total"] = total_per_pos[start_pos:].sum()
 
-    # EAL = sum_k prod_{i<=k} acc_i over drafted positions
-    eal = torch.zeros((), device=logits.device)
-    cum = torch.ones((), device=logits.device)
     for pos in range(start_pos, block_size):
         metrics[f"position_{pos}_acc_sum"] = correct_per_pos[pos]
         metrics[f"position_{pos}_acc_total"] = total_per_pos[pos]
-        acc = correct_per_pos[pos] / total_per_pos[pos].clamp(min=1.0)
-        cum = cum * acc
-        eal = eal + cum
-    metrics["eal_sum"] = eal
-    metrics["eal_total"] = ones.clone()
+
+    # Counted per block so the accepted run is formed before any averaging; the
+    # sum/total pair then pools across batches and ranks like every other metric.
+    eal_sum, eal_total = compute_accepted_length_counts(
+        (pred_ids == target_ids).reshape(-1, block_size)[:, start_pos:],
+        loss_mask.to(torch.bool).reshape(-1, block_size)[:, start_pos:],
+    )
+    metrics["eal_sum"] = eal_sum
+    metrics["eal_total"] = eal_total
     return loss, metrics

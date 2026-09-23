@@ -9,6 +9,7 @@ Optional adaptive position weights (CAT / SSAL) replace fixed decay.
 Correction can additionally report teacher-forced and rollout acceptance metrics.
 """
 
+from collections.abc import Callable
 from typing import Any, Literal
 
 import torch
@@ -22,6 +23,7 @@ from torch.nn.functional import (
 from speculators.models.metrics import (
     LossConfig,
     compound_loss,
+    compute_accepted_length_counts,
     compute_accuracy_multi_step,
     dpace_loss_decay,
     position_weights,
@@ -38,6 +40,7 @@ _CORE_LOGGED_METRICS = frozenset(
         "loss",
         "full_acc",
         "accept_len",
+        "eal",
         "confidence_loss",
     }
 )
@@ -183,6 +186,7 @@ def compute_metrics(  # noqa: C901
     proposal_candidate_ids: torch.Tensor | None = None,
     proposal_candidate_logits: torch.Tensor | None = None,
     *,
+    tv_loss_fn: Callable | None = None,
     target_log_normalizer: torch.Tensor | None = None,
     target_argmax_ids: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, dict]:
@@ -241,7 +245,11 @@ def compute_metrics(  # noqa: C901
             pred_ids = proposal_candidate_ids.gather(-1, selected).squeeze(-1)
         else:
             draft_p = softmax(logits.float(), dim=-1)
-            accept_rate = torch.minimum(draft_p, target_p).sum(dim=-1)
+            accept_rate = (
+                (1.0 - tv_loss_fn(logits, targets)).clamp(0.0, 1.0)
+                if tv_loss_fn is not None and target_log_normalizer is None
+                else torch.minimum(draft_p, target_p).sum(dim=-1)
+            )
             pred_ids = torch.argmax(logits, dim=-1)
         rollout_accept_rate = None
         if rollout_logits is not None:
@@ -557,6 +565,10 @@ def compute_metrics(  # noqa: C901
 
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
+    )
+    metrics["eal_sum"], metrics["eal_total"] = compute_accepted_length_counts(
+        (pred_ids == target_ids).reshape(-1, block_size)[:, start_pos:],
+        loss_mask.bool().reshape(-1, block_size)[:, start_pos:],
     )
     metrics["full_acc_sum"] = correct_per_pos[start_pos:].sum()
     metrics["full_acc_total"] = total_per_pos[start_pos:].sum()

@@ -102,6 +102,7 @@ Apply path-specific focus based on which files changed:
 - **`src/speculators/data_generation/**`**: Hidden state extraction correctness, shift-based alignment (off-by-one), loss mask application before storage, vLLM client error handling.
 - **`src/speculators/convert/**`**: Weight mapping completeness, shape compatibility, key renaming correctness, legacy format assumptions.
 - **`src/speculators/config.py`**: Pydantic validators, serialization roundtrip, backward compat with saved checkpoints, registry auto-discovery.
+- **`scripts/launch_vllm.py`**: This script runs inside the vLLM virtualenv (`VLLM_PYTHON`), which does **not** have `speculators` installed. Make sure there's no `speculators` dependency and flag any such import with confidence 95+.
 - **`tests/**`**: Coverage of new code paths, edge cases for speculative decoding (vocab boundaries, multi-step loss), proper mocking of vLLM/GPU.
 
 Ignore: `**/*.pyc`, `**/build/**`, `**/.pytest_cache/**`, `**/.ruff_cache/**`, `**/__pycache__/**`, `**/*.egg-info/**`.
@@ -188,11 +189,7 @@ For single-line comments, use `line` only. For multi-line, use `start_line` + `l
 
 If there are zero inline comments beyond the summary, post just the review body.
 
-If no issues survive filtering (all < 80 confidence), post a short review comment. Keep it to 1–3 sentences max. Do NOT list everything you checked — that's noise. Examples:
-
-- "LGTM. Recommend approving."
-- "LGTM. Agree with @coderabbitai's suggestion to add tests for auto-detection and `_save` happy path. Recommend approving once addressed."
-- "LGTM, one minor non-blocking note below. Recommend approving."
+If no issues survive filtering (all < 80 confidence), **do not post a review**. Report to the invoker that no actionable findings were found, but do not leave a comment on the PR — clean PRs don't need noise.
 
 **Never approve a PR automatically.** Always use `event="COMMENT"`, never `event="APPROVE"`. Only the human reviewer should submit an approval.
 

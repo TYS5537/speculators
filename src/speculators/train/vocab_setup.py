@@ -31,11 +31,13 @@ def _load_mappings(
     d2t = torch.from_numpy(np.load(d2t_path))
     t2d = torch.from_numpy(np.load(t2d_path))
     draft_vocab_size = d2t.shape[0]
-    if expected_draft_vocab_size and expected_draft_vocab_size != draft_vocab_size:
+    if (
+        expected_draft_vocab_size is not None
+        and expected_draft_vocab_size != draft_vocab_size
+    ):
         raise ValueError(
-            f"Explicit vocab mapping (t2d & d2t) files were provided, but don't"
-            f"match the provided --draft-vocab-size {draft_vocab_size}."
-            f"d2t.shape={d2t.shape}, dim 0 should match provided value."
+            f"Vocab mapping d2t has size {draft_vocab_size}, but "
+            f"--draft-vocab-size requires {expected_draft_vocab_size}."
         )
     return d2t, t2d, draft_vocab_size
 
@@ -72,8 +74,10 @@ def _parse_vocab_mappings_local(
         )
 
     data_path = Path(args.data_path)
-    default_t2d_path = data_path / "t2d.npy"
-    default_d2t_path = data_path / "d2t.npy"
+    legacy = getattr(args, "training_recipe", "legacy") == "legacy"
+    suffix = "" if legacy else f"-{args.draft_vocab_size}"
+    default_t2d_path = data_path / f"t2d{suffix}.npy"
+    default_d2t_path = data_path / f"d2t{suffix}.npy"
 
     if default_t2d_path.exists() and default_d2t_path.exists():
         return _load_mappings(
@@ -86,7 +90,15 @@ def _parse_vocab_mappings_local(
         logger.info("No vocab mappings provided. Regenerating from token frequencies")
         token_freq_dict = torch.load(token_freq_path, weights_only=True)
 
-        target_vocab_size = get_target_vocab_size(None, args.verifier_name_or_path)
+        target_vocab_size = get_target_vocab_size(
+            None,
+            args.verifier_name_or_path,
+            **(
+                {"trust_remote_code": True}
+                if getattr(args, "trust_remote_code", False)
+                else {}
+            ),
+        )
 
         d2t, t2d = build_vocab_mappings_from_distribution(
             token_freq_dict=token_freq_dict,
@@ -94,7 +106,10 @@ def _parse_vocab_mappings_local(
             target_vocab_size=target_vocab_size,
         )
         draft_vocab_size = d2t.shape[0]
-        if args.draft_vocab_size and args.draft_vocab_size != draft_vocab_size:
+        if (
+            args.draft_vocab_size is not None
+            and args.draft_vocab_size != draft_vocab_size
+        ):
             raise ValueError(
                 f"Explicit vocab mapping (t2d & d2t) files were provided, but don't"
                 f"match the provided --draft-vocab-size {draft_vocab_size}."
@@ -102,8 +117,8 @@ def _parse_vocab_mappings_local(
             )
 
         logger.info(f"Caching vocab mapping files to '{data_path}'")
-        _save_vocab_mapping_atomically(data_path / "d2t.npy", d2t.cpu().numpy())
-        _save_vocab_mapping_atomically(data_path / "t2d.npy", t2d.cpu().numpy())
+        _save_vocab_mapping_atomically(default_d2t_path, d2t.cpu().numpy())
+        _save_vocab_mapping_atomically(default_t2d_path, t2d.cpu().numpy())
 
         return d2t, t2d, draft_vocab_size
 
@@ -113,7 +128,14 @@ def _parse_vocab_mappings_local(
         "None. Using full verifier vocab"
     )
     # When vocab mapping is not provided, use the full verifier vocab
-    verifier_config = get_verifier_config(args.verifier_name_or_path)
+    verifier_config = get_verifier_config(
+        args.verifier_name_or_path,
+        **(
+            {"trust_remote_code": True}
+            if getattr(args, "trust_remote_code", False)
+            else {}
+        ),
+    )
     return None, None, verifier_config.vocab_size
 
 

@@ -21,9 +21,16 @@ from torch.nn import Module
 logger = logging.getLogger("speculators")
 
 # Names of parameters that are 2D but should still be optimized with AdamW rather than
-# Muon, following the convention from Keller Jordan's Muon (embeddings and the output
-# head and token codebooks are excluded from the orthogonalized update).
-_ADAMW_NAME_HINTS = ("embed_tokens", "lm_head", "codebook")
+# Muon, following the convention from Keller Jordan's Muon (embeddings, embedding-like
+# codebooks, Markov vocabulary factors, and output heads are excluded from the
+# orthogonalized update).
+_ADAMW_NAME_HINTS = (
+    "embed_tokens",
+    "lm_head",
+    "codebook",
+    "markov_w1",
+    "markov_w2",
+)
 
 # Muon only orthogonalizes 2D weight matrices.
 _MATRIX_NDIM = 2
@@ -31,18 +38,25 @@ _MATRIX_NDIM = 2
 
 def split_named_params_for_muon(
     model: Module,
+    *,
+    training_recipe: str = "upstream",
 ) -> tuple[list[tuple[str, Tensor]], list[tuple[str, Tensor]]]:
     """Split a model's trainable parameters into Muon and AdamW groups.
 
     A parameter goes to Muon iff it requires gradients, is a 2D matrix with both
-    dimensions > 1, and is not an embedding or LM-head weight; everything else goes to
-    AdamW. Token codebooks and degenerate 2D weights (``[1, N]`` / ``[N, 1]``
-    vectors) also route to AdamW -- Muon orthogonalizes dense transformation
-    matrices, not embedding tables or vectors.
+    dimensions > 1, and is not an embedding, codebook, or vocabulary-output weight;
+    everything else goes to AdamW. Degenerate 2D weights (``[1, N]`` / ``[N, 1]``
+    vectors) route to AdamW -- Muon orthogonalizes matrices, not vectors, and crashes
+    on them under FSDP2.
 
     :param model: The model whose parameters should be partitioned.
     :return: A ``(muon_params, adamw_params)`` tuple of named parameter lists.
     """
+    hints = (
+        _ADAMW_NAME_HINTS
+        if training_recipe == "upstream"
+        else ("embed_tokens", "lm_head", "codebook")
+    )
     muon_params: list[tuple[str, Tensor]] = []
     adamw_params: list[tuple[str, Tensor]] = []
     for name, param in model.named_parameters():
@@ -51,7 +65,7 @@ def split_named_params_for_muon(
         if (
             param.ndim == _MATRIX_NDIM
             and min(param.shape) > 1  # exclude degenerate [1, N] / [N, 1] vectors
-            and not any(hint in name for hint in _ADAMW_NAME_HINTS)
+            and not any(hint in name for hint in hints)
         ):
             muon_params.append((name, param))
         else:
@@ -77,7 +91,9 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         ]
 
     if config.optimizer == "muon":
-        muon_params, adamw_params = split_named_params_for_muon(model)
+        muon_params, adamw_params = split_named_params_for_muon(
+            model, training_recipe=getattr(config, "training_recipe", "legacy")
+        )
         logger.info(
             "Muon optimizer: %d 2D params via Muon, %d params via AdamW.",
             len(muon_params),

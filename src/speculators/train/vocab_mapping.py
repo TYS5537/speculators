@@ -1,5 +1,6 @@
 """Vocabulary mapping utilities for draft model training."""
 
+import logging
 from collections import Counter
 from pathlib import Path
 
@@ -7,6 +8,8 @@ import torch
 from datasets import Dataset as HFDataset
 from tqdm import tqdm  # type: ignore[import-untyped]
 from transformers import AutoConfig
+
+logger = logging.getLogger("speculators")
 
 __all__ = [
     "build_vocab_mappings_from_distribution",
@@ -29,6 +32,13 @@ def save_token_frequency_distribution(
     """
     path = Path(output_path)
     if path.exists():
+        logger.warning(
+            f"Reusing existing token frequency distribution at '{path}' without "
+            "recounting. The d2t/t2d vocab mappings derived from it will reflect "
+            "the dataset and tokenizer of the run that wrote that file; delete "
+            "it (or pass a different output path) when the dataset or target "
+            "model changed."
+        )
         return
 
     token_freq: Counter[int] = Counter()
@@ -96,7 +106,11 @@ def build_vocab_mappings_from_distribution(
     return draft_to_target, target_to_draft
 
 
-def get_target_vocab_size(target_vocab_size, target_model_path):
+def get_target_vocab_size(
+    target_vocab_size,
+    target_model_path,
+    trust_remote_code: bool = False,
+):
     has_vocab = target_vocab_size is not None
     has_model = target_model_path is not None
 
@@ -109,7 +123,10 @@ def get_target_vocab_size(target_vocab_size, target_model_path):
     if has_vocab:
         return target_vocab_size
 
-    config = AutoConfig.from_pretrained(target_model_path)
+    config = AutoConfig.from_pretrained(
+        target_model_path,
+        trust_remote_code=trust_remote_code,
+    )
 
     # For multimodal models (Qwen3VL, etc.), extract text_config
     if hasattr(config, "text_config"):

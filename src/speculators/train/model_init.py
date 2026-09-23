@@ -141,11 +141,25 @@ def build_draft_model(
         # transformer_layer_config and extracts the native MTP head weights from
         # the verifier; the decoder-shaping flags and --draft-config do not apply,
         # and there is no draft mask token to resolve.
-        transformer_layer_config = get_verifier_config(args.verifier_name_or_path)
+        transformer_layer_config = get_verifier_config(
+            args.verifier_name_or_path,
+            **(
+                {"trust_remote_code": True}
+                if getattr(args, "trust_remote_code", False)
+                else {}
+            ),
+        )
     else:
         if args.draft_config:
             transformer_layer_config = load_draft_transformer_layer_config(
-                args.draft_config, args.verifier_name_or_path, logger=logger
+                args.draft_config,
+                args.verifier_name_or_path,
+                logger=logger,
+                **(
+                    {"trust_remote_code": True}
+                    if getattr(args, "trust_remote_code", False)
+                    else {}
+                ),
             )
         else:
             full_attention_indices = args.full_attention_indices
@@ -166,6 +180,11 @@ def build_draft_model(
                 sliding_window=args.sliding_window,
                 full_attention_indices=full_attention_indices,
                 mrope_full_head_hack=args.draft_mrope_full_head_hack,
+                **(
+                    {"trust_remote_code": True}
+                    if getattr(args, "trust_remote_code", False)
+                    else {}
+                ),
                 logger=logger,
             )
 
@@ -173,7 +192,11 @@ def build_draft_model(
             args.verifier_name_or_path,
             transformer_layer_config.vocab_size,
             args.mask_token_id,
-            trust_remote_code=args.trust_remote_code,
+            **(
+                {"trust_remote_code": True}
+                if getattr(args, "trust_remote_code", False)
+                else {}
+            ),
         )
 
     args.draft_vocab_size = draft_vocab_size

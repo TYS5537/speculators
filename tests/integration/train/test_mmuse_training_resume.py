@@ -27,7 +27,7 @@ import numpy as np
 import pytest
 import torch
 from safetensors.torch import load_file
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from transformers.models.qwen3.modeling_qwen3 import Qwen3Config
 
 from speculators import SpeculatorModelConfig
@@ -160,13 +160,14 @@ def _loader():
     return DataLoader(rows, batch_size=1, shuffle=False, num_workers=0)
 
 
-def _trainer(path, config, *, epochs, resume=False):
+def _trainer(path, config, *, epochs, resume=False, max_steps=None):
     train_kwargs, _ = MMuseDraftModel.get_trainer_kwargs(max_anchors=2, block_size=3)
     return _CPUTrainer(
         _make_model(config),
         TrainerConfig(
             lr=0.005,
             num_epochs=epochs,
+            max_steps=max_steps,
             save_path=str(path),
             resume_from_checkpoint=resume,
             optimizer="adamw",
@@ -362,3 +363,59 @@ def test_mmuse_train_save_resume_matches_uninterrupted(
     )
     assert final_config["speculators_model_type"] == "mmuse"
     assert final_config["speculators_config"]["algorithm"] == "mmuse"
+
+
+class _NoisyDataset(Dataset):
+    def __init__(self, rows):
+        self.rows = rows
+        self.reads = 0
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, index):
+        self.reads += 1
+        row = {key: value.clone() for key, value in self.rows[index].items()}
+        row["hidden_states"] += torch.rand_like(row["hidden_states"]) * 0.01
+        return row
+
+
+def test_max_steps_checkpoint_resumes_without_extra_data_rng(
+    tmp_path, cpu_training, monkeypatch
+):
+    original_loader = _loader
+
+    def noisy_loader():
+        return DataLoader(_NoisyDataset(original_loader().dataset), batch_size=1)
+
+    monkeypatch.setitem(globals(), "_loader", noisy_loader)
+    _seed(71)
+    reference = _trainer(tmp_path / "full", _config("hidden"), epochs=2)
+    reference.run_training()
+    expected_rng = capture_rng_states("cpu")
+
+    _seed(71)
+    stopped = _trainer(tmp_path / "limited", _config("hidden"), epochs=2, max_steps=1)
+    stopped.run_training()
+    assert stopped.global_step == 1
+    assert stopped.train_loader.dataset.reads == 1
+    checkpoint = tmp_path / "limited" / "interrupted"
+    state = json.loads((checkpoint / "training_state.json").read_text())
+    assert state["epoch"] == 0
+    assert state["local_step"] == 1
+    assert not state["epoch_complete"]
+    assert (checkpoint / "checkpoint_complete.json").exists()
+
+    _seed(1234)
+    restored = SpeculatorModelConfig.from_pretrained(checkpoint, local_files_only=True)
+    resumed = _trainer(tmp_path / "limited", restored, epochs=2, resume=True)
+    resumed.run_training()
+    assert resumed.global_step == reference.global_step == 4
+    _assert_equal(resumed.model.state_dict(), reference.model.state_dict())
+    _assert_equal(
+        resumed.optimizers[0].state_dict(), reference.optimizers[0].state_dict()
+    )
+    _assert_equal(
+        resumed.schedulers[0].state_dict(), reference.schedulers[0].state_dict()
+    )
+    assert capture_rng_states("cpu") == expected_rng

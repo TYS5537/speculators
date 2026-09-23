@@ -11,7 +11,8 @@ import pytest
 
 from scripts import train
 from speculators.models.mmuse.config import MMUSE_OPTION_FIELDS, mmuse_option_defaults
-from speculators.train import cli, mmuse_args
+from speculators.train import legacy_cli as cli
+from speculators.train import mmuse_args
 from speculators.utils.argparse_utils import explicitly_provided_dests
 
 

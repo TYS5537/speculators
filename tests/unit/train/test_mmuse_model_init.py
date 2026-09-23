@@ -126,14 +126,18 @@ def test_fresh_sources_route_decoder_then_mask_then_training_factory(
             sliding_window=64,
             full_attention_indices=[],
             mrope_full_head_hack=False,
+            trust_remote_code=True,
             logger=effective_logger,
         )
     elif source == "decoder_config":
         load.assert_called_once_with(
-            "decoder-source", "cli-verifier", logger=effective_logger
+            "decoder-source",
+            "cli-verifier",
+            logger=effective_logger,
+            trust_remote_code=True,
         )
     else:
-        verifier.assert_called_once_with("cli-verifier")
+        verifier.assert_called_once_with("cli-verifier", trust_remote_code=True)
     assert args.mask_token_id == (99 if source == "mtp" else 5)
     assert args.draft_vocab_size == 16
     factory.assert_called_once_with(

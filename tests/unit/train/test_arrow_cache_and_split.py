@@ -59,6 +59,7 @@ def data_api():
     namespace = {
         "torch": torch,
         "Dataset": torch.utils.data.Dataset,
+        "SampleUnavailable": type("SampleUnavailable", (), {}),
         "Path": Path,
         "DEFAULT_REQUEST_TIMEOUT": 120,
         "DEFAULT_MAX_RETRIES": 0,

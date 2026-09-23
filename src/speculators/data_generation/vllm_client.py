@@ -117,10 +117,20 @@ def extract_output(
     if kv_transfer_params is None:
         raise InvalidResponseError("Response missing kv_transfer_params")
 
-    return kv_transfer_params.get("hidden_states_path")
+    handle = kv_transfer_params.get("hidden_states_path") or kv_transfer_params.get(
+        "handle"
+    )
+    if handle is None:
+        raise InvalidResponseError(
+            "Response kv_transfer_params missing both 'hidden_states_path' and 'handle'"
+        )
+    return handle
 
 
 class ClientItem(TypedDict):
+    continue_final_message: NotRequired[bool]
+    """Explicit rendering policy for legacy/pre-rendered multimodal rows."""
+
     input_ids: list[int]
     """The input token IDs."""
 
@@ -139,7 +149,7 @@ async def _poll_lock_async(fd, poll_interval):
 
 
 async def wait_for_lock_async(lock_path, timeout=10.0, poll_interval=0.1):
-    fd = os.open(lock_path, os.O_RDONLY)
+    fd = os.open(lock_path, os.O_RDWR)
     try:
         await asyncio.wait_for(_poll_lock_async(fd, poll_interval), timeout=timeout)
     except BaseException:
@@ -150,7 +160,7 @@ async def wait_for_lock_async(lock_path, timeout=10.0, poll_interval=0.1):
 
 
 def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
-    fd = os.open(lock_path, os.O_RDONLY)
+    fd = os.open(lock_path, os.O_RDWR)
     try:
         deadline = time.monotonic() + timeout
         while True:
@@ -168,6 +178,20 @@ def wait_for_lock(lock_path, timeout=10.0, poll_interval=0.1):
         raise
     os.close(fd)
     os.remove(lock_path)
+
+
+# Models whose chat template appends a trailing EOS on a *closed* final turn that
+# ``input_ids`` omits; open the turn for them to keep prompt_token_ids == input_ids.
+_OPEN_FINAL_TURN_MODEL_MARKERS = ("mistral",)
+
+
+def _continue_final_message_for(model: str) -> bool:
+    """Whether to leave the final assistant turn open when re-rendering the MM
+    chat prompt. Default False (closed, reproducing ``input_ids``); True for
+    Mistral, whose template adds a spurious EOS on close."""
+    # Basename match so the ``mistralai/`` org prefix doesn't sweep in siblings.
+    name = model.rsplit("/", 1)[-1].lower()
+    return any(marker in name for marker in _OPEN_FINAL_TURN_MODEL_MARKERS)
 
 
 @with_retries
@@ -207,8 +231,10 @@ async def generate_hidden_states_async(
             max_tokens=1,
             extra_body={
                 "add_generation_prompt": False,
-                # Match preprocessing: retain the final message's end tokens.
-                "continue_final_message": False,
+                # Re-render to match the stored ``input_ids`` (model-dependent).
+                "continue_final_message": client_item.get(
+                    "continue_final_message", _continue_final_message_for(model)
+                ),
                 "return_token_ids": True,
             },
             timeout=timeout,
@@ -254,8 +280,10 @@ def generate_hidden_states(
             max_tokens=1,
             extra_body={
                 "add_generation_prompt": False,
-                # Match preprocessing: retain the final message's end tokens.
-                "continue_final_message": False,
+                # Re-render to match the stored ``input_ids`` (model-dependent).
+                "continue_final_message": client_item.get(
+                    "continue_final_message", _continue_final_message_for(model)
+                ),
                 "return_token_ids": True,
             },
             timeout=timeout,

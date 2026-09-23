@@ -81,9 +81,21 @@ def cpu_platform(monkeypatch, tmp_path):
         # aliases only; auto-resume still reads the real numbered checkpoint.
         def skip_alias(path, target, target_is_directory=False):
             assert path.is_relative_to(tmp_path)
-            assert path.name.startswith("epoch") or path.name == "checkpoint_best"
+            assert path.name.startswith("epoch")
+            raise OSError("Descriptive checkpoint symlinks unavailable on test host")
 
         monkeypatch.setattr(Path, "symlink_to", skip_alias)
+
+        # The real best-pointer transaction has separate filesystem tests;
+        # this CPU run verifies training/metrics/checkpoint restoration only.
+        def skip_best_pointer(self, epoch):
+            assert (self.path / str(epoch) / "checkpoint_complete.json").is_file()
+
+        monkeypatch.setattr(
+            checkpointer_module.SingleGPUCheckpointer,
+            "update_best_symlink",
+            skip_best_pointer,
+        )
     # Production graceful-shutdown decorators install handlers; restore the
     # process's original handlers after this unit-test fixture finishes.
     handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGINT, signal.SIGTERM)}

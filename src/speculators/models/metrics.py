@@ -636,3 +636,45 @@ def loss_function(
 
     batch_loss = torch.sum(elementwise_loss, dim=1) / denominator  # shape: [1]
     return batch_loss.mean()  # shape: []
+
+
+def compute_accepted_length_counts(
+    correct: torch.Tensor,  # shape: [num_blocks, num_draft_slots]
+    valid: torch.Tensor,  # shape: [num_blocks, num_draft_slots]
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Count accepted length per speculative block as raw sum/total counts.
+
+    A block is accepted up to its first wrong draft slot, so its length is the
+    leading run of correct slots plus the verifier's always-emitted bonus token
+    (vLLM's convention). Forming the run inside the block preserves the
+    correlation between slots; a product of per-slot marginals discards it and
+    understates the result.
+
+    Args:
+        correct: Whether each draft slot matched the target.
+        valid: Whether each draft slot is trained on (block-shaped loss mask).
+
+    Returns:
+        Tuple of (accepted_length_sum, valid_block_total) as raw counts suitable
+        for distributed reduction before computing the ratio.
+    """
+    accepted = torch.logical_and(correct, valid).to(torch.float32)
+    per_block_len = accepted.cumprod(dim=-1).sum(dim=-1) + 1.0
+    block_valid = valid.any(dim=-1).to(torch.float32)
+    return (per_block_len * block_valid).sum(), block_valid.sum()
+
+
+def resolve_training_loss(loss_fn: str, **kwargs) -> LossConfig:
+    """Keep legacy numerical implementations unless the upstream recipe is selected."""
+    implementation = kwargs.get("loss_implementation")
+    if implementation is None:
+        implementation = (
+            "fused" if kwargs.get("training_recipe") == "upstream" else "legacy"
+        )
+    if implementation == "legacy":
+        return resolve_loss_config(loss_fn)
+    from speculators.losses import (  # noqa: PLC0415
+        resolve_loss_config as resolve_upstream,
+    )
+
+    return resolve_upstream(loss_fn, implementation)

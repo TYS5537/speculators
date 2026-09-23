@@ -95,6 +95,10 @@ def _checkpoint_overlay(monkeypatch, tmp_path, config, options=None, **kwargs):
 def _factory(monkeypatch, **options):
     config = _config()
     monkeypatch.setattr(
+        "speculators.models.utils.get_verifier_config",
+        lambda *_args, **_kwargs: config.transformer_layer_config,
+    )
+    monkeypatch.setattr(
         VerifierConfig,
         "from_pretrained",
         lambda *_args, **_kwargs: config.speculators_config.verifier,

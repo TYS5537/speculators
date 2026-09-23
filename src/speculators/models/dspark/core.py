@@ -10,7 +10,11 @@ from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.metrics import compute_metrics, select_logged_metrics
 from speculators.models.dspark.model_definitions import ConfidenceHead, MarkovHead
-from speculators.models.metrics import LossConfig, resolve_loss_config
+from speculators.models.metrics import (
+    LossConfig,
+    resolve_loss_config,
+    resolve_training_loss,
+)
 from speculators.models.utils import conditional_torch_compile
 
 _DSPARK_PAPER_LOSS_FN = '{"ce": 0.1, "tv": 0.9}'
@@ -42,6 +46,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 markov_rank=config.markov_rank,
                 hidden_size=hidden_size,
                 head_type=config.markov_head_type,
+                init_std=config.markov_init_std,
             )
         self.confidence_head: ConfidenceHead | None = None
         if config.enable_confidence_head:
@@ -70,6 +75,9 @@ class DSparkDraftModel(DFlashDraftModel):
             **cls._build_base_config_kwargs("dspark", verifier_config, **kwargs),
             markov_rank=kwargs.get("markov_rank", 256),
             markov_head_type=kwargs.get("markov_head_type", "vanilla"),
+            markov_init_std=(
+                0.01 if kwargs.get("training_recipe") == "upstream" else None
+            ),
             enable_confidence_head=(
                 True
                 if enable_confidence_head_arg is None
@@ -91,7 +99,9 @@ class DSparkDraftModel(DFlashDraftModel):
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
         """Resolve DSpark's compound loss from ``--loss-fn``."""
-        loss_config = resolve_loss_config(kwargs.get("loss_fn", _DSPARK_PAPER_LOSS_FN))
+        loss_config = resolve_training_loss(
+            **{"loss_fn": _DSPARK_PAPER_LOSS_FN, **kwargs}
+        )
         gamma = kwargs.get("dflash_decay_gamma", float(kwargs.get("block_size", 7)))
         max_anchors = kwargs.get("max_anchors", 3072)
         confidence_head_alpha = kwargs.get("confidence_head_alpha", 1.0)
@@ -121,6 +131,10 @@ class DSparkDraftModel(DFlashDraftModel):
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
         }
+        if kwargs.get("training_recipe") == "upstream":
+            shared["tv_loss_fn"] = resolve_training_loss(**{**kwargs, "loss_fn": "tv"})[
+                "tv"
+            ][0]
         train_kw = dict(shared)
         if ssal_curriculum:
             train_kw["ssal_curriculum"] = True
@@ -168,6 +182,7 @@ class DSparkDraftModel(DFlashDraftModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
+        tv_loss_fn = kwargs.pop("tv_loss_fn", None)
         (
             hidden,
             logits,
@@ -238,6 +253,7 @@ class DSparkDraftModel(DFlashDraftModel):
             per_position_loss_weight=per_position_loss_weight,
             dpace_alpha=dpace_alpha,
             sample_from_anchor=self.config.sample_from_anchor,
+            tv_loss_fn=tv_loss_fn,
             target_log_normalizer=target_log_normalizer,
             target_argmax_ids=target_argmax_ids,
         )

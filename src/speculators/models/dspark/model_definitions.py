@@ -21,6 +21,7 @@ class MarkovHead(nn.Module):
         markov_rank: int,
         hidden_size: int,
         head_type: str = "vanilla",
+        init_std: float | None = 0.01,
     ) -> None:
         super().__init__()
         if markov_rank <= 0:
@@ -30,6 +31,9 @@ class MarkovHead(nn.Module):
         self.head_type = head_type
         self.markov_rank = markov_rank
         self.markov_w1 = nn.Embedding(verifier_vocab_size, markov_rank)
+        # None retains legacy nn.Embedding initialization and RNG consumption.
+        if init_std is not None:
+            nn.init.normal_(self.markov_w1.weight, std=init_std)
         self.markov_w2 = nn.Linear(markov_rank, draft_vocab_size, bias=False)
         if head_type == "gated":
             self.gate_proj = nn.Linear(hidden_size + markov_rank, markov_rank)

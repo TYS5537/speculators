@@ -75,7 +75,7 @@ def _write_pair(directory, *, prefix=""):
     return d2t_path, t2d_path, d2t, t2d
 
 
-@pytest.mark.parametrize("expected_size", [0, 3])
+@pytest.mark.parametrize("expected_size", [None, 3])
 def test_explicit_pair_wins_over_cache_and_preserves_dtype(
     tmp_path, monkeypatch, expected_size
 ):
@@ -99,7 +99,7 @@ def test_explicit_pair_wins_over_cache_and_preserves_dtype(
         logger=caller_logger,
     )
 
-    assert size == 3  # An expected size of zero retains the existing truthy guard.
+    assert size == 3  # Only None leaves the mapping size unconstrained.
     assert actual_d2t.dtype == torch.int32
     assert actual_t2d.dtype == torch.bool
     np.testing.assert_array_equal(actual_d2t.numpy(), d2t)

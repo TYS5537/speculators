@@ -134,6 +134,7 @@ class ArrowTextOnlyTests(unittest.TestCase):
             self.namespace,
             class_methods={
                 "__init__",
+                "_select_split",
                 "__len__",
                 "_map_to_file_idx",
                 "_compute_approx_lengths",

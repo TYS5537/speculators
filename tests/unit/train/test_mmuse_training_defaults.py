@@ -4,7 +4,7 @@ import argparse
 
 import pytest
 
-from speculators.train import cli
+from speculators.train import legacy_cli as cli
 
 _RECIPE_VALUES = {
     "block_size": 8,
