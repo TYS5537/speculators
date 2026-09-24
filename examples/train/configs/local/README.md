@@ -55,4 +55,4 @@ python -m speculators.train \
 
 Keep server model/layers and prepared-data paths consistent with training when overriding them. Hardware-specific Ascend and MMuse/DSV4 launchers are unchanged by this example/config separation.
 
-The local [Qwen3-4B Ascend comparison](../../qwen3_4b_bestarch/README.md) provides three named training scripts (DSpark, bestarch MMuse with legacy grouping, and the same MMuse with upstream Markov grouping), sharing one target server and one editable settings file. It does not replace the upstream-named examples.
+The local [Qwen3-4B Ascend comparison](../../qwen3_4b_bestarch/README.md) provides three standalone training scripts (DSpark with AdamW, bestarch MMuse with legacy grouping, and the same MMuse with upstream Markov grouping) and one reusable target-server script. Edit settings directly at the top of each script. It does not replace the upstream-named examples.

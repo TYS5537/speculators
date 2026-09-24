@@ -3,6 +3,7 @@
 # ruff: noqa: PT009 -- Also runnable with stdlib unittest.
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -24,49 +25,37 @@ TRAINERS = (
     "train_mmuse_legacy_optimizer.sh",
     "train_mmuse_upstream_optimizer.sh",
 )
-# Do not let the host user's training settings leak into the contract tests.
-SETTING_KEYS = [
-    "MODEL",
-    "DATA_PATH",
-    "OUTPUT_ROOT",
-    "OUTPUT_DIR",
-    "VLLM_PORT",
-    "VLLM_ENDPOINT",
-    "VLLM_NPUS",
-    "TRAIN_NPUS",
-    "DSPARK_LR",
-    "DSPARK_WEIGHT_DECAY",
-    "DSPARK_SCHEDULER_TYPE",
-    "DSPARK_WARMUP_RATIO",
-    "SERVER_READY_TIMEOUT",
-    "SERVER_PROVENANCE_DIR",
-    "SEQ_LENGTH",
-    "EPOCHS",
-    "LR",
-    "MUON_LR",
-    "WEIGHT_DECAY",
-    "MUON_WEIGHT_DECAY",
-    "SEED",
-    "LOGGER",
-    "DRAFT_VOCAB_SIZE",
-    "DRY_RUN",
-    "DUMP_CONFIG",
-    "BASH_ENV",
-    "ENV",
-]
+LAUNCH_MARKER = "# ============ Launch ============"
 
 
-def run_recipe(name, *, settings=None, prelude="", trailer=""):
-    """Run real entrypoints with a clean environment and optional fake commands."""
+def recipe_source(name, settings=None):
+    """Simulate editing scalar settings at the top, without modifying repo files."""
+    configuration, launch = (
+        (RECIPES / name).read_text(encoding="utf-8").split(LAUNCH_MARKER, 1)
+    )
+    for key, value in (settings or {}).items():
+        configuration, count = re.subn(
+            rf"^{re.escape(key)}=.*$",
+            lambda match, key=key, value=value: f"{key}={shlex.quote(value)}",
+            configuration,
+            flags=re.MULTILINE,
+        )
+        if count != 1:
+            raise AssertionError(f"Expected one editable {key} in {name}")
+    return configuration + LAUNCH_MARKER + launch
+
+
+def run_shell(shell):
+    """Bash execution is isolated in a temporary cwd, with no implicit startup file."""
     if not BASH:
         raise unittest.SkipTest("Bash is required for shell wiring tests")
     environment = {
-        key: value for key, value in os.environ.items() if key not in SETTING_KEYS
+        key: value
+        for key, value in os.environ.items()
+        if key not in {"BASH_ENV", "ENV", "SHELLOPTS", "BASHOPTS"}
     }
-    environment.update(settings or {})
-    shell = f"{prelude}\nsource {shlex.quote((RECIPES / name).as_posix())}\n{trailer}\n"
     with tempfile.TemporaryDirectory() as unrelated_cwd:
-        return subprocess.run(  # noqa: S603 -- Fixed entrypoints with fake/dry launches.
+        return subprocess.run(  # noqa: S603 -- Fixed recipes with inert launches.
             [BASH, "--noprofile", "--norc"],
             input=shell,
             cwd=unrelated_cwd,
@@ -79,11 +68,38 @@ def run_recipe(name, *, settings=None, prelude="", trailer=""):
         )
 
 
+def run_recipe(name, *, settings=None, prelude="", trailer=""):
+    """Exercise guards/logging with fake commands; never start training/serving."""
+    guards = """
+curl() { return 1; }
+env() { echo 'Unexpected server launch' >&2; return 97; }
+nohup() { echo 'Unexpected training launch' >&2; return 97; }
+"""
+    return run_shell(
+        f"{guards}\n{prelude}\n{recipe_source(name, settings)}\n{trailer}\n"
+    )
+
+
 def preview_command(name, **settings):
-    result = run_recipe(name, settings={**settings, "DRY_RUN": "1"})
+    # Evaluate the real configuration and direct command with a capture function.
+    # Do not run the launch section (filesystem/network/process side effects).
+    configuration, launch = recipe_source(name, settings).split(LAUNCH_MARKER, 1)
+    pattern = (
+        r'^nohup (env .*?) \\\n    > "\$LOG_FILE" 2>&1 &$'
+        if name in TRAINERS
+        else r"^(env ASCEND_RT_VISIBLE_DEVICES=.*?) &\nVLLM_PID="
+    )
+    match = re.search(pattern, launch, flags=re.MULTILINE | re.DOTALL)
+    if match is None:
+        raise AssertionError(f"Expected a direct launch command in {name}")
+    result = run_shell(
+        configuration
+        + "\ncapture() { printf '%s\\0' \"$@\"; }\n"
+        + f"capture {match.group(1)}\n"
+    )
     if result.returncode:
         raise AssertionError(result.stderr)
-    return shlex.split(result.stdout.strip())
+    return result.stdout.rstrip("\0").split("\0")
 
 
 def training_arguments(name, **settings):
@@ -93,6 +109,19 @@ def training_arguments(name, **settings):
 
 @unittest.skipUnless(BASH, "Bash is required for shell wiring tests")
 class Qwen4BBestarchScriptTests(unittest.TestCase):
+    def test_four_standalone_scripts_without_shared_configuration(self):
+        self.assertEqual(
+            {path.name for path in RECIPES.glob("*.sh")},
+            {*TRAINERS, "server.sh"},
+        )
+        for name in (*TRAINERS, "server.sh"):
+            source = recipe_source(name)
+            self.assertNotRegex(source, r"(?m)^\s*(?:source|\.)\s")
+            self.assertNotIn("run_qwen4b_training", source)
+            self.assertNotIn("DRY_RUN", source)
+            self.assertNotIn("DUMP_CONFIG", source)
+            self.assertIn('MODEL="../../Qwen3-4B"', source)
+
     def test_all_shell_files_parse(self):
         for path in RECIPES.glob("*.sh"):
             with self.subTest(path=path.name):
@@ -110,6 +139,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
             for key, value in {
                 "--training-recipe": "legacy",
                 "--loss-implementation": "legacy",
+                "--optimizer": "muon",
                 "--lr": "6e-5",
                 "--muon-lr": "6e-4",
                 "--total-seq-len": "3072",
@@ -174,14 +204,14 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         self.assertIn("--provenance-dir", server)
         self.assertNotIn("--spec-model", server)
 
-    def test_overrides_preserve_spaces_and_derive_worker_count(self):
+    def test_editable_settings_preserve_spaces_and_explicit_worker_count(self):
         command = preview_command(
             TRAINERS[1],
             TRAIN_NPUS="10,12",
+            NUM_TRAIN_NPUS="2",
             MODEL="/weights/Qwen 4B",
             DATA_PATH="/data/prepared samples",
             OUTPUT_DIR="/outputs/new run",
-            DRAFT_VOCAB_SIZE="32000",
             VLLM_ENDPOINT="http://target:9000/v1",
         )
         self.assertEqual(command[command.index("--nproc_per_node") + 1], "2")
@@ -189,45 +219,42 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         self.assertIn("/data/prepared samples", command)
         self.assertIn("/outputs/new run/checkpoints", command)
         self.assertIn("http://target:9000/v1", command)
-        self.assertEqual(command[command.index("--draft-vocab-size") + 1], "32000")
 
-    def test_invalid_device_list_fails_before_launch(self):
-        result = run_recipe(
-            TRAINERS[0], settings={"TRAIN_NPUS": "2,,3", "DRY_RUN": "1"}
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("TRAIN_NPUS", result.stderr)
+    def test_invalid_device_list_or_worker_count_fails_before_launch(self):
+        for name in TRAINERS:
+            for devices in ("2,,3", "2,3"):
+                result = run_recipe(name, settings={"TRAIN_NPUS": devices})
+                self.assertEqual(result.returncode, 2)
+                self.assertIn("TRAIN_NPUS", result.stderr)
 
     def test_dspark_changes_only_script_parameters_on_existing_training_entrypoint(
         self,
     ):
-        command = preview_command(
-            TRAINERS[0], LR="0.1", MUON_LR="0.2", WEIGHT_DECAY="0.3"
-        )
+        command = preview_command(TRAINERS[0])
         self.assertEqual(command[command.index("-m") + 1], "speculators.train")
         self.assertIn("ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7", command)
         self.assertEqual(command[command.index("--nproc_per_node") + 1], "6")
         for flag, value in {
             "--training-recipe": "legacy",
             "--loss-implementation": "legacy",
-            "--optimizer": "muon",
-            "--muon-parameter-policy": "legacy",
+            "--optimizer": "adamw",
             "--lr": "6e-4",
-            "--muon-lr": "6e-4",
             "--weight-decay": "0.0",
-            "--muon-weight-decay": "0.0",
             "--scheduler-type": "cosine",
             "--scheduler-warmup-ratio": "0.04",
             "--total-seq-len": "3072",
         }.items():
             self.assertEqual(command[command.index(flag) + 1], value)
         self.assertNotIn("--draft-vocab-size", command)
+        self.assertFalse(any(arg.startswith("--muon-") for arg in command))
         self.assertIn("../../datasets/open_perfectblend_qwen3_4b_700k", command)
         start = command.index("--full-attention-indices") + 1
         self.assertEqual(command[start : start + 5], ["0", "1", "2", "3", "4"])
         self.assertTrue(any("dspark_custom/checkpoints" in arg for arg in command))
         twelve = preview_command(
-            TRAINERS[0], TRAIN_NPUS=",".join(str(i) for i in range(12))
+            TRAINERS[0],
+            TRAIN_NPUS=",".join(str(i) for i in range(12)),
+            NUM_TRAIN_NPUS="12",
         )
         self.assertEqual(twelve[twelve.index("--nproc_per_node") + 1], "12")
 
@@ -235,40 +262,24 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         command = preview_command(
             TRAINERS[0],
             TRAIN_NPUS="10,11",
+            NUM_TRAIN_NPUS="2",
             SEQ_LENGTH="2048",
-            DSPARK_LR="0.0003",
-            DSPARK_WEIGHT_DECAY="0.02",
-            DSPARK_SCHEDULER_TYPE="linear",
-            DSPARK_WARMUP_RATIO="0.02",
+            LR="0.0003",
+            WEIGHT_DECAY="0.02",
+            SCHEDULER_TYPE="linear",
+            WARMUP_RATIO="0.02",
             DATA_PATH="/data/original",
-            DRAFT_VOCAB_SIZE="32000",
         )
         self.assertIn("ASCEND_RT_VISIBLE_DEVICES=10,11", command)
         for flag, value in {
             "--total-seq-len": "2048",
             "--lr": "0.0003",
-            "--muon-lr": "0.0003",
             "--weight-decay": "0.02",
-            "--muon-weight-decay": "0.02",
             "--scheduler-type": "linear",
             "--scheduler-warmup-ratio": "0.02",
             "--data-path": "/data/original",
-            "--draft-vocab-size": "32000",
         }.items():
             self.assertEqual(command[command.index(flag) + 1], value)
-
-    def test_dspark_overrides_do_not_change_mmuse_commands(self):
-        for name in TRAINERS[1:]:
-            self.assertEqual(
-                preview_command(name),
-                preview_command(
-                    name,
-                    DSPARK_LR="0.03",
-                    DSPARK_WEIGHT_DECAY="0.5",
-                    DSPARK_SCHEDULER_TYPE="none",
-                    DSPARK_WARMUP_RATIO="0.2",
-                ),
-            )
 
     def test_server_refuses_an_existing_endpoint(self):
         result = run_recipe(
@@ -281,9 +292,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         result = run_recipe(
             "server.sh",
             prelude=r"""
-curl() { return 1; }
-env() ( while [[ "$1" == *=* ]]; do export "$1"; shift; done; "$@"; )
-python() { return 27; }
+env() { return 27; }
 sleep() { command sleep 0.01; }
 """,
         )
@@ -300,14 +309,49 @@ sleep() { command sleep 0.01; }
                 "DATA_PATH": str(root / "absent"),
                 "OUTPUT_DIR": output.as_posix(),
             }
-            missing = run_recipe(TRAINERS[0], settings=settings)
-            self.assertEqual(missing.returncode, 2)
-            self.assertIn("Arrow data not found", missing.stderr)
+            for name in TRAINERS:
+                missing = run_recipe(name, settings=settings)
+                self.assertEqual(missing.returncode, 2)
+                self.assertIn("Arrow data not found", missing.stderr)
             (output / "checkpoints").mkdir(parents=True)
             settings["DATA_PATH"] = data.as_posix()
-            existing = run_recipe(TRAINERS[0], settings=settings)
-            self.assertEqual(existing.returncode, 2)
-            self.assertIn("already used", existing.stderr)
+            for name in TRAINERS:
+                existing = run_recipe(name, settings=settings)
+                self.assertEqual(existing.returncode, 2)
+                self.assertIn("already used", existing.stderr)
+
+    def test_training_launch_writes_log_pid_and_uses_edited_configuration(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "prepared data"
+            data.mkdir()
+            for name in TRAINERS:
+                output = root / name
+                settings = {
+                    "DATA_PATH": data.as_posix(),
+                    "OUTPUT_DIR": output.as_posix(),
+                }
+                unavailable = run_recipe(name, settings=settings)
+                self.assertEqual(unavailable.returncode, 2)
+                self.assertIn("Target unavailable", unavailable.stderr)
+                self.assertFalse(output.exists())
+                launched = run_recipe(
+                    name,
+                    settings=settings,
+                    prelude="""
+curl() { return 0; }
+nohup() { printf '%s\\0' "$@"; }
+""",
+                    trailer="wait",
+                )
+                self.assertEqual(launched.returncode, 0, launched.stderr)
+                self.assertTrue(
+                    (output / "logs/train.pid").read_text().strip().isdigit()
+                )
+                logs = list((output / "logs").glob("train_*.log"))
+                self.assertEqual(len(logs), 1)
+                captured = logs[0].read_text().rstrip("\0").split("\0")
+                self.assertEqual(captured, preview_command(name, **settings))
 
 
 if __name__ == "__main__":
