@@ -361,11 +361,15 @@ class TensorBoardHandler(logging.Handler):
         flat_dict = _flatten_dict(record.msg)
         step = getattr(record, "step", None)
         if getattr(record, "hparams", None):
+            from torch.utils.tensorboard.summary import hparams  # noqa: PLC0415
+
             # Convert non-scalar values to JSON strings for TensorBoard compatibility
             scalarised_dict = self._scalarise(flat_dict)
-            self._tboard_writer.add_hparams(
-                scalarised_dict, {}, run_name=".", global_step=step
-            )
+            # add_hparams opens another event file, so live readers can stop
+            # following the original metrics file. Keep all summaries in this writer.
+            for summary in hparams(scalarised_dict, {}):
+                self._tboard_writer.file_writer.add_summary(summary, global_step=step)
+            self._tboard_writer.flush()
             return
 
         for k, v in flat_dict.items():

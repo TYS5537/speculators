@@ -3,3 +3,5 @@
 torch==2.12.1
 transformers==5.16.1
 pytest~=9.1.1
+# Exercise TensorBoard's real event reader in the logging regressions.
+tensorboard==2.21.0

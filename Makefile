@@ -26,6 +26,7 @@ test-mmuse:
 		$(MMUSE_TRAIN_TESTS) \
 		tests/unit/train/test_cli_args.py \
 		tests/unit/train/test_draft_config_init.py \
+		tests/unit/train/test_logger.py \
 		tests/unit/train/test_rope_config.py \
 		tests/unit/train/test_vocab_mapping_startup.py \
 		tests/unit/train/test_upstream_alignment.py \

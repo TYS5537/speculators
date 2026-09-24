@@ -34,6 +34,12 @@ The merge validation run on 2026-09-23 passed 3,268 CPU test cases and 812 subte
 
 Always pass `--provenance-dir` when running `scripts/launch_vllm.py`.
 
+## TensorBoard logging compatibility
+
+The local logger keeps hyperparameter metadata and scalar metrics in one event writer. Upstream's `add_hparams(..., run_name=".")` creates a second event file in the same directory; TensorBoard's single-file polling can then stop following updates to the original metrics file. The fix preserves the same configuration summaries and rank-0 filtering without changing training calculations. CPU CI tests this with TensorBoard 2.21.0 and a reader that stays open across successive updates.
+
+For training processes already running the old code, leave training running and restart only TensorBoard with `--load_fast=false --reload_multifile=true` added to its existing command. The code fix takes effect on new training processes; it does not rewrite existing logs. Do not delete event files to resolve this issue. Hostnames such as `localhost.localdomain` in event filenames are normal and unrelated to the polling bug.
+
 ## Post-merge maintenance
 
 This maintenance sequence uses the merged upstream version as its baseline, not the pre-merge implementation. Model loading now separates config/conversion resolution, concrete-model dispatch and ordered post-load hooks. It retains upstream external checkpoint conversion and verifier-owned weight reconstruction alongside legacy MMuse identity migration. No training recipe, model parameter or checkpoint key is changed by this refactor.

@@ -46,6 +46,14 @@ class MMuseCIContractTests(unittest.TestCase):
                 self.assertIn(command, text)
                 self.assertNotIn("transformers==", text)
 
+    def test_cpu_ci_runs_tensorboard_logging_regressions(self):
+        requirements = (ROOT / REQUIREMENTS).read_text(encoding="utf-8")
+        self.assertIn("tensorboard==2.21.0", requirements.splitlines())
+        self.assertIn(
+            "tests/unit/train/test_logger.py",
+            (ROOT / "Makefile").read_text(encoding="utf-8"),
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
