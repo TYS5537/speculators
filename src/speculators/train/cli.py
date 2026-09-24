@@ -348,6 +348,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         gradient_checkpointing=args.gradient_checkpointing,
         activation_checkpointing=args.activation_checkpointing,
         training_recipe=args.training_recipe,
+        muon_parameter_policy=args.muon_parameter_policy,
         max_steps=args.max_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)

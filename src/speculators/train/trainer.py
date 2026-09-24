@@ -165,6 +165,7 @@ class TrainerConfig(NamedTuple):
     gradient_checkpointing: bool = False
     max_steps: int | None = None
     training_recipe: Literal["legacy", "upstream"] = "legacy"
+    muon_parameter_policy: Literal["legacy", "upstream"] | None = None
 
 
 def _resolve_scheduler_steps(

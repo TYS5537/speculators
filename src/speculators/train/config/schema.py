@@ -362,6 +362,12 @@ class OptimizerArgs(_Group):
         description="LR for the Muon (2D weights) group. Only used with --optimizer "
         "muon. Defaults to --lr (and --lr defaults to 1e-3).",
     )
+    muon_parameter_policy: Literal["legacy", "upstream"] | None = Field(
+        default=None,
+        description="Muon/AdamW parameter grouping only; defaults to the training "
+        "recipe. 'legacy' keeps Markov factors in Muon; 'upstream' puts them in "
+        "AdamW. Does not change initialization, losses or learning-rate defaults.",
+    )
     muon_momentum: float = Field(
         default=0.95, description="Momentum for the Muon group."
     )

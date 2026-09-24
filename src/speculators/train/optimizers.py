@@ -91,13 +91,18 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         ]
 
     if config.optimizer == "muon":
+        policy = getattr(config, "muon_parameter_policy", None) or getattr(
+            config, "training_recipe", "legacy"
+        )
         muon_params, adamw_params = split_named_params_for_muon(
-            model, training_recipe=getattr(config, "training_recipe", "legacy")
+            model, training_recipe=policy
         )
         logger.info(
-            "Muon optimizer: %d 2D params via Muon, %d params via AdamW.",
+            "Muon optimizer: %d 2D params via Muon, %d params via AdamW. "
+            "Parameter policy=%s.",
             len(muon_params),
             len(adamw_params),
+            policy,
         )
 
         optimizers: list[torch.optim.Optimizer] = []
