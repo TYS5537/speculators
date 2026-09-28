@@ -26,6 +26,7 @@ from typing import Any
 from speculators_eval import data as _eval_data
 from speculators_eval import parallel as _eval_parallel
 from speculators_eval import reporting as _eval_reporting
+from speculators_eval.progress import WorkerProgress
 
 # Keep the script's existing helper API while the package owns implementation.
 _load_jsonl = _eval_data.load_jsonl
@@ -1266,6 +1267,8 @@ def _evaluate_dataset(
     base_elapsed_s = 0.0
     base_total_output_tokens = 0
 
+    progress = WorkerProgress(getattr(args, "worker_progress_path", None))
+    progress.update(0)
     _warmup_dataset(
         dataset=dataset,
         path=path,
@@ -1321,7 +1324,8 @@ def _evaluate_dataset(
                     "source_index": idx,
                 }
             )
-        if (
+        progress.update(processed)
+        if progress.path is None and (
             processed == 1
             or processed % args.log_every == 0
             or processed == len(indexed_records)
@@ -1825,6 +1829,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ascend-devices", default=None)
     parser.add_argument("--worker-shard-index", type=int, default=None)
     parser.add_argument("--worker-num-shards", type=int, default=1)
+    parser.add_argument("--worker-progress-path", type=Path, help=argparse.SUPPRESS)
     return parser.parse_args()
 
 

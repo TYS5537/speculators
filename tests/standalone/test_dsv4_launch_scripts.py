@@ -190,6 +190,7 @@ class LaunchScriptTests(unittest.TestCase):
             "common/ascend_training_env.sh",
             "../evaluate/dspark_dsv4_offline_eval.sh",
             "../evaluate/dspark_dsv4_single_eval.sh",
+            "../evaluate/dspark_offline_jsonl.sh",
             "dspark_dsv4_hs_http_server.sh",
         ):
             script = ROOT / "examples/train" / relative
@@ -232,6 +233,7 @@ class LaunchScriptTests(unittest.TestCase):
                             "DRAFT_MODEL": "/fixture/draft",
                             "DATASETS_ROOT": "/fixture/eval data",
                             "DATASETS": datasets,
+                            "MAX_SAMPLES": None,
                             "HS_PATH": "/fixture/hs",
                             "VLLM_ENDPOINT": "http://target.fixture:8001/v1",
                             "VLLM_NPUS": "0,1",
@@ -259,6 +261,7 @@ class LaunchScriptTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stderr)
                     self.assertTrue(result.stdout.endswith("\0"))
                     args = result.stdout.split("\0")[:-1]
+                    self.assertNotIn("--max-samples", args)
                     self.assertEqual(args.count("--datasets"), 1 if expected else 0)
                     if expected:
                         self.assertEqual(args[args.index("--datasets") + 1], expected)
@@ -304,7 +307,7 @@ class LaunchScriptTests(unittest.TestCase):
                 "http://target.fixture:9001/v1",
             ),
             "EVAL_NPU": ("--ascend-devices", ",".join(map(str, range(16))), "8,9"),
-            "MAX_SAMPLES": ("--max-samples", "500", "12"),
+            "MAX_SAMPLES": ("--max-samples", None, "12"),
             "MAX_NEW_TOKENS": ("--max-new-tokens", "2048", "128"),
             "DSV4_MAX_MODEL_LEN": ("--dsv4-max-model-len", "4096", "8192"),
             "VERIFICATION_MODE": ("--dsv4-verification-mode", "reference", "block"),
@@ -339,6 +342,9 @@ class LaunchScriptTests(unittest.TestCase):
                 self.assertTrue(result.stdout.endswith("\0"))
                 args = result.stdout.split("\0")[:-1]
                 for flag, default, override in settings.values():
+                    if not use_overrides and default is None:
+                        self.assertNotIn(flag, args)
+                        continue
                     self.assertEqual(args.count(flag), 1)
                     self.assertEqual(
                         args[args.index(flag) + 1],
@@ -346,6 +352,59 @@ class LaunchScriptTests(unittest.TestCase):
                     )
                 devices = settings["EVAL_NPU"][2 if use_overrides else 1]
                 self.assertIn(f"ASCEND_RT_VISIBLE_DEVICES={devices}", args)
+
+    def test_eval_scripts_export_both_source_packages(self):
+        for name in (
+            "dspark_dsv4_offline_eval.sh",
+            "dspark_dsv4_single_eval.sh",
+            "dspark_offline_jsonl.sh",
+        ):
+            for inherited in ("", "/fixture/user code:/fixture/other"):
+                with self.subTest(script=name, inherited=inherited):
+                    environment = _shell_environment(
+                        {
+                            "PYTHONPATH": None,
+                            "FIXTURE_PYTHONPATH": inherited,
+                            "VERIFIER_MODEL": "/fixture/target",
+                            "DRAFT_MODEL": "/fixture/draft",
+                            "DATASETS_ROOT": "/fixture/eval",
+                            "HS_PATH": "/fixture/hs",
+                            "VLLM_NPUS": "0,1",
+                            "EVAL_NPU": "2,3",
+                            "HS_HTTP_ENDPOINT": "",
+                            "KEEP_TARGET_HS": "0",
+                            "ALLOW_SHARED_DEVICE": "0",
+                            "SKIP_ARTIFACTS": "0",
+                            "DRY_RUN": "0",
+                        }
+                    )
+                    source = r"""
+export PYTHONPATH="$FIXTURE_PYTHONPATH"
+exec() {
+  printf '%s\0' "$REPO_ROOT"
+  env | while IFS='=' read -r name value; do
+    if [[ "$name" == PYTHONPATH ]]; then printf '%s\0' "$value"; fi
+  done
+}
+"""
+                    script = ROOT / "examples/evaluate" / name
+                    source += f"\nsource {shlex.quote(script.as_posix())}\n"
+                    result = subprocess.run(  # noqa: S603 -- No actual eval process.
+                        [BASH, "--noprofile", "--norc"],
+                        input=source,
+                        cwd=self.root,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    root, pythonpath, _ = result.stdout.split("\0")
+                    self.assertEqual(
+                        pythonpath,
+                        f"{root}/src:{root}/hs_connectors/src:{root}:{inherited}",
+                    )
 
     def test_http_eval_and_sidecar_wiring_without_shared_storage(self):
         for sidecar in (False, True):

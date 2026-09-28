@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from speculators_eval import parallel as eval_parallel
+from speculators_eval.progress import WorkerProgress
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -108,6 +109,10 @@ class EvalWorkerTests(unittest.TestCase):
         shard = self.module._shard_records(
             selected, shard_index=index, num_shards=count
         )
+        if "--worker-progress-path" in command:
+            WorkerProgress(Path(self.flag(command, "--worker-progress-path"))).update(
+                len(shard)
+            )
         stats = self.module.EvalStats(elapsed_s=1.0)
         for sample_index, _ in shard:
             stats.add_response(
@@ -189,6 +194,44 @@ class EvalWorkerTests(unittest.TestCase):
                 ):
                     self.module.run_ascend_data_parallel(self.args)
                 launch.assert_not_called()
+
+    def test_progress_is_isolated_cleaned_up_and_preserves_results(self):
+        rows = []
+        directories = []
+        for disabled in (False, False, True):
+            self.args.no_progress = disabled
+            with (
+                patch.object(
+                    eval_parallel.subprocess,
+                    "Popen",
+                    side_effect=self.fake_completed_worker,
+                ) as launch,
+                patch.dict(
+                    self.module.os.environ, {"OPENAI_API_KEY": "fixture-private-key"}
+                ),
+            ):
+                self.module.run_ascend_data_parallel(self.args)
+            for call in launch.call_args_list:
+                command = call.args[0]
+                self.assertIn("--no-progress", command)
+                if disabled:
+                    self.assertNotIn("--worker-progress-path", command)
+                else:
+                    path = Path(self.flag(command, "--worker-progress-path"))
+                    self.assertFalse(path.parent.exists())
+            if not disabled:
+                directories.append(path.parent)
+            row = json.loads((self.args.output_dir / "summary.json").read_text())[0]
+            for field in (
+                "elapsed_s",
+                "requests_per_second",
+                "output_tokens_per_second",
+            ):
+                row.pop(field)
+            rows.append(row)
+        self.assertNotEqual(directories[0], directories[1])
+        self.assertEqual(rows[0], rows[1])
+        self.assertEqual(rows[0], rows[2])
 
     def test_http_options_fail_early_and_metadata_excludes_secret(self):
         self.args.hs_http_endpoint = "http://hs.fixture:8002"

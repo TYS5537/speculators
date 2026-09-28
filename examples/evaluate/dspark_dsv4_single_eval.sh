@@ -7,10 +7,13 @@ set -euo pipefail
 # Dataset selection: edit the comma-separated JSONL names/stems here.
 # Environment overrides are supported; DATASETS="" evaluates all discovered files.
 DATASETS="${DATASETS-gsm8k,math500}"
+# Empty uses the Qwen evaluator's per-dataset caps; set a number to override.
+: "${MAX_SAMPLES:=}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
+# Both packages use a src layout when running directly from the checkout.
+export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTHONPATH:-}"
 
 : "${VERIFIER_MODEL:?Set VERIFIER_MODEL to the local DSV4-Flash checkpoint}"
 : "${DRAFT_MODEL:?Set DRAFT_MODEL to the trained DSV4 DSpark checkpoint}"
@@ -36,7 +39,6 @@ cmd=(
   --shutdown-timeout "${SHUTDOWN_TIMEOUT:-30}"
   --target-request-timeout "${TARGET_REQUEST_TIMEOUT:-120}"
   --output-dir "${OUTPUT_DIR:-dspark_dsv4_single_eval}"
-  --max-samples "${MAX_SAMPLES:-4}"
   --max-new-tokens "${MAX_NEW_TOKENS:-64}"
   --temperature "${TEMPERATURE:-0.0}"
   --seed "${SEED:-980406}"
@@ -60,6 +62,9 @@ if [[ -n "${TARGET_MEMORY_UTILIZATION:-}" ]]; then
 fi
 if [[ -n "${DATASETS:-}" ]]; then
   cmd+=(--datasets "$DATASETS")
+fi
+if [[ -n "$MAX_SAMPLES" ]]; then
+  cmd+=(--max-samples "$MAX_SAMPLES")
 fi
 case "${ALLOW_SHARED_DEVICE:-0}" in
   0) ;;

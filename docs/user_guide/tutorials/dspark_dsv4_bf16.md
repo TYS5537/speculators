@@ -977,6 +977,22 @@ worker. Results are merged using total proposal/acceptance counts, and artifacts
 are restored to sample order. Target TP is unchanged; target DP/PP remain 1.
 The launcher clears inherited distributed rank environment variables.
 
+Both DSV4 evaluation scripts leave `MAX_SAMPLES` empty by default, using the same
+per-dataset caps as Qwen evaluation: 500 for gsm8k, math500, livecodebench, alpaca
+and arena-hard-v2; 256 for mbpp; 164 for humaneval; 80 for mt-bench; and 30 for
+aime25. Files with fewer records use all available records. An explicit
+`MAX_SAMPLES` overrides these caps, including the small smoke-test value above.
+Use `unset MAX_SAMPLES` to restore the defaults after exporting an override.
+
+Multi-NPU evaluation reports one aggregate progress bar per dataset in a terminal.
+Under `nohup` or redirected output it logs completed/total samples, percentage,
+elapsed time and estimated remaining time every 10 seconds, plus initial/final
+snapshots. The managed single-host launcher writes these snapshots to `eval.log`.
+Counts advance after each complete sample, not each token; ETA is unavailable
+until the first sample finishes. Worker progress excludes warmup and does not
+change sample selection or acceptance statistics. The evaluator's `--no-progress`
+flag disables aggregate reporting and retains the previous worker log behavior.
+
 For example, on a host with **16 visible devices** and enough memory for this
 target topology, dedicate eight to the target and eight to draft evaluation:
 

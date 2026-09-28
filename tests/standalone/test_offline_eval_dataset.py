@@ -5,6 +5,7 @@
 import importlib.util
 import json
 import sys
+import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -378,6 +379,40 @@ class OfflineEvalDatasetTests(unittest.TestCase):
                     self.assertEqual(len(artifacts), 0 if skip_artifacts else 1)
                     self.assertEqual(row["total_output_tokens"], 4)
                     self.assertEqual(case.calls["log"], 1)
+
+    def test_worker_progress_counts_samples_not_tokens_or_warmup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker.count"
+            case = _DatasetRun(
+                self.evaluator,
+                count=5,
+                paired=True,
+                worker_shard_index=0,
+                worker_num_shards=2,
+                worker_progress_path=path,
+                no_progress=True,
+                skip_artifacts=True,
+            )
+            row, _ = case.run()
+            self.assertEqual(path.read_text(), "3")
+            self.assertEqual(row["num_requests"], 3)
+            self.assertEqual(case.calls["draft"], 4)  # Includes one warmup sample.
+            self.assertEqual(case.calls["log"], 1)  # Warmup only, no worker spam.
+
+    def test_worker_progress_does_not_count_a_failed_generation_pair(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "worker.count"
+            case = _DatasetRun(
+                self.evaluator,
+                count=3,
+                paired=True,
+                worker_progress_path=path,
+                no_progress=True,
+            )
+            case.fail_at = ("base", 3)  # Warmup, one completed pair, then failure.
+            with self.assertRaisesRegex(RuntimeError, "injected dataset failure"):
+                case.run()
+            self.assertEqual(path.read_text(), "1")
 
     def test_zero_time_or_base_output_keeps_safe_speedup_and_raw_token_counts(self):
         for draft_time, base_time in ((0.0, 0.0), (2.0, 0.0), (0.0, 4.0), (2.0, 4.0)):

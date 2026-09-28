@@ -4,15 +4,19 @@
 # VERIFICATION_MODE=block requires a dedicated --dsv4-block-verify target instead.
 # Only the dense draft and target IO weights are loaded on the evaluation device.
 # Full-prefix target recomputation and file/API transfers are NOT serving speed.
+# Multi-NPU progress is aggregated in one bar, or periodic snapshots under nohup.
 set -euo pipefail
 
 # Dataset selection: edit the comma-separated JSONL names/stems here.
 # Environment overrides are supported; DATASETS="" evaluates all discovered files.
 DATASETS="${DATASETS-gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,alpaca,arena-hard-v2}"
+# Empty uses the Qwen evaluator's per-dataset caps; set a number to override.
+: "${MAX_SAMPLES:=}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
-export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
+# Both packages use a src layout when running directly from the checkout.
+export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTHONPATH:-}"
 
 # Local copy of the target checkpoint; its directory may differ from the server's.
 # Preserve shard timestamps when copying: they are part of the checkpoint signature.
@@ -45,7 +49,6 @@ cmd=(
   --dsv4-max-model-len "${DSV4_MAX_MODEL_LEN:-4096}"
   --target-request-timeout "${TARGET_REQUEST_TIMEOUT:-120}"
   --output-dir "${OUTPUT_DIR:-dspark_dsv4_reference_eval}"
-  --max-samples "${MAX_SAMPLES:-500}"
   --max-new-tokens "${MAX_NEW_TOKENS:-2048}"
   --temperature "${TEMPERATURE:-0.0}"
   --seed "${SEED:-980406}"
@@ -63,6 +66,9 @@ if [[ "$EVAL_NPU" == *,* ]]; then
 fi
 if [[ -n "${DATASETS:-}" ]]; then
   cmd+=(--datasets "$DATASETS")
+fi
+if [[ -n "$MAX_SAMPLES" ]]; then
+  cmd+=(--max-samples "$MAX_SAMPLES")
 fi
 if [[ -n "${SERVED_MODEL_NAME:-}" ]]; then
   cmd+=(--served-model-name "$SERVED_MODEL_NAME")

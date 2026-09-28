@@ -160,7 +160,9 @@ def parse_args(argv=None):
     parser.add_argument(
         "--output-dir", type=Path, default=Path("dspark_dsv4_single_eval")
     )
-    parser.add_argument("--max-samples", type=int, default=4)
+    parser.add_argument(
+        "--max-samples", type=int, default=None, help="Override per-dataset sample caps"
+    )
     parser.add_argument("--max-new-tokens", type=int, default=64)
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=980406)
@@ -210,7 +212,11 @@ def _validate_options(args):
             raise ValueError(f"--{name.replace('_', '-')} must be finite and positive")
     if not math.isfinite(args.temperature) or args.temperature < 0:
         raise ValueError("--temperature must be finite and nonnegative")
-    if args.max_samples <= 0 or args.max_new_tokens <= 0 or args.max_model_len <= 1:
+    if (
+        (args.max_samples is not None and args.max_samples <= 0)
+        or args.max_new_tokens <= 0
+        or args.max_model_len <= 1
+    ):
         raise ValueError("Invalid sample count, generation length or context limit")
     if not args.datasets_root.exists():
         raise ValueError(f"Dataset path does not exist: {args.datasets_root}")
@@ -259,7 +265,12 @@ def _child_env(devices):
     environment["ASCEND_RT_VISIBLE_DEVICES"] = ",".join(map(str, devices))
     environment["PYTHONUNBUFFERED"] = "1"
     environment["PYTHONPATH"] = os.pathsep.join(
-        [str(REPO_ROOT / "src"), str(REPO_ROOT), environment.get("PYTHONPATH", "")]
+        [
+            str(REPO_ROOT / "src"),
+            str(REPO_ROOT / "hs_connectors" / "src"),
+            str(REPO_ROOT),
+            environment.get("PYTHONPATH", ""),
+        ]
     )
     # OpenAI/httpx inherits proxy settings. Keep this run's prompts and API token
     # on loopback, just as the readiness client does, without disabling proxies
@@ -365,8 +376,6 @@ def _eval_command(
         str(args.max_model_len),
         "--target-request-timeout",
         str(args.target_request_timeout),
-        "--max-samples",
-        str(args.max_samples),
         "--max-new-tokens",
         str(args.max_new_tokens),
         "--temperature",
@@ -383,12 +392,15 @@ def _eval_command(
         "bfloat16",
         "--draft-attn-impl",
         "sdpa",
-        "--no-progress",
     ]
     if len(eval_devices) > 1:
         command.extend(["--ascend-devices", ",".join(map(str, eval_devices))])
+    else:
+        command.append("--no-progress")
     if args.datasets:
         command.extend(["--datasets", args.datasets])
+    if args.max_samples is not None:
+        command.extend(["--max-samples", str(args.max_samples)])
     if args.keep_target_hs:
         command.append("--keep-target-hs")
     if args.skip_artifacts:

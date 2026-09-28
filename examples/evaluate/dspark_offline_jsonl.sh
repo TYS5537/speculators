@@ -32,7 +32,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 
-export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
+# Both packages use a src layout when running directly from the checkout.
+export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTHONPATH:-}"
 
 # Required inputs.
 : "${VERIFIER_MODEL:?set VERIFIER_MODEL to the target/verifier model path or HF id}"

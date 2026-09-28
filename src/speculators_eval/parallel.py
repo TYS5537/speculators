@@ -11,9 +11,18 @@ import subprocess
 import sys
 import time
 from contextlib import ExitStack
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from typing import TYPE_CHECKING, Any
 
-from speculators_eval.data import dataset_id, discover_datasets, split_csv
+from speculators_eval.data import (
+    dataset_id,
+    discover_datasets,
+    load_jsonl,
+    select_eval_records,
+    split_csv,
+)
+from speculators_eval.progress import ParallelProgress
 from speculators_eval.reporting import (
     aggregate_rows,
     dataset_output_path,
@@ -24,7 +33,6 @@ from speculators_eval.reporting import (
 
 if TYPE_CHECKING:
     import argparse
-    from pathlib import Path
 
 
 def target_worker_args(args: argparse.Namespace) -> list[str]:
@@ -61,6 +69,7 @@ def worker_command(
     shard_index: int,
     num_shards: int,
     output_dir: Path,
+    progress_path: Path | None = None,
 ) -> list[str]:
     cmd = [
         sys.executable,
@@ -97,6 +106,8 @@ def worker_command(
         str(num_shards),
         "--no-progress",
     ]
+    if progress_path is not None:
+        cmd.extend(["--worker-progress-path", str(progress_path)])
     if args.max_samples is not None:
         cmd.extend(["--max-samples", str(args.max_samples)])
     if args.d2t_path is not None:
@@ -132,9 +143,13 @@ def stop_eval_worker(process) -> None:
             process.wait(timeout=5)
 
 
-def wait_eval_workers(processes, dataset: str) -> None:
+def wait_eval_workers(
+    processes, dataset: str, *, progress: ParallelProgress | None = None
+) -> None:
     while True:
         statuses = [(index, process.poll()) for index, _, process in processes]
+        if progress is not None:
+            progress.update(statuses)
         failed = [(index, code) for index, code in statuses if code not in (None, 0)]
         if failed:
             raise RuntimeError(f"{dataset} worker failures: {failed}")
@@ -171,6 +186,24 @@ def run_ascend_data_parallel(
         shard_root = dataset_output_path(args.output_dir / "_shards", dataset)
         processes = []
         with ExitStack() as workers:
+            progress = None
+            if not getattr(args, "no_progress", False):
+                total = len(
+                    select_eval_records(
+                        load_jsonl(dataset_path),
+                        dataset_name=dataset_path.stem,
+                        max_samples=args.max_samples,
+                        seed=args.seed,
+                    )
+                )
+                # Unique to this dataset/run: no stale counts on repeated evals.
+                directory = workers.enter_context(
+                    TemporaryDirectory(prefix="speculators-eval-progress-")
+                )
+                progress = ParallelProgress(
+                    dataset, total, Path(directory), len(devices)
+                )
+                workers.callback(progress.close)
             for shard_index, visible_device in enumerate(devices):
                 shard_output_dir = shard_root / f"shard_{shard_index}"
                 cmd = worker_command(
@@ -180,6 +213,9 @@ def run_ascend_data_parallel(
                     shard_index=shard_index,
                     num_shards=len(devices),
                     output_dir=shard_output_dir,
+                    progress_path=(
+                        progress.paths[shard_index] if progress is not None else None
+                    ),
                 )
                 env = os.environ.copy()
                 env["ASCEND_RT_VISIBLE_DEVICES"] = visible_device
@@ -187,7 +223,7 @@ def run_ascend_data_parallel(
                 process = subprocess.Popen(cmd, env=env)  # noqa: S603
                 workers.callback(stop_eval_worker, process)
                 processes.append((shard_index, shard_output_dir, process))
-            wait_eval_workers(processes, dataset)
+            wait_eval_workers(processes, dataset, progress=progress)
         shard_rows = [
             read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
         ]

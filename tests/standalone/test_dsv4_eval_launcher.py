@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import nullcontext, redirect_stderr, redirect_stdout
+from importlib.machinery import PathFinder
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 from urllib.error import HTTPError, URLError
@@ -88,6 +89,12 @@ class LauncherFixture(unittest.TestCase):
 
 
 class PlanningTests(LauncherFixture):
+    def test_default_sample_caps_and_explicit_override_match_offline_evaluator(self):
+        plan = self.plan()
+        self.assertNotIn("--max-samples", plan.eval_command)
+        plan = self.plan("--max-samples", "12")
+        self.assertEqual(self.flag(plan.eval_command, "--max-samples"), "12")
+
     def test_split_devices_use_block_evaluator_and_loopback_by_default(self):
         plan = self.plan()
         self.assertFalse(plan.shared_device)
@@ -146,6 +153,7 @@ class PlanningTests(LauncherFixture):
                     mode,
                 )
                 self.assertEqual(plan.eval_devices, list(range(8, 16)))
+                self.assertNotIn("--no-progress", plan.eval_command)
                 self.assertIsNone(plan.eval_device)
                 self.assertFalse(plan.shared_device)
                 self.assertEqual(plan.public_metadata()["eval_num_workers"], 8)
@@ -233,6 +241,7 @@ class PlanningTests(LauncherFixture):
             ("--target-request-timeout", [0, math.inf]),
             ("--temperature", [-1, math.nan, math.inf]),
             ("--max-new-tokens", [0, -1]),
+            ("--max-samples", [0, -1]),
         ):
             for value in values:
                 with (
@@ -253,6 +262,34 @@ class PlanningTests(LauncherFixture):
         self.assertNotIn(
             "inherited-secret-do-not-persist", json.dumps(plan.public_metadata())
         )
+
+    def test_child_pythonpath_resolves_checkout_connector_package(self):
+        for inherited in ("", str(self.root / "previous checkout with spaces")):
+            with (
+                self.subTest(inherited=inherited),
+                patch.dict(launcher.os.environ, {"PYTHONPATH": inherited}),
+            ):
+                plan = self.plan("--eval-device", "4,5")
+                for environment in (plan.target_env, plan.eval_env):
+                    paths = environment["PYTHONPATH"].split(launcher.os.pathsep)
+                    self.assertEqual(
+                        paths,
+                        [
+                            str(launcher.REPO_ROOT / "src"),
+                            str(launcher.REPO_ROOT / "hs_connectors/src"),
+                            str(launcher.REPO_ROOT),
+                            inherited,
+                        ],
+                    )
+                    # Resolve using only checkout paths, not an installed package.
+                    spec = PathFinder.find_spec("hs_connectors", paths[:3])
+                    self.assertIsNotNone(spec)
+                    self.assertEqual(
+                        Path(spec.origin),
+                        launcher.REPO_ROOT
+                        / "hs_connectors/src/hs_connectors/__init__.py",
+                    )
+                self.assertEqual(launcher.os.environ["PYTHONPATH"], inherited)
 
     def test_authentication_stays_in_child_environment_not_metadata_or_argv(self):
         first = self.plan(run_id="one")
