@@ -22,6 +22,7 @@ from speculators_eval.data import (
     select_eval_records,
     split_csv,
 )
+from speculators_eval.profiling import collect_worker_timings
 from speculators_eval.progress import ParallelProgress
 from speculators_eval.reporting import (
     aggregate_rows,
@@ -49,9 +50,15 @@ def target_worker_args(args: argparse.Namespace) -> list[str]:
         str(args.dsv4_max_model_len),
         "--dsv4-verification-mode",
         getattr(args, "dsv4_verification_mode", "reference"),
+        "--dsv4-block-output",
+        getattr(args, "dsv4_block_output", "auto"),
         "--target-request-timeout",
         str(args.target_request_timeout),
     ]
+    if getattr(args, "dsv4_profile", False):
+        result.append("--dsv4-profile")
+    if getattr(args, "dsv4_kv_reuse", False):
+        result.append("--dsv4-kv-reuse")
     if args.served_model_name:
         result.extend(["--served-model-name", args.served_model_name])
     if args.keep_target_hs:
@@ -116,6 +123,8 @@ def worker_command(
         cmd.extend(["--t2d-path", str(args.t2d_path)])
     if args.skip_artifacts:
         cmd.append("--skip-artifacts")
+    if getattr(args, "draft_kv_reuse", False):
+        cmd.append("--draft-kv-reuse")
     if args.trust_remote_code:
         cmd.append("--trust-remote-code")
     if args.sample_from_anchor is not None:
@@ -180,6 +189,7 @@ def run_ascend_data_parallel(
     )
     rows: list[dict[str, Any]] = []
     artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    profiles = {}
     for dataset_path in dataset_paths:
         dataset_start = time.perf_counter()
         dataset = dataset_id(dataset_path, args.datasets_root)
@@ -237,6 +247,13 @@ def run_ascend_data_parallel(
                 row["total_output_tokens"] / row["elapsed_s"] if row["elapsed_s"] else 0
             )
         rows.append(row)
+        collect_worker_timings(
+            args.output_dir,
+            processes,
+            dataset,
+            profiles,
+            enabled=getattr(args, "dsv4_profile", False),
+        )
         if not args.skip_artifacts:
             artifacts = []
             for _, shard_output_dir, _ in processes:

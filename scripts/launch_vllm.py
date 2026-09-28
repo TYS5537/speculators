@@ -238,8 +238,19 @@ def parse_args():
         action="store_true",
         help=(
             "Dedicated DSV4 offline block-verification service; requires --dsv4. "
-            "Only one sequence and max_tokens=1 requests are supported."
+            "Each request uses max_tokens=1."
         ),
+    )
+    train_parser.add_argument(
+        "--dsv4-kv-reuse",
+        action="store_true",
+        help="Opt-in bounded host KV snapshots; requires --dsv4-block-verify",
+    )
+    train_parser.add_argument(
+        "--dsv4-kv-cache-mb",
+        type=int,
+        default=1024,
+        help="KV snapshot host-memory budget in MiB per target TP/DP rank",
     )
     train_parser.add_argument(
         "--dsv4-manifest-timeout",
@@ -545,8 +556,10 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
                 "--max-num-seqs", "--max_num_seqs", type=int, action="append"
             )
             sequence_args, _ = sequence_parser.parse_known_args(vllm_args)
-            if any(value != 1 for value in sequence_args.max_num_seqs or []):
-                raise ValueError("DSV4 block verification requires --max-num-seqs 1.")
+            if any(value < 1 for value in sequence_args.max_num_seqs or []):
+                raise ValueError(
+                    "DSV4 block verification requires positive max-num-seqs."
+                )
             if sequence_args.max_num_seqs is None:
                 vllm_args.extend(["--max-num-seqs", "1"])
         for arg in vllm_args:
@@ -632,16 +645,25 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
         from speculators_dsv4.block_protocol import (  # noqa: PLC0415
             BLOCK_CONNECTOR,
             BLOCK_CONNECTOR_MODULE,
+            KV_CONNECTOR,
+            KV_CONNECTOR_MODULE,
         )
 
+        reuse = getattr(args, "dsv4_kv_reuse", False)
         kv_transfer_config = {
-            "kv_connector": BLOCK_CONNECTOR,
-            "kv_connector_module_path": BLOCK_CONNECTOR_MODULE,
+            "kv_connector": KV_CONNECTOR if reuse else BLOCK_CONNECTOR,
+            "kv_connector_module_path": KV_CONNECTOR_MODULE
+            if reuse
+            else BLOCK_CONNECTOR_MODULE,
             "kv_role": "kv_producer",
             "kv_connector_extra_config": {
                 "shared_storage_path": args.hidden_states_path,
             },
         }
+        if reuse:
+            kv_transfer_config["kv_connector_extra_config"]["kv_cache_mb"] = (
+                args.dsv4_kv_cache_mb
+            )
 
     cmd = [
         sys.executable,
@@ -769,6 +791,10 @@ def _build_eval_cmd(args, vllm_args):
 
 
 def _validate_dsv4_flags(args):
+    if getattr(args, "dsv4_kv_reuse", False) and not args.dsv4_block_verify:
+        raise ValueError("--dsv4-kv-reuse requires --dsv4-block-verify.")
+    if getattr(args, "dsv4_kv_cache_mb", 1024) <= 0:
+        raise ValueError("--dsv4-kv-cache-mb must be positive.")
     if args.dsv4_block_verify and not args.dsv4:
         raise ValueError("--dsv4-block-verify requires --dsv4.")
     if args.dsv4_execution_mode is not None and not args.dsv4:

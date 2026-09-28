@@ -157,7 +157,9 @@ class LaunchScriptTests(unittest.TestCase):
             "TARGET_QUANTIZATION": "",
             "DSV4_EVAL": "0",
             "DSV4_BLOCK_VERIFY": "0",
+            "DSV4_KV_REUSE": "0",
             "MAX_NUM_SEQS": "",
+            "MAX_NUM_BATCHED_TOKENS": "",
             "DSV4_EXECUTION_MODE": "",
             "DSV4_ASYNC_SCHEDULING": "",
             "DSV4_EXTERNAL_ARROW": "0",
@@ -209,6 +211,23 @@ class LaunchScriptTests(unittest.TestCase):
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_server_snapshot_switch_is_opt_in_and_requires_block(self):
+        result = self.run_script(
+            "server", DSV4_BLOCK_VERIFY="1", DSV4_KV_REUSE="1", DSV4_KV_CACHE_MB="256"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertLess(args.index("--dsv4-kv-reuse"), args.index("--"))
+        self.assertEqual(args[args.index("--dsv4-kv-cache-mb") + 1], "256")
+        for overrides in (
+            {"DSV4_KV_REUSE": "1"},
+            {"DSV4_BLOCK_VERIFY": "1", "DSV4_KV_REUSE": "bad"},
+            {"DSV4_BLOCK_VERIFY": "1", "DSV4_KV_REUSE": "1", "DSV4_KV_CACHE_MB": "0"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self.run_script("server", **overrides)
+                self.assertNotEqual(result.returncode, 0)
+
     def test_eval_dataset_and_device_wiring(self):
         for kind, devices in (
             ("offline", "2"),
@@ -245,6 +264,9 @@ class LaunchScriptTests(unittest.TestCase):
                             "SKIP_ARTIFACTS": "0",
                             "DRY_RUN": "0",
                             "HS_HTTP_ENDPOINT": "",
+                            "MAX_NUM_SEQS": "2" if "," in devices else "",
+                            "MAX_NUM_BATCHED_TOKENS": "8192" if "," in devices else "",
+                            "DSV4_MAX_MODEL_LEN": "4096",
                         }
                     )
                     # Capture the final argv; never invoke Python or a target service.
@@ -272,7 +294,17 @@ class LaunchScriptTests(unittest.TestCase):
                     )
                     if kind == "single":
                         self.assertEqual(args[args.index("--eval-device") + 1], devices)
+                        self.assertEqual(
+                            args[args.index("--target-max-num-seqs") + 1],
+                            "2" if "," in devices else "1",
+                        )
+                        self.assertEqual(
+                            args[args.index("--target-max-num-batched-tokens") + 1],
+                            "8192" if "," in devices else "4096",
+                        )
                     else:
+                        self.assertNotIn("--target-max-num-seqs", args)
+                        self.assertNotIn("--target-max-num-batched-tokens", args)
                         self.assertIn(f"ASCEND_RT_VISIBLE_DEVICES={devices}", args)
                         if "," in devices:
                             self.assertEqual(
@@ -280,6 +312,50 @@ class LaunchScriptTests(unittest.TestCase):
                             )
                         else:
                             self.assertNotIn("--ascend-devices", args)
+
+    def test_draft_cache_switch_in_all_eval_scripts(self):
+        for filename in (
+            "dspark_dsv4_offline_eval.sh",
+            "dspark_dsv4_single_eval.sh",
+            "dspark_offline_jsonl.sh",
+        ):
+            for value in ("0", "1", "bad"):
+                with self.subTest(filename=filename, value=value):
+                    environment = _shell_environment(
+                        {
+                            "VERIFIER_MODEL": "/fixture/target",
+                            "DRAFT_MODEL": "/fixture/draft",
+                            "DATASETS_ROOT": "/fixture/data",
+                            "HS_PATH": "/fixture/hs",
+                            "HS_HTTP_ENDPOINT": "",
+                            "VLLM_NPUS": "0,1",
+                            "EVAL_NPU": "2,3",
+                            "DSV4_PROFILE": "0",
+                            "DSV4_KV_REUSE": "0",
+                            "DRAFT_KV_REUSE": value,
+                        }
+                    )
+                    script = ROOT / "examples/evaluate" / filename
+                    source = r"""exec() { printf '%s\0' "$@"; }"""
+                    source += f"\nsource {shlex.quote(script.as_posix())}\n"
+                    result = subprocess.run(  # noqa: S603 -- Only capture script argv.
+                        [BASH, "--noprofile", "--norc"],
+                        input=source,
+                        cwd=self.root,
+                        env=environment,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                        check=False,
+                    )
+                    if value == "bad":
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("DRAFT_KV_REUSE", result.stderr)
+                    else:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        args = result.stdout.split("\0")[:-1]
+                        self.assertEqual("--draft-kv-reuse" in args, value == "1")
+                        self.assertNotIn("--dsv4-kv-reuse", args)
 
     def test_offline_eval_saved_paths_and_runtime_defaults_allow_overrides(self):
         settings = {
@@ -313,6 +389,7 @@ class LaunchScriptTests(unittest.TestCase):
             "MAX_NEW_TOKENS": ("--max-new-tokens", "2048", "128"),
             "DSV4_MAX_MODEL_LEN": ("--dsv4-max-model-len", "4096", "8192"),
             "VERIFICATION_MODE": ("--dsv4-verification-mode", "reference", "block"),
+            "DSV4_BLOCK_OUTPUT": ("--dsv4-block-output", "auto", "full"),
         }
         script = ROOT / "examples/evaluate/dspark_dsv4_offline_eval.sh"
         for use_overrides in (False, True):
@@ -326,6 +403,9 @@ class LaunchScriptTests(unittest.TestCase):
                         "HS_HTTP_ENDPOINT": "",
                         "KEEP_TARGET_HS": "0",
                         "SERVED_MODEL_NAME": "",
+                        "DSV4_PROFILE": "1" if use_overrides else "0",
+                        "DSV4_KV_REUSE": "1" if use_overrides else "0",
+                        "DRAFT_KV_REUSE": "1" if use_overrides else "0",
                     }
                 )
                 source = r"""exec() { printf '%s\0' "$@"; }"""
@@ -343,6 +423,9 @@ class LaunchScriptTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertTrue(result.stdout.endswith("\0"))
                 args = result.stdout.split("\0")[:-1]
+                self.assertEqual("--dsv4-profile" in args, use_overrides)
+                self.assertEqual("--dsv4-kv-reuse" in args, use_overrides)
+                self.assertEqual("--draft-kv-reuse" in args, use_overrides)
                 for flag, default, override in settings.values():
                     if not use_overrides and default is None:
                         self.assertNotIn(flag, args)
@@ -623,7 +706,9 @@ exec() {
         for overrides in (
             {"DSV4_BLOCK_VERIFY": "2"},
             {"DP_SIZE": "4"},
-            {"MAX_NUM_SEQS": "64"},
+            {"MAX_NUM_SEQS": "0"},
+            {"MAX_NUM_SEQS": "-1"},
+            {"MAX_NUM_SEQS": "1.5"},
             {"DSV4_ASYNC_SCHEDULING": "1"},
             {"DSV4_EXECUTION_MODE": "full-decode-only"},
         ):
@@ -634,6 +719,18 @@ exec() {
                 self.assertNotEqual(result.returncode, 0)
                 self.assertFalse(self.checkpoint_capture.exists())
                 self.assertFalse(self.capture.exists())
+
+    def test_server_allows_explicit_block_batch_and_token_budget(self):
+        result = self.run_script(
+            "server",
+            DSV4_BLOCK_VERIFY="1",
+            MAX_NUM_SEQS="2",
+            MAX_NUM_BATCHED_TOKENS="8192",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(args[args.index("--max-num-seqs") + 1], "2")
+        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "8192")
 
     def test_two_host_head_starts_local_engines_and_keeps_http_readiness(self):
         result = self.run_script("server", DP_SIZE="4", DP_ADDRESS="10.0.0.10")

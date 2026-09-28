@@ -26,6 +26,8 @@ from typing import Any
 from speculators_eval import data as _eval_data
 from speculators_eval import parallel as _eval_parallel
 from speculators_eval import reporting as _eval_reporting
+from speculators_eval.diagnostics import capture_sample_failure
+from speculators_eval.profiling import EvaluationProfiler, profile_stage, write_timings
 from speculators_eval.progress import WorkerProgress
 
 # Keep the script's existing helper API while the package owns implementation.
@@ -89,6 +91,21 @@ def logits_to_probs(logits, temperature: float):
             num_classes=logits.shape[-1],
         ).to(logits.dtype)
     return torch.softmax(logits.float() / temperature, dim=-1)
+
+
+def target_output_to_probs(output, temperature: float, *, last_only=False):
+    """Reconstruct the original one-hot probabilities from compact greedy IDs."""
+    token_ids = getattr(output, "greedy_token_ids", None)
+    if token_ids is not None:
+        if temperature != 0.0:
+            raise ValueError("Compact target output requires temperature=0")
+        if last_only:
+            token_ids = token_ids[:, -1:]
+        return torch.nn.functional.one_hot(token_ids, num_classes=output.vocab_size).to(
+            torch.float32
+        )
+    logits = output.logits[:, -1:, :] if last_only else output.logits
+    return logits_to_probs(logits, temperature)
 
 
 def sample_from_probs(probs):
@@ -376,7 +393,7 @@ def verify_draft_tokens(
         use_cache=True,
         output_hidden_states=True,
     )
-    target_probs = logits_to_probs(target_output.logits, float(temperature))
+    target_probs = target_output_to_probs(target_output, float(temperature))
 
     (
         accept_prefix_mask,
@@ -444,6 +461,19 @@ def _new_target_cache(target_model):
     return factory() if factory is not None else DynamicCache()
 
 
+def _probability_rows_to_lists(rows):
+    """Transfer diagnostics once per sample, not twice per speculative round."""
+    lengths = [0 if row is None else row.numel() for row in rows]
+    tensors = [row for row in rows if row is not None and row.numel()]
+    values = torch.cat(tensors).tolist() if tensors else []
+    result = []
+    offset = 0
+    for length in lengths:
+        result.append(values[offset : offset + length])
+        offset += length
+    return result
+
+
 def generate_decoding_sample(
     *,
     target_model,
@@ -489,13 +519,13 @@ def generate_decoding_sample(
     )
     output_ids[:, :num_input_tokens] = input_ids
     output_ids[:, num_input_tokens : num_input_tokens + 1] = sample_from_probs(
-        logits_to_probs(output.logits[:, -1:, :], float(temperature))
+        target_output_to_probs(output, float(temperature), last_only=True)
     )
     start = num_input_tokens
     proposal_lengths: list[int] = []
     accepted_draft_lengths: list[int] = []
-    accept_prob_lists: list[list[float]] = []
-    support_accept_rate_lists: list[list[float]] = []
+    accept_prob_rows: list[Any] = []
+    support_accept_rate_rows: list[Any] = []
 
     initial_token = output_ids[:, num_input_tokens : num_input_tokens + 1]
     if max_new_tokens == 1 or has_stop_token(initial_token, stop_token_ids):
@@ -510,8 +540,8 @@ def generate_decoding_sample(
             num_output_tokens=output_ids.shape[1] - num_input_tokens,
             proposal_lengths=proposal_lengths,
             accepted_draft_lengths=accepted_draft_lengths,
-            accept_prob_lists=accept_prob_lists,
-            support_accept_rate_lists=support_accept_rate_lists,
+            accept_prob_lists=[],
+            support_accept_rate_lists=[],
         )
 
     context = init_context(initial_output=output, initial_token=initial_token)
@@ -529,13 +559,14 @@ def generate_decoding_sample(
                 draft_probs=None,
             )
         else:
-            proposal = propose(
-                context=context,
-                output_ids=output_ids,
-                position_ids=position_ids,
-                start=start,
-                stop_token_ids=stop_token_ids,
-            )
+            with profile_stage(target_model, "draft_propose"):
+                proposal = propose(
+                    context=context,
+                    output_ids=output_ids,
+                    position_ids=position_ids,
+                    start=start,
+                    stop_token_ids=stop_token_ids,
+                )
             if proposal.draft_token_count > max_proposal_tokens:
                 raise ValueError(
                     "DraftProposal.draft_token_count exceeds max_proposal_tokens"
@@ -570,15 +601,15 @@ def generate_decoding_sample(
         proposal_lengths.append(int(verification.effective_proposal_length))
         accepted = int(verification.accepted_draft_tokens)
         accepted_draft_lengths.append(accepted)
-        accept_prob_lists.append(
-            []
+        accept_prob_rows.append(
+            None
             if verification.accept_probs is None
-            else verification.accept_probs.detach().float()[0].tolist()
+            else verification.accept_probs.detach().float()[0]
         )
-        support_accept_rate_lists.append(
-            []
+        support_accept_rate_rows.append(
+            None
             if verification.support_accept_rates is None
-            else verification.support_accept_rates.detach().float()[0].tolist()
+            else verification.support_accept_rates.detach().float()[0]
         )
         output_ids[:, start : start + accepted + 1] = proposal.verify_input_ids[
             :, : accepted + 1
@@ -604,8 +635,8 @@ def generate_decoding_sample(
         num_output_tokens=output_ids.shape[1] - num_input_tokens,
         proposal_lengths=proposal_lengths,
         accepted_draft_lengths=accepted_draft_lengths,
-        accept_prob_lists=accept_prob_lists,
-        support_accept_rate_lists=support_accept_rate_lists,
+        accept_prob_lists=_probability_rows_to_lists(accept_prob_rows),
+        support_accept_rate_lists=_probability_rows_to_lists(support_accept_rate_rows),
     )
 
 
@@ -694,6 +725,16 @@ class DSparkOfflineRunner:
         self.tokenizer = tokenizer
         self.args = args
         self.device = next(target_model.parameters()).device
+        if getattr(args, "draft_kv_reuse", False):
+            from speculators_eval.draft_cache import (  # noqa: PLC0415
+                validate_draft_cache,
+            )
+
+            validate_draft_cache(draft_model)
+        logger.info(
+            "Draft context/KV reuse: %s (per-sample device cache)",
+            bool(getattr(args, "draft_kv_reuse", False)),
+        )
         self.sample_from_anchor = _draft_sample_from_anchor(draft_model)
         self.first_draft_slot = first_draft_slot_for_draft(draft_model)
         self.max_proposal_tokens = speculative_slots_for_draft(draft_model)
@@ -707,6 +748,19 @@ class DSparkOfflineRunner:
             and not self.sample_from_anchor
             and correction_output_mode == "logits"
         )
+        configure = getattr(target_model, "configure_evaluation", None)
+        if configure is not None:
+            configure(
+                temperature=float(args.temperature),
+                requires_target_logits=self.uses_initial_correction_logits,
+                block_output=getattr(args, "dsv4_block_output", "auto"),
+            )
+            logger.info(
+                "DSV4 target output=%s | profile=%s | correction_requires_logits=%s",
+                target_model.block_output_mode,
+                target_model.profiler.enabled,
+                self.uses_initial_correction_logits,
+            )
         self._draft_target_logit_indices = None
         if self.uses_initial_correction_logits and draft_model.use_draft_vocab:
             if draft_model.d2t is None:
@@ -760,11 +814,17 @@ class DSparkOfflineRunner:
             correction_previous_logits = self._target_logits_to_draft_vocab(
                 initial_output.logits[:, -1, :]
             )
+        draft_cache = None
+        if getattr(self.args, "draft_kv_reuse", False):
+            from speculators_eval.draft_cache import DraftContextCache  # noqa: PLC0415
+
+            draft_cache = DraftContextCache()
         return SimpleNamespace(
             target_hidden_states=self._extract_context_feature(
                 initial_output.hidden_states,
             ),
             correction_previous_logits=correction_previous_logits,
+            draft_cache=draft_cache,
         )
 
     def _single_anchor_backbone(
@@ -772,6 +832,8 @@ class DSparkOfflineRunner:
         hidden_states,
         input_ids,
         start: int,
+        *,
+        cache=None,
     ):
         draft = self.draft_model
         block = int(draft.block_size)
@@ -819,7 +881,12 @@ class DSparkOfflineRunner:
         )
         mask_token_ids[:, 0] = input_ids[:, start]
         noise_embedding = draft.embed_tokens(mask_token_ids)
-        fc_output = _prepare_dflash_target_context(draft, hidden_states)
+        cached_length = 0 if cache is None else cache.length
+        if cache is None:
+            fc_output = _prepare_dflash_target_context(draft, hidden_states)
+            layer_context = fc_output
+        else:
+            fc_output, layer_context = cache.prepare(draft, hidden_states, start)
         noise_embedding = draft._condition_noise_embedding(
             noise_embedding,
             fc_output,
@@ -837,6 +904,12 @@ class DSparkOfflineRunner:
             dim=0,
         ).unsqueeze(0)
         position_embeddings = draft.rotary_emb(hidden_states, position_ids)
+        if cache is not None:
+            # Rotate only the newly projected keys; old keys are already rotated.
+            # The attention mask and final concatenated key layout stay unchanged.
+            position_embeddings = tuple(
+                value[:, cached_length:, :] for value in position_embeddings
+            )
 
         for layer_idx, layer in enumerate(draft.layers):
             attention_mask = (
@@ -846,12 +919,22 @@ class DSparkOfflineRunner:
             )
             noise_embedding = layer(
                 hidden_states=noise_embedding,
-                target_hidden=fc_output,
+                target_hidden=layer_context,
                 attention_mask=attention_mask,
                 position_ids=position_ids,
-                use_cache=False,
+                use_cache=cache is not None,
+                **({"past_key_value": cache.kv} if cache is not None else {}),
                 position_embeddings=position_embeddings,
             )
+
+        if cache is not None:
+            cache.commit(fc_output, start)
+            profiler = getattr(self.target_model, "profiler", None)
+            if profiler is not None:
+                profiler.count("draft_context_reused_tokens", cached_length)
+                profiler.count(
+                    "draft_context_projected_tokens", start + 1 - cached_length
+                )
 
         hidden = draft.norm(noise_embedding)
         # Selector-conditioned Correction needs pure DFlash logits before the
@@ -1053,6 +1136,7 @@ class DSparkOfflineRunner:
             context.target_hidden_states,
             output_ids,
             start,
+            cache=getattr(context, "draft_cache", None),
         )
         proposed_target_ids, draft_probs = self._sample_dspark_tokens(
             base_logits,
@@ -1263,6 +1347,10 @@ def _evaluate_dataset(
     )
 
     stats = EvalStats()
+    profiler = (
+        getattr(getattr(runner, "target_model", None), "profiler", None)
+        or EvaluationProfiler()
+    )
     artifacts: list[dict[str, Any]] = []
     base_elapsed_s = 0.0
     base_total_output_tokens = 0
@@ -1292,29 +1380,40 @@ def _evaluate_dataset(
         )
 
     for processed, (idx, record) in enumerate(iterator, start=1):
-        prompt = _prompt_from_record(
-            record,
-            runner.tokenizer,
-            source=f"{path}:{idx}",
+        with capture_sample_failure(
             args=args,
-        )
-        if base_runner is None:
-            response = runner.generate_one(prompt, stop_token_ids)
-        else:
-            response, dspark_elapsed = _timed_generate(
-                runner,
-                prompt,
-                stop_token_ids,
+            path=path,
+            dataset=dataset,
+            selected_index=idx,
+            record=record,
+            profiler=profiler,
+        ):
+            prompt = _prompt_from_record(
+                record,
+                runner.tokenizer,
+                source=f"{path}:{idx}",
+                args=args,
             )
-            base_response, base_elapsed = _timed_generate(
-                base_runner,
-                prompt,
-                stop_token_ids,
-            )
-            stats.elapsed_s += dspark_elapsed
-            base_elapsed_s += base_elapsed
-            base_total_output_tokens += int(base_response.num_output_tokens)
+            if base_runner is None:
+                with profile_stage(getattr(runner, "target_model", None), "generation"):
+                    response = runner.generate_one(prompt, stop_token_ids)
+            else:
+                response, dspark_elapsed = _timed_generate(
+                    runner,
+                    prompt,
+                    stop_token_ids,
+                )
+                base_response, base_elapsed = _timed_generate(
+                    base_runner,
+                    prompt,
+                    stop_token_ids,
+                )
+                stats.elapsed_s += dspark_elapsed
+                base_elapsed_s += base_elapsed
+                base_total_output_tokens += int(base_response.num_output_tokens)
         stats.add_response(response)
+        profiler.count("samples", 1)
+        profiler.count("output_tokens", int(response.num_output_tokens))
         if not args.skip_artifacts:
             artifacts.append(
                 {
@@ -1325,6 +1424,12 @@ def _evaluate_dataset(
                 }
             )
         progress.update(processed)
+        if (
+            processed == 1
+            or processed % args.log_every == 0
+            or processed == len(indexed_records)
+        ):
+            profiler.log(dataset)
         if progress.path is None and (
             processed == 1
             or processed % args.log_every == 0
@@ -1421,15 +1526,21 @@ def _write_backend_metadata(args, report):
         "target_backend": "dsv4-vllm",
         "verification_mode": mode,
         "verification": (
-            "full-prefix-block-recompute"
+            "immutable-kv-snapshot-accepted-tail-replay"
+            if getattr(args, "dsv4_kv_reuse", False)
+            else "full-prefix-block-recompute"
             if mode == "block"
             else "full-prefix-per-position-recompute"
         ),
         "probability_source": (
-            "target_native_full_vocabulary_logprobs_packet"
+            "target_native_full_vocabulary_head_packet"
             if mode == "block"
             else "target_api_full_vocabulary_logprobs"
         ),
+        "block_output_policy": getattr(args, "dsv4_block_output", "auto"),
+        "diagnostic_profile": getattr(args, "dsv4_profile", False),
+        "target_kv_reuse": getattr(args, "dsv4_kv_reuse", False),
+        "draft_kv_reuse": getattr(args, "draft_kv_reuse", False),
         "online_speedup_benchmark": False,
         "target_model": report["model_path"],
         "checkpoint_signature": report["checkpoint_signature"],
@@ -1448,6 +1559,11 @@ def _write_backend_metadata(args, report):
 
 
 def run(args: argparse.Namespace) -> None:
+    if getattr(args, "dsv4_kv_reuse", False) and (
+        getattr(args, "target_backend", "hf") != "dsv4-vllm"
+        or getattr(args, "dsv4_verification_mode", "reference") != "block"
+    ):
+        raise ValueError("--dsv4-kv-reuse requires dsv4-vllm and block verification")
     # Close service clients on failed setup, transport errors and interrupts too.
     with ExitStack() as resources:
         _run(args, resources)
@@ -1494,6 +1610,8 @@ class _LoadedEvaluation:
 def _prepare_target_backend(args: argparse.Namespace) -> _TargetSetup:
     """Validate transport/cache contracts and publish metadata before dispatch."""
     target_backend = getattr(args, "target_backend", "hf")
+    if getattr(args, "dsv4_profile", False) and target_backend != "dsv4-vllm":
+        raise ValueError("--dsv4-profile requires --target-backend dsv4-vllm")
     hs_http_endpoint = _prepare_hs_http(args, target_backend)
     target_config = _validate_target_cache_support(args.verifier_model, target_backend)
     report = None
@@ -1631,7 +1749,12 @@ def _load_dsv4_target(
         max_retries=0,
     )
     resources.callback(client.close)
-    target_model = DSV4OfflineTarget(
+    target_class = DSV4OfflineTarget
+    if getattr(args, "dsv4_kv_reuse", False):
+        from speculators_dsv4.cached_target import DSV4CachedTarget  # noqa: PLC0415
+
+        target_class = DSV4CachedTarget
+    target_model = target_class(
         draft_model,
         setup.report,
         hidden_states_path=args.hidden_states_path,
@@ -1643,6 +1766,7 @@ def _load_dsv4_target(
         verification_mode=args.dsv4_verification_mode,
         hs_http_endpoint=setup.hs_http_endpoint,
         hs_http_token=os.environ.get("DSV4_HS_HTTP_TOKEN"),
+        profile=getattr(args, "dsv4_profile", False),
     )
     endpoint = urlsplit(args.vllm_endpoint)
     root_path = endpoint.path.rstrip("/").removesuffix("/v1")
@@ -1660,9 +1784,12 @@ def _load_dsv4_target(
         vocab_size=setup.target_config["vocab_size"],
     )
     logger.warning(
-        "DSV4 %s verification uses full-prefix recomputation and native target "
+        "DSV4 %s verification uses %s and native target "
         "probabilities. Reported elapsed time is NOT online speculative speed.",
         args.dsv4_verification_mode,
+        "host KV snapshots with accepted-tail replay"
+        if getattr(args, "dsv4_kv_reuse", False)
+        else "full-prefix recomputation",
     )
     return target_model, tokenizer
 
@@ -1730,7 +1857,11 @@ def _evaluate_loaded_models(
     )
     rows: list[dict[str, Any]] = []
     artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
+    profiler = getattr(target_model, "profiler", None)
+    profiles = {}
     for path in dataset_paths:
+        if profiler is not None:
+            profiler.reset()
         row, artifacts = _evaluate_dataset(
             path=path,
             runner=runner,
@@ -1739,6 +1870,9 @@ def _evaluate_loaded_models(
             stop_token_ids=stop_token_ids,
         )
         rows.append(row)
+        if profiler is not None and profiler.enabled:
+            profiles[row["dataset"]] = profiler.snapshot()
+            write_timings(args.output_dir, profiles)
         if not args.skip_artifacts:
             artifacts_by_dataset[row["dataset"]] = artifacts
     _write_outputs(args.output_dir, rows, artifacts_by_dataset)
@@ -1765,6 +1899,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dsv4-max-model-len", type=int, default=4096)
     parser.add_argument(
         "--dsv4-verification-mode", choices=["reference", "block"], default="reference"
+    )
+    parser.add_argument(
+        "--dsv4-kv-reuse",
+        action="store_true",
+        help="Reuse native V4 target KV via a matching --dsv4-kv-reuse block server",
+    )
+    parser.add_argument(
+        "--dsv4-block-output",
+        choices=["auto", "full"],
+        default="auto",
+        help="Auto uses compact greedy IDs for temperature=0 only when Correction "
+        "does not need target logits. Full retains the version-1 probability path.",
+    )
+    parser.add_argument(
+        "--dsv4-profile",
+        action="store_true",
+        help="Write timing.json with synchronized diagnostic timings; block mode "
+        "also requests server timings and requires the updated server.",
     )
     parser.add_argument("--target-request-timeout", type=float, default=120.0)
     parser.add_argument("--keep-target-hs", action="store_true")
@@ -1795,6 +1947,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", default="bfloat16")
+    parser.add_argument(
+        "--draft-kv-reuse",
+        action="store_true",
+        help="Cache confirmed draft context projections/KV across rounds (HF or "
+        "DSV4 target); opt-in, with no checkpoint changes",
+    )
     parser.add_argument(
         "--draft-attn-impl",
         choices=["auto", "simple_flex_attention", "sdpa", "eager"],

@@ -100,6 +100,25 @@ class OfflineEvalModuleTests(unittest.TestCase):
             self.module.run_ascend_data_parallel(args)
         run.assert_called_once_with(args, entrypoint=EVALUATOR)
 
+    def test_draft_cache_switch_reaches_hf_and_dsv4_workers(self):
+        args = self.args()
+        self.assertFalse(args.draft_kv_reuse)
+        kwargs = {
+            "entrypoint": EVALUATOR,
+            "dataset_path": self.root / "data.jsonl",
+            "shard_index": 0,
+            "num_shards": 2,
+            "output_dir": self.root / "shard",
+        }
+        self.assertNotIn("--draft-kv-reuse", parallel.worker_command(args, **kwargs))
+        args.draft_kv_reuse = True
+        for backend in ("hf", "dsv4-vllm"):
+            args.target_backend = backend
+            with self.subTest(backend=backend):
+                self.assertEqual(
+                    parallel.worker_command(args, **kwargs).count("--draft-kv-reuse"), 1
+                )
+
     def test_explicit_worker_entrypoint_keeps_arguments_and_paths_with_spaces(self):
         args = self.args()
         kwargs = {

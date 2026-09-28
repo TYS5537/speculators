@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 from speculators_eval import parallel as eval_parallel
+from speculators_eval.profiling import EvaluationProfiler, write_timings
 from speculators_eval.progress import WorkerProgress
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -100,6 +101,10 @@ class EvalWorkerTests(unittest.TestCase):
         ):
             self.assertEqual(self.flag(command, flag), value)
         self.assertIn("--keep-target-hs", command)
+        self.assertEqual(
+            self.flag(command, "--dsv4-block-output"), self.args.dsv4_block_output
+        )
+        self.assertEqual("--dsv4-profile" in command, self.args.dsv4_profile)
         selected = self.module._select_eval_records(
             self.records,
             dataset_name="samples",
@@ -129,7 +134,36 @@ class EvalWorkerTests(unittest.TestCase):
             [self.module._summary_row("samples", len(shard), stats)],
             {"samples": [{"source_index": i} for i, _ in shard]},
         )
+        if self.args.dsv4_profile:
+            profiler = EvaluationProfiler(enabled=True)
+            for _sample in shard:
+                profiler.record("target_rpc", 2.0)
+            profiler.count("samples", len(shard))
+            write_timings(
+                Path(self.flag(command, "--output-dir")),
+                {"samples": profiler.snapshot()},
+            )
         return Mock(poll=Mock(return_value=0), wait=Mock(return_value=0))
+
+    def test_profile_and_full_output_flags_reach_workers_and_merge_reports(self):
+        self.args.dsv4_profile = True
+        self.args.dsv4_block_output = "full"
+        self.args.dsv4_verification_mode = "block"
+        with (
+            patch.object(
+                eval_parallel.subprocess,
+                "Popen",
+                side_effect=self.fake_completed_worker,
+            ),
+            patch.dict(
+                self.module.os.environ, {"OPENAI_API_KEY": "fixture-private-key"}
+            ),
+        ):
+            self.module.run_ascend_data_parallel(self.args)
+        payload = json.loads((self.args.output_dir / "timing.json").read_text())
+        report = payload["datasets"]["group/samples"]
+        self.assertEqual(report["counters"]["samples"], 11)
+        self.assertEqual(report["stages"]["target_rpc"], {"seconds": 22.0, "calls": 11})
 
     def test_eight_workers_merge_uneven_and_empty_shards_in_both_modes(self):
         for mode, endpoint in (

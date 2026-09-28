@@ -17,6 +17,7 @@ from unittest.mock import Mock, patch
 
 from speculators_dsv4 import ARCHITECTURE, KV_CACHE_COMPAT_ENV, register
 from speculators_dsv4.block_protocol import BLOCK_CONNECTOR
+from speculators_eval.profiling import EvaluationProfiler
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -163,7 +164,10 @@ class RuntimeTests(unittest.TestCase):
     def test_block_export_hook_receives_corrected_teacher_only_when_enabled(self):
         connector = ModuleType("speculators_dsv4.block_connector")
         connector.export_block = Mock()
-        input_ids, positions = object(), object()
+        connector.install_worker_block_layout = Mock()
+        profiler = EvaluationProfiler()
+        connector.block_forward_profiler = Mock(return_value=profiler)
+        input_ids, positions = object(), SimpleNamespace(device="cpu")
         with patch.dict(sys.modules, {connector.__name__: None}):
             reference = self.make_model()
             reference.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
@@ -176,8 +180,9 @@ class RuntimeTests(unittest.TestCase):
             model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
             output = model.forward(input_ids, positions)
         connector.export_block.assert_called_once_with(
-            model, input_ids, positions, output
+            model, input_ids, positions, output, profiler=profiler
         )
+        connector.install_worker_block_layout.assert_called_once_with()
         self.assertIs(connector.export_block.call_args.args[3], output)
         self.assertEqual(output[1][-1].value, 7)
         self.assertEqual(model.auxiliary[-1].value, 43)
@@ -272,7 +277,11 @@ class RuntimeTests(unittest.TestCase):
         config.parallel_config.data_parallel_size_local = 2
         config.parallel_config.enable_expert_parallel = True
         config.kv_transfer_config = SimpleNamespace(kv_connector=BLOCK_CONNECTOR)
-        model = self.make_model(config)
+        connector = ModuleType("speculators_dsv4.block_connector")
+        connector.install_worker_block_layout = Mock()
+        with patch.dict(sys.modules, {connector.__name__: connector}):
+            model = self.make_model(config)
+        connector.install_worker_block_layout.assert_called_once_with()
         self.assertIs(model.vllm_config, config)
         self.assertTrue(model._block_verify)
 
@@ -444,6 +453,38 @@ class LauncherTests(unittest.TestCase):
 
     def test_dsv4_primary_flag_and_legacy_alias_are_equivalent(self):
         self.assertEqual(self.launch_dsv4(), self.launch_dsv4("--dsv4-bf16"))
+
+    def test_snapshot_connector_is_explicit_and_keeps_block_parallel_settings(self):
+        devices = patch.dict(
+            self.launcher.os.environ,
+            {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16)))},
+        )
+        devices.start()
+        self.addCleanup(devices.stop)
+        cmd = self.launch_dsv4(
+            block=True,
+            launcher_extra=["--dsv4-kv-reuse", "--dsv4-kv-cache-mb", "256"],
+            extra=[
+                "--tensor-parallel-size",
+                "8",
+                "--data-parallel-size",
+                "2",
+                "--data-parallel-size-local",
+                "2",
+                "--data-parallel-backend",
+                "mp",
+                "--enable-expert-parallel",
+            ],
+        )
+        transfer = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])
+        self.assertEqual(transfer["kv_connector"], "DSV4CachedBlockVerifyConnector")
+        self.assertEqual(
+            transfer["kv_connector_module_path"], "speculators_dsv4.cached_connector"
+        )
+        self.assertEqual(transfer["kv_connector_extra_config"]["kv_cache_mb"], 256)
+        for extra in (["--dsv4-kv-reuse"], ["--dsv4-kv-cache-mb", "0"]):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.launch_dsv4(launcher_extra=extra)
 
     def test_dsv4_passes_quantization_options_unchanged(self):
         for extra, method in (
@@ -781,18 +822,29 @@ class LauncherTests(unittest.TestCase):
         connector = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])
         self.assertEqual(connector["kv_connector"], BLOCK_CONNECTOR)
 
-    def test_block_verification_rejects_multiple_sequence_configuration(self):
+    def test_block_verification_rejects_nonpositive_sequence_configuration(self):
         for extra in (
-            ["--max-num-seqs", "2"],
-            ["--max-num-seqs=2"],
-            ["--max_num_seqs", "2"],
-            ["--max-num-seqs", "2", "--max-num-seqs", "1"],
+            ["--max-num-seqs", "0"],
+            ["--max-num-seqs=-2"],
+            ["--max_num_seqs", "0"],
+            ["--max-num-seqs", "0", "--max-num-seqs", "1"],
         ):
             with (
                 self.subTest(extra=extra),
-                self.assertRaisesRegex(ValueError, "max-num-seqs 1"),
+                self.assertRaisesRegex(ValueError, "positive max-num-seqs"),
             ):
                 self.launch_dsv4(extra=extra, block=True)
+
+    def test_block_verification_allows_explicit_per_engine_batch_capacity(self):
+        for extra in (
+            ["--max-num-seqs", "2"],
+            ["--max-num-seqs=4"],
+            ["--max_num_seqs", "8"],
+        ):
+            with self.subTest(extra=extra):
+                cmd = self.launch_dsv4(extra=extra, block=True)
+                self.assertIn(extra[0], cmd)
+                self.assertNotIn("1", cmd[cmd.index(extra[0]) + 1 :][:1])
 
     def test_block_verification_requires_explicit_dsv4_bridge(self):
         with (

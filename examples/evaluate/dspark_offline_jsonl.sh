@@ -56,6 +56,7 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTH
 : "${DEVICE:=npu:0}"
 : "${DTYPE:=bfloat16}"
 : "${DRAFT_ATTN_IMPL:=sdpa}"
+: "${DRAFT_KV_REUSE:=0}"  # Optional confirmed-context projection/KV reuse.
 : "${TRUST_REMOTE_CODE:=1}"
 
 # Prompt handling. Use raw for preformatted prompts, chat_template for chat
@@ -88,6 +89,11 @@ fi
 if [[ -n "$ASCEND_DEVICES" ]]; then
   cmd+=(--ascend-devices "$ASCEND_DEVICES")
 fi
+case "$DRAFT_KV_REUSE" in
+  0) ;;
+  1) cmd+=(--draft-kv-reuse) ;;
+  *) echo 'DRAFT_KV_REUSE must be 0 or 1.' >&2; exit 1 ;;
+esac
 if [[ "$TRUST_REMOTE_CODE" == "1" ]]; then
   cmd+=(--trust-remote-code)
 fi

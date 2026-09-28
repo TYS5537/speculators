@@ -89,11 +89,71 @@ class LauncherFixture(unittest.TestCase):
 
 
 class PlanningTests(LauncherFixture):
+    def test_draft_cache_is_eval_only_and_independent_of_target_cache(self):
+        default = self.plan()
+        self.assertNotIn("--draft-kv-reuse", default.eval_command)
+        self.assertFalse(default.public_metadata()["draft_kv_reuse"])
+        for mode in ("block", "reference"):
+            with self.subTest(mode=mode):
+                plan = self.plan("--draft-kv-reuse", "--verification-mode", mode)
+                self.assertIn("--draft-kv-reuse", plan.eval_command)
+                self.assertNotIn("--draft-kv-reuse", plan.target_command)
+                self.assertNotIn("--dsv4-kv-reuse", plan.target_command)
+                self.assertTrue(plan.public_metadata()["draft_kv_reuse"])
+
+    def test_snapshot_switch_and_memory_budget_reach_both_processes(self):
+        default = self.plan()
+        self.assertNotIn("--dsv4-kv-reuse", default.target_command)
+        self.assertNotIn("--dsv4-kv-reuse", default.eval_command)
+        plan = self.plan("--dsv4-kv-reuse", "--dsv4-kv-cache-mb", "256")
+        self.assertIn("--dsv4-kv-reuse", plan.target_command)
+        self.assertIn("--dsv4-kv-reuse", plan.eval_command)
+        self.assertLess(
+            plan.target_command.index("--dsv4-kv-reuse"),
+            plan.target_command.index("--"),
+        )
+        self.assertEqual(self.flag(plan.target_command, "--dsv4-kv-cache-mb"), "256")
+        for extra in (
+            ["--verification-mode", "reference", "--dsv4-kv-reuse"],
+            ["--dsv4-kv-cache-mb", "0"],
+        ):
+            with self.subTest(extra=extra), self.assertRaises(ValueError):
+                self.plan(*extra)
+
     def test_default_sample_caps_and_explicit_override_match_offline_evaluator(self):
         plan = self.plan()
         self.assertNotIn("--max-samples", plan.eval_command)
         plan = self.plan("--max-samples", "12")
         self.assertEqual(self.flag(plan.eval_command, "--max-samples"), "12")
+
+    def test_compact_output_and_profiling_flags_reach_evaluator(self):
+        plan = self.plan()
+        self.assertEqual(self.flag(plan.eval_command, "--dsv4-block-output"), "auto")
+        self.assertNotIn("--dsv4-profile", plan.eval_command)
+        plan = self.plan("--dsv4-block-output", "full", "--dsv4-profile")
+        self.assertEqual(self.flag(plan.eval_command, "--dsv4-block-output"), "full")
+        self.assertIn("--dsv4-profile", plan.eval_command)
+
+    def test_explicit_batch_limits_reach_target_and_provenance(self):
+        plan = self.plan(
+            "--target-max-num-seqs", "2", "--target-max-num-batched-tokens", "8192"
+        )
+        self.assertEqual(self.flag(plan.target_command, "--max-num-seqs"), "2")
+        self.assertEqual(
+            self.flag(plan.target_command, "--max-num-batched-tokens"), "8192"
+        )
+        self.assertEqual(plan.public_metadata()["target_max_num_seqs"], 2)
+        self.assertEqual(plan.public_metadata()["target_max_num_batched_tokens"], 8192)
+
+    def test_invalid_batch_limits_fail_before_starting_target(self):
+        for name, value in (
+            ("--target-max-num-seqs", "0"),
+            ("--target-max-num-seqs", "-1"),
+            ("--target-max-num-batched-tokens", "4095"),
+            ("--target-max-num-batched-tokens", "0"),
+        ):
+            with self.subTest(option=name, value=value), self.assertRaises(ValueError):
+                self.plan(name, value)
 
     def test_split_devices_use_block_evaluator_and_loopback_by_default(self):
         plan = self.plan()

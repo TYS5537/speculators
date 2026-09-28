@@ -9,6 +9,13 @@ set -euo pipefail
 DATASETS="${DATASETS-gsm8k,math500}"
 # Empty uses the Qwen evaluator's per-dataset caps; set a number to override.
 : "${MAX_SAMPLES:=}"
+: "${DSV4_BLOCK_OUTPUT:=auto}"
+: "${DSV4_PROFILE:=0}"  # Synchronized diagnostics, not serving speed.
+: "${DSV4_KV_REUSE:=0}"
+: "${DRAFT_KV_REUSE:=0}"  # Draft-only; works with either target mode.
+: "${DSV4_KV_CACHE_MB:=1024}"  # Host RAM per target process.
+# Target defaults to one prefix per step. Opt in to MAX_NUM_SEQS=2;
+# MAX_NUM_BATCHED_TOKENS budgets their summed full lengths (more needs memory).
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -33,8 +40,11 @@ cmd=(
   --target-devices "$VLLM_NPUS"
   --eval-device "$EVAL_NPU"
   --verification-mode "${VERIFICATION_MODE:-block}"
+  --dsv4-block-output "$DSV4_BLOCK_OUTPUT"
   --port "${VLLM_PORT:-0}"
   --max-model-len "${DSV4_MAX_MODEL_LEN:-4096}"
+  --target-max-num-seqs "${MAX_NUM_SEQS:-1}"
+  --target-max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-${DSV4_MAX_MODEL_LEN:-4096}}"
   --startup-timeout "${STARTUP_TIMEOUT:-1800}"
   --shutdown-timeout "${SHUTDOWN_TIMEOUT:-30}"
   --target-request-timeout "${TARGET_REQUEST_TIMEOUT:-120}"
@@ -45,6 +55,21 @@ cmd=(
   --enable-thinking "${ENABLE_THINKING:-false}"
   --raw-prompt-mode "${RAW_PROMPT_MODE:-auto}"
 )
+case "$DSV4_PROFILE" in
+  0) ;;
+  1) cmd+=(--dsv4-profile) ;;
+  *) printf '%s\n' 'DSV4_PROFILE must be 0 or 1.' >&2; exit 1 ;;
+esac
+case "$DSV4_KV_REUSE" in
+  0) ;;
+  1) cmd+=(--dsv4-kv-reuse --dsv4-kv-cache-mb "$DSV4_KV_CACHE_MB") ;;
+  *) echo 'DSV4_KV_REUSE must be 0 or 1.' >&2; exit 1 ;;
+esac
+case "$DRAFT_KV_REUSE" in
+  0) ;;
+  1) cmd+=(--draft-kv-reuse) ;;
+  *) echo 'DRAFT_KV_REUSE must be 0 or 1.' >&2; exit 1 ;;
+esac
 if [[ -n "${TP_SIZE:-}" ]]; then
   cmd+=(--target-tp-size "$TP_SIZE")
 fi

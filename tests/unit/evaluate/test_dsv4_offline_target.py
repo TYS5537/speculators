@@ -11,6 +11,8 @@ from contextlib import ExitStack
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
+import httpx
+import openai
 import pytest
 import torch
 from safetensors.torch import save_file
@@ -19,11 +21,12 @@ from speculators_dsv4 import HS_FORMAT, contract
 from speculators_dsv4 import offline as backend
 from speculators_dsv4.contract import MANIFEST, make_manifest
 from speculators_dsv4.hs_http_server import HiddenStatesServer
+from speculators_eval.diagnostics import capture_sample_failure
 
 ROOT = Path(__file__).resolve().parents[3]
 
 
-@pytest.mark.parametrize("mode", ["reference", "block"])
+@pytest.mark.parametrize("mode", ["reference", "block", "greedy"])
 @pytest.mark.parametrize("keep", [False, True])
 @pytest.mark.parametrize("model_name", [None, "served-target"])
 def test_real_http_transport_preserves_reference_and_block_tensors(
@@ -53,13 +56,13 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
         assert request_id.startswith("hshttp-")
         path = remote / f"cmpl-{request_id}-0.safetensors"
         paths.append(path)
-        if mode == "block":
+        if mode != "reference":
             block = kwargs["extra_body"]["kv_transfer_params"]["dsv4_block_verify"]
             start, hidden_start = block["logits_start"], block["hidden_start"]
             packet = {
                 "token_ids": torch.tensor(prefix, dtype=torch.int64),
                 "verification_metadata": torch.tensor(
-                    [1, len(prefix), start, hidden_start]
+                    [block["version"], len(prefix), start, hidden_start]
                 ),
                 "layer_ids": torch.tensor([*layers, 43]),
                 "logprobs": torch.stack(
@@ -70,7 +73,16 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
                 ),
                 "hidden_states": _hidden_for(prefix)[hidden_start:].contiguous(),
             }
-            transfer = {"hidden_states_path": str(path), "dsv4_block_verify_version": 1}
+            if block.get("output_mode") == "greedy":
+                packet["greedy_token_ids"] = packet.pop("logprobs").argmax(-1)
+            if block.get("profile"):
+                packet["server_timings"] = torch.tensor(
+                    [0.1, 0.02, 0.01], dtype=torch.float64
+                )
+            transfer = {
+                "hidden_states_path": str(path),
+                "dsv4_block_verify_version": block["version"],
+            }
             choice = SimpleNamespace(prompt_token_ids=prefix)
         else:
             packet = {
@@ -103,9 +115,14 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
             max_model_len=64,
             hs_http_endpoint=f"http://127.0.0.1:{server.server_port}",
             hs_http_token=token,
-            verification_mode=mode,
+            verification_mode="block" if mode == "greedy" else mode,
             keep_hidden_states=keep,
+            profile=mode == "greedy",
         )
+        if mode == "greedy":
+            target.configure_evaluation(
+                temperature=0.0, requires_target_logits=False, block_output="auto"
+            )
         assert target.model_name == served_name
         cache = target.new_cache()
         for tokens in ([2, 0], [1, 3, 4], [0, 2]):
@@ -118,7 +135,11 @@ def test_real_http_transport_preserves_reference_and_block_tensors(
                     for i in range(logits_start, len(cache.tokens))
                 ]
             ).unsqueeze(0)
-            torch.testing.assert_close(output.logits, expected)
+            if mode == "greedy":
+                assert output.logits is None
+                assert torch.equal(output.greedy_token_ids, expected.argmax(-1))
+            else:
+                torch.testing.assert_close(output.logits, expected)
             for slot, layer in enumerate(layers):
                 torch.testing.assert_close(
                     output.hidden_states[layer],
@@ -419,6 +440,7 @@ def test_ascend_worker_command_preserves_remote_target_configuration(
             "8192",
             "--dsv4-verification-mode",
             "block",
+            "--dsv4-kv-reuse",
             "--target-request-timeout",
             "321",
             "--keep-target-hs",
@@ -446,6 +468,7 @@ def test_ascend_worker_command_preserves_remote_target_configuration(
     for flag, value in expected.items():
         assert command[command.index(flag) + 1] == value
     assert "--keep-target-hs" in command
+    assert "--dsv4-kv-reuse" in command
     assert "--measure-base-speedup" not in command
 
 
@@ -798,6 +821,147 @@ def _native_logprobs(prefix):
 
 
 @pytest.fixture
+def cached_fixture(block_fixture):
+    from speculators_dsv4.cached_target import DSV4CachedTarget  # noqa: PLC0415
+
+    case = block_fixture
+    case.target.__class__ = DSV4CachedTarget
+    case.snapshots = {}
+    case.save_snapshots = True
+    case.matched = []
+
+    def snapshot_packet(packet):
+        call = case.calls[-1]
+        options = call["extra_body"]["kv_transfer_params"]["dsv4_block_verify"]
+        assert options["version"] == 3
+        cache = options["cache"]
+        old = case.snapshots.get(cache["read"], [])
+        assert call["prompt"][: len(old)] == old
+        assert min(options["logits_start"], options["hidden_start"]) >= len(old)
+        case.matched.append(len(old))
+        for key in cache["release"]:
+            case.snapshots.pop(key, None)
+        if case.save_snapshots:
+            case.snapshots[cache["write"]] = list(call["prompt"])
+        packet["kv_reuse_metadata"] = torch.tensor(
+            [len(old), int(case.save_snapshots), 1]
+        )
+
+    case.packet_hook = snapshot_packet
+    return case
+
+
+@pytest.mark.parametrize("accepted", [0, 1, 2])
+@pytest.mark.parametrize("greedy", [False, True])
+def test_cached_target_replays_only_accepted_tail_and_pins_dp(
+    cached_fixture, accepted, greedy
+):
+    case, cache = cached_fixture, cached_fixture.target.new_cache()
+    if greedy:
+        case.target.configure_evaluation(
+            temperature=0.0, requires_target_logits=False, block_output="auto"
+        )
+    rng = torch.random.get_rng_state()
+    _forward(case.target, cache, [2, 0])
+    _forward(case.target, cache, [1, 3, 4])
+    cache.crop(3 + accepted)  # Anchor 1 plus accepted draft tokens.
+    committed = list(cache.tokens)
+    output = _forward(case.target, cache, [0, 2])
+    assert torch.equal(torch.random.get_rng_state(), rng)
+    expected = torch.stack(
+        [
+            _native_logprobs(cache.tokens[: i + 1])
+            for i in range(len(committed), len(cache.tokens))
+        ]
+    ).unsqueeze(0)
+    if greedy:
+        assert torch.equal(output.greedy_token_ids, expected.argmax(-1))
+    else:
+        assert torch.equal(output.logits, expected)
+    assert torch.equal(
+        output.hidden_states[1],
+        _hidden_for(cache.tokens)[len(committed) :, 0].unsqueeze(0),
+    )
+    assert "X-data-parallel-rank" not in case.calls[0]["extra_headers"]
+    assert all(
+        call["extra_headers"]["X-data-parallel-rank"] == "1" for call in case.calls[1:]
+    )
+    if accepted == 2:
+        assert case.matched == [0, 2, 5]  # Full acceptance needs no commit RPC.
+    else:
+        assert case.matched == [0, 2, 2, len(committed)]
+        assert case.calls[2]["prompt"] == committed
+        assert case.calls[2]["extra_body"]["kv_transfer_params"]["dsv4_block_verify"][
+            "hidden_start"
+        ] == len(committed)
+    assert len(case.snapshots) == 2  # Confirmed + trial; old ancestors released.
+    assert not any(path.exists() for path in case.paths)
+
+
+def test_cached_target_eviction_recomputes_without_changing_results(cached_fixture):
+    case, cache = cached_fixture, cached_fixture.target.new_cache()
+    _forward(case.target, cache, [2, 0])
+    _forward(case.target, cache, [1, 3, 4])
+    cache.crop(3)
+    case.snapshots.clear()  # LRU eviction on every TP worker.
+    output = _forward(case.target, cache, [2])
+    assert case.matched == [0, 2, 0, 3]
+    assert torch.equal(output.logits, _native_logprobs([2, 0, 1, 2]).view(1, 1, 5))
+
+
+def test_cached_target_oversize_snapshot_falls_back_to_full_prefix(cached_fixture):
+    case, cache = cached_fixture, cached_fixture.target.new_cache()
+    case.save_snapshots = False
+    _forward(case.target, cache, [2, 0])
+    _forward(case.target, cache, [1, 3, 4])
+    cache.crop(3)
+    _forward(case.target, cache, [2])
+    assert case.matched == [0, 0, 0]
+    assert cache.base is cache.trial is None
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        torch.tensor([0, 1]),
+        torch.tensor([0, 1, 0], dtype=torch.float32),
+        torch.tensor([1, 1, 1]),
+        torch.tensor([0, 3, 1]),
+        torch.tensor([0, 1, 2]),
+    ],
+)
+def test_bad_kv_metadata_never_commits_token_history(cached_fixture, metadata):
+    case, cache = cached_fixture, cached_fixture.target.new_cache()
+    case.packet_hook = lambda packet: packet.update(kv_reuse_metadata=metadata)
+    with pytest.raises(ValueError, match="KV reuse"):
+        _forward(case.target, cache, [2, 0])
+    assert not cache.tokens
+    assert cache.base is cache.trial is cache.dp_rank is None
+    assert not any(path.exists() for path in case.paths)
+
+
+def test_dp_identity_change_and_failed_commit_are_not_hidden(cached_fixture):
+    case, cache = cached_fixture, cached_fixture.target.new_cache()
+    _forward(case.target, cache, [2, 0])
+    _forward(case.target, cache, [1, 3, 4])
+    cache.crop(3)
+    base = cache.base
+    case.transport_failure = True
+    with pytest.raises(RuntimeError, match="transport failure"):
+        _forward(case.target, cache, [2])
+    assert cache.tokens == [2, 0, 1]
+    assert cache.base == base
+    case.transport_failure = False
+    case.packet_hook = lambda packet: packet.update(
+        kv_reuse_metadata=torch.tensor([2, 1, 0])
+    )
+    with pytest.raises(ValueError, match="DP identity"):
+        _forward(case.target, cache, [2])
+    assert cache.tokens == [2, 0, 1]
+    assert cache.base == base
+
+
+@pytest.fixture
 def block_fixture(target_fixture):
     target = target_fixture.target
     target.verification_mode = "block"
@@ -825,7 +989,8 @@ def block_fixture(target_fixture):
         packet = {
             "token_ids": torch.tensor(prefix, dtype=torch.int64),
             "verification_metadata": torch.tensor(
-                [1, len(prefix), logits_start, hidden_start], dtype=torch.int64
+                [options["version"], len(prefix), logits_start, hidden_start],
+                dtype=torch.int64,
             ),
             "layer_ids": torch.tensor([1, 11, 43], dtype=torch.int64),
             "logprobs": torch.stack(
@@ -836,6 +1001,12 @@ def block_fixture(target_fixture):
             ),
             "hidden_states": _hidden_for(prefix)[hidden_start:].contiguous(),
         }
+        if options.get("output_mode") == "greedy":
+            packet["greedy_token_ids"] = packet.pop("logprobs").argmax(-1)
+        if options.get("profile"):
+            packet["server_timings"] = torch.tensor(
+                [0.25, 0.05, 0.01], dtype=torch.float64
+            )
         case.packet_hook(packet)
         save_file(packet, str(path))
         case.paths.append(path)
@@ -844,7 +1015,7 @@ def block_fixture(target_fixture):
             model=target.model_name,
             choices=[SimpleNamespace(prompt_token_ids=prefix)],
             kv_transfer_params={
-                "dsv4_block_verify_version": 1,
+                "dsv4_block_verify_version": options["version"],
                 "hidden_states_path": str(path),
             },
         )
@@ -1115,6 +1286,75 @@ def test_block_transport_failure_does_not_commit_candidates(block_fixture):
     assert len(case.calls) == case.target.num_target_requests == 2
 
 
+@pytest.mark.parametrize("mode", ["reference", "block", "greedy"])
+@pytest.mark.parametrize(
+    "body", ["", '{"choices":[', '{\r\n"text":"\u793a\u4f8b", "probability":-inf}']
+)
+def test_real_sdk_bad_json_is_captured_without_retry_or_cache_commit(
+    target_fixture, tmp_path, mode, body
+):
+    requests = []
+
+    def reply(request):
+        requests.append(request)
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=body.encode("utf-8"),
+        )
+
+    output_dir = tmp_path / "output"
+    with openai.OpenAI(
+        api_key="fixture-secret-must-not-be-saved",
+        base_url="http://target.invalid/v1",
+        max_retries=0,
+        http_client=httpx.Client(transport=httpx.MockTransport(reply), trust_env=False),
+    ) as client:
+        target = backend.DSV4OfflineTarget.from_contract(
+            target_fixture.report,
+            target_fixture.draft.target_layer_ids,
+            hidden_states_path=tmp_path / "hs",
+            client=client,
+            model_name="fixture-target",
+            max_model_len=64,
+            verification_mode="block" if mode == "greedy" else mode,
+        )
+        if mode == "greedy":
+            target.configure_evaluation(
+                temperature=0.0, requires_target_logits=False, block_output="auto"
+            )
+        cache = target.new_cache()
+        cache.tokens = [2, 0]
+        with (
+            pytest.raises(json.JSONDecodeError) as caught,
+            capture_sample_failure(
+                args=SimpleNamespace(output_dir=output_dir),
+                path=tmp_path / "alpaca.jsonl",
+                dataset="alpaca",
+                selected_index=8,
+                record={"instruction": "fixture"},
+            ),
+        ):
+            _forward(target, cache, [1, 3])
+
+    assert caught.value.doc == body
+    assert len(requests) == target.num_target_requests == 1
+    assert cache.tokens == [2, 0]
+    (path,) = output_dir.glob("errors/*/error.json")
+    error_text = path.read_text(encoding="utf-8")
+    payload = json.loads(error_text)
+    request = payload["sample"]["last_target_request"]
+    sent = json.loads(requests[0].content)
+    assert request["request_id"] == sent["request_id"]
+    assert request["prefix_token_ids"] == sent["prompt"]
+    assert request["prefix_length"] == len(sent["prompt"])
+    assert request["failed_during_rpc"] is True
+    assert request["output_mode"] == ("greedy" if mode == "greedy" else "logprobs")
+    assert "fixture-secret-must-not-be-saved" not in error_text
+    assert "Authorization" not in error_text
+    assert (path.parent / "response_body.txt").read_bytes() == body.encode("utf-8")
+
+
 @pytest.mark.parametrize("mode", ["reference", "block"])
 def test_backend_metadata_identifies_transport_but_not_online_speedup(tmp_path, mode):
     evaluator = _load_evaluator()
@@ -1308,3 +1548,237 @@ def test_block_bad_suffix_packet_does_not_commit_candidates(block_fixture):
         _forward(case.target, cache, [1, 3])
     assert cache.tokens == [2, 0]
     assert not case.paths[-1].exists()
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.7, -1.0])
+@pytest.mark.parametrize("requires_logits", [False, True])
+@pytest.mark.parametrize("policy", ["auto", "full"])
+@pytest.mark.parametrize("mode", ["block", "reference"])
+def test_compact_mode_is_gated_by_all_consumers(
+    target_fixture, temperature, requires_logits, policy, mode
+):
+    target = target_fixture.target
+    target.verification_mode = mode
+    target.configure_evaluation(
+        temperature=temperature,
+        requires_target_logits=requires_logits,
+        block_output=policy,
+    )
+    compact = (
+        mode == "block"
+        and policy == "auto"
+        and temperature == 0
+        and not requires_logits
+    )
+    assert target.block_output_mode == ("greedy" if compact else "logprobs")
+    assert target.block_protocol_version == (2 if compact else 1)
+
+
+@pytest.mark.parametrize("candidates", [[3, 2], [3, 0], [4, 0]])
+@pytest.mark.parametrize("stop_ids", [None, [3]])
+@pytest.mark.parametrize("profile", [False, True])
+def test_compact_acceptance_eos_and_rng_match_full_probabilities(
+    block_fixture, candidates, stop_ids, profile
+):
+    case = block_fixture
+    evaluator = _load_evaluator()
+    case.target.profiler.enabled = profile
+    proposal = evaluator.DraftProposal(
+        draft_token_count=2,
+        verify_input_ids=torch.tensor([[3, *candidates]]),
+        draft_probs=torch.nn.functional.one_hot(torch.tensor([candidates]), 5).float(),
+    )
+    outputs, rng_states = [], []
+    for policy in ("full", "auto"):
+        case.target.configure_evaluation(
+            temperature=0.0, requires_target_logits=False, block_output=policy
+        )
+        cache = case.target.new_cache()
+        prefill = _forward(case.target, cache, [2, 0])
+        torch.manual_seed(781)
+        # Includes the prefill multinomial, all proposal draws and EOS continuation.
+        evaluator.sample_from_probs(evaluator.target_output_to_probs(prefill, 0.0))
+        outputs.append(
+            evaluator.verify_draft_tokens(
+                target_model=case.target,
+                proposal=proposal,
+                position_ids=torch.arange(8).unsqueeze(0),
+                start=2,
+                past_key_values_target=cache,
+                temperature=0.0,
+                max_proposal_tokens=2,
+                current_token_ids=torch.tensor([[3]]),
+                stop_token_ids=stop_ids,
+            )
+        )
+        rng_states.append(torch.get_rng_state())
+        assert cache.tokens == [2, 0, 3, *candidates]
+    for field in (
+        "target_probs",
+        "accept_prefix_mask",
+        "accept_probs",
+        "support_accept_rates",
+        "next_token",
+        "committed_tokens",
+    ):
+        assert torch.equal(getattr(outputs[0], field), getattr(outputs[1], field))
+    for field in (
+        "accepted_draft_tokens",
+        "effective_proposal_length",
+        "terminated_by_stop_token",
+    ):
+        assert getattr(outputs[0], field) == getattr(outputs[1], field)
+    assert torch.equal(*rng_states)
+    assert outputs[1].target_output.logits is None
+    assert all(not path.exists() for path in case.paths)
+    if profile:
+        stats = case.target.profiler.snapshot()
+        assert stats["stages"]["target_rpc"]["calls"] == 4
+        assert stats["stages"]["server_forward"] == {"seconds": 1.0, "calls": 4}
+        assert stats["counters"]["greedy_packets"] == 2
+        assert stats["counters"]["logprobs_packets"] == 2
+        assert stats["counters"]["target_packet_bytes"] > 0
+
+
+@pytest.mark.parametrize(
+    "bad_ids",
+    [
+        torch.tensor([5]),
+        torch.tensor([-1]),
+        torch.tensor([1.0]),
+        torch.tensor([[1]]),
+        torch.tensor([], dtype=torch.int64),
+    ],
+)
+def test_invalid_compact_ids_do_not_commit_cache(block_fixture, bad_ids):
+    case = block_fixture
+    case.target.configure_evaluation(
+        temperature=0.0, requires_target_logits=False, block_output="auto"
+    )
+    cache = case.target.new_cache()
+    _forward(case.target, cache, [2, 0])
+    case.packet_hook = lambda packet: packet.__setitem__("greedy_token_ids", bad_ids)
+    with pytest.raises(ValueError, match="greedy token IDs"):
+        _forward(case.target, cache, [3])
+    assert cache.tokens == [2, 0]
+    assert not case.paths[-1].exists()
+
+
+@pytest.mark.parametrize(
+    "bad_timings",
+    [
+        torch.tensor([1.0, 2.0, 3.0]),
+        torch.tensor([1.0, -1.0, 0.0], dtype=torch.float64),
+        torch.tensor([math.nan, 0.0, 0.0], dtype=torch.float64),
+        torch.tensor([math.inf, 0.0, 0.0], dtype=torch.float64),
+        torch.tensor([0.0], dtype=torch.float64),
+    ],
+)
+def test_invalid_server_timings_do_not_commit_cache(block_fixture, bad_timings):
+    case = block_fixture
+    case.target.profiler.enabled = True
+    case.packet_hook = lambda packet: packet.__setitem__("server_timings", bad_timings)
+    cache = case.target.new_cache()
+    with pytest.raises(ValueError, match="server timings"):
+        _forward(case.target, cache, [2, 0])
+    assert cache.tokens == []
+    assert "server_forward" not in case.target.profiler.stages
+
+
+def test_compact_refuses_stale_server_confirmation(block_fixture):
+    case = block_fixture
+    case.target.configure_evaluation(
+        temperature=0.0, requires_target_logits=False, block_output="auto"
+    )
+    case.response_hook = lambda response: response.kv_transfer_params.update(
+        dsv4_block_verify_version=1
+    )
+    cache = case.target.new_cache()
+    with pytest.raises(ValueError, match="Update/restart"):
+        _forward(case.target, cache, [2, 0])
+    assert cache.tokens == []
+    assert case.paths[
+        -1
+    ].exists()  # Do not remove a file without matching confirmation.
+
+
+def test_compact_output_cannot_be_used_with_nonzero_temperature(block_fixture):
+    target = block_fixture.target
+    target.configure_evaluation(
+        temperature=0.0, requires_target_logits=False, block_output="auto"
+    )
+    output = _forward(target, target.new_cache(), [2, 0])
+    with pytest.raises(ValueError, match="requires temperature=0"):
+        _load_evaluator().target_output_to_probs(output, 1.0)
+
+
+@pytest.mark.parametrize("anchor", [False, True])
+@pytest.mark.parametrize("correction_mode", [None, "logits", "hidden"])
+def test_runner_keeps_real_logits_when_correction_consumes_them(
+    block_fixture, anchor, correction_mode
+):
+    target, draft = block_fixture.target, block_fixture.draft
+    draft.config.sample_from_anchor = anchor
+    draft.block_size = 3
+    draft.use_draft_vocab = False
+    draft.correction_head = (
+        SimpleNamespace(output_mode=correction_mode) if correction_mode else None
+    )
+    evaluator = _load_evaluator()
+    runner = evaluator.DSparkOfflineRunner(
+        target, draft, None, SimpleNamespace(temperature=0.0)
+    )
+    needs_logits = correction_mode == "logits" and not anchor
+    assert runner.uses_initial_correction_logits is needs_logits
+    assert target.block_output_mode == ("logprobs" if needs_logits else "greedy")
+
+
+@pytest.mark.parametrize("max_new_tokens", [1, 2, 5, 9])
+@pytest.mark.parametrize("stop_ids", [None, [3], [2]])
+def test_compact_complete_decode_matches_tokens_statistics_and_rng(
+    block_fixture, max_new_tokens, stop_ids
+):
+    target = block_fixture.target
+    evaluator = _load_evaluator()
+    results, rng_states = [], []
+
+    def propose(*, context, output_ids, position_ids, start, stop_token_ids):
+        probabilities = torch.nn.functional.one_hot(torch.tensor([[2, 4]]), 5).float()
+        candidates = evaluator.sample_from_probs(probabilities)
+        return evaluator.DraftProposal(
+            draft_token_count=2,
+            verify_input_ids=torch.cat(
+                [output_ids[:, start : start + 1], candidates], 1
+            ),
+            draft_probs=probabilities,
+        )
+
+    for policy in ("full", "auto"):
+        target.configure_evaluation(
+            temperature=0.0, requires_target_logits=False, block_output=policy
+        )
+        torch.manual_seed(713)
+        results.append(
+            evaluator.generate_decoding_sample(
+                target_model=target,
+                input_ids=torch.tensor([[1, 0]]),
+                max_new_tokens=max_new_tokens,
+                max_proposal_tokens=2,
+                temperature=0.0,
+                stop_token_ids=stop_ids,
+                init_context=lambda **kwargs: None,
+                propose=propose,
+                update=lambda *args: None,
+            )
+        )
+        rng_states.append(torch.get_rng_state())
+    assert torch.equal(results[0].output_ids, results[1].output_ids)
+    for field in (
+        "num_output_tokens",
+        "proposal_lengths",
+        "accepted_draft_lengths",
+        "accept_prob_lists",
+        "support_accept_rate_lists",
+    ):
+        assert getattr(results[0], field) == getattr(results[1], field)
+    assert torch.equal(*rng_states)

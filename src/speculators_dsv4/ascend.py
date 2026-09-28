@@ -4,13 +4,14 @@ Uses a separate architecture so Qwen and the native V4 serving path are untouche
 """
 
 import logging
+from contextlib import nullcontext
 from importlib.metadata import version
 
 import torch
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v4 import AscendDeepseekV4ForCausalLM
 
-from speculators_dsv4.block_protocol import BLOCK_CONNECTOR
+from speculators_dsv4.block_protocol import BLOCK_CONNECTOR, KV_CONNECTOR
 from speculators_dsv4.contract import (
     replace_teacher_hidden,
     validate_config,
@@ -49,12 +50,9 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
                 "not DSpark serving."
             )
         parallel = vllm_config.parallel_config
-        self._block_verify = (
-            getattr(
-                getattr(vllm_config, "kv_transfer_config", None), "kv_connector", None
-            )
-            == BLOCK_CONNECTOR
-        )
+        self._block_verify = getattr(
+            getattr(vllm_config, "kv_transfer_config", None), "kv_connector", None
+        ) in (BLOCK_CONNECTOR, KV_CONNECTOR)
         execution, asynchronous = validate_execution_config(
             vllm_config, block_verify=self._block_verify
         )
@@ -67,9 +65,7 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
         if vllm_config.compilation_config.pass_config.enable_sp:
             raise ValueError("Disable sequence parallelism for DSV4 HS export.")
         super().__init__(vllm_config=vllm_config, prefix=prefix)
-        install_worker_cache_compatibility()
-        if execution == "full-decode-only":
-            install_worker_graph_compatibility()
+        self._install_worker_compatibility(execution)
         self._teacher_pre_norm = None
         self._export_count = None
         self.model.norm.register_forward_pre_hook(self._capture_teacher)
@@ -82,6 +78,17 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
             execution,
             asynchronous,
         )
+
+    def _install_worker_compatibility(self, execution):
+        install_worker_cache_compatibility()
+        if self._block_verify:
+            from speculators_dsv4.block_connector import (  # noqa: PLC0415
+                install_worker_block_layout,
+            )
+
+            install_worker_block_layout()
+        if execution == "full-decode-only":
+            install_worker_graph_compatibility()
 
     def _capture_teacher(self, _module, inputs):
         # Clone before RMSNorm so any backend in-place implementation is harmless.
@@ -106,19 +113,24 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
         if self._export_count is None:
             raise RuntimeError("DSV4 auxiliary HS IDs were not configured.")
         self._teacher_pre_norm = None
-        try:
-            output = super().forward(
-                input_ids, positions, intermediate_tensors, inputs_embeds
+        profiler = None
+        if self._block_verify:
+            from speculators_dsv4.block_connector import (  # noqa: PLC0415
+                block_forward_profiler,
+                export_block,
             )
-            output = replace_teacher_hidden(
-                output, self._teacher_pre_norm, self._export_count
-            )
-            if self._block_verify:
-                from speculators_dsv4.block_connector import (  # noqa: PLC0415
-                    export_block,
-                )
 
-                export_block(self, input_ids, positions, output)
+            profiler = block_forward_profiler(positions.device)
+        try:
+            with profiler.measure("server_forward") if profiler else nullcontext():
+                output = super().forward(
+                    input_ids, positions, intermediate_tensors, inputs_embeds
+                )
+                output = replace_teacher_hidden(
+                    output, self._teacher_pre_norm, self._export_count
+                )
+            if self._block_verify:
+                export_block(self, input_ids, positions, output, profiler=profiler)
             return output
         finally:
             self._teacher_pre_norm = None

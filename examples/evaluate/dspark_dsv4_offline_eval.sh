@@ -12,6 +12,15 @@ set -euo pipefail
 DATASETS="${DATASETS-gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,alpaca,arena-hard-v2}"
 # Empty uses the Qwen evaluator's per-dataset caps; set a number to override.
 : "${MAX_SAMPLES:=}"
+# Auto compacts temperature=0 block results when the draft needs no target logits.
+# Requires the updated block server; full + DSV4_PROFILE=0 uses the old protocol.
+: "${DSV4_BLOCK_OUTPUT:=auto}"
+# Diagnostic mode synchronizes devices and writes timing.json (not serving speed).
+: "${DSV4_PROFILE:=0}"
+# Requires DSV4_KV_REUSE=1 on the dedicated block target too.
+: "${DSV4_KV_REUSE:=0}"
+# Draft-only context/KV cache; independent of target reuse, no server changes.
+: "${DRAFT_KV_REUSE:=0}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -41,6 +50,7 @@ cmd=(
   python3 scripts/evaluate/dspark_offline_eval.py
   --target-backend dsv4-vllm
   --dsv4-verification-mode "${VERIFICATION_MODE:-reference}"
+  --dsv4-block-output "$DSV4_BLOCK_OUTPUT"
   --verifier-model "$VERIFIER_MODEL"
   --draft-model "$DRAFT_MODEL"
   --datasets-root "$DATASETS_ROOT"
@@ -58,6 +68,21 @@ cmd=(
   --dtype bfloat16
   --draft-attn-impl sdpa
 )
+case "$DSV4_PROFILE" in
+  0) ;;
+  1) cmd+=(--dsv4-profile) ;;
+  *) printf '%s\n' 'DSV4_PROFILE must be 0 or 1.' >&2; exit 1 ;;
+esac
+case "$DSV4_KV_REUSE" in
+  0) ;;
+  1) cmd+=(--dsv4-kv-reuse) ;;
+  *) echo 'DSV4_KV_REUSE must be 0 or 1.' >&2; exit 1 ;;
+esac
+case "$DRAFT_KV_REUSE" in
+  0) ;;
+  1) cmd+=(--draft-kv-reuse) ;;
+  *) echo 'DRAFT_KV_REUSE must be 0 or 1.' >&2; exit 1 ;;
+esac
 if [[ -n "$HS_HTTP_ENDPOINT" ]]; then
   cmd+=(--hs-http-endpoint "$HS_HTTP_ENDPOINT")
 fi

@@ -63,6 +63,7 @@ def connector_module(monkeypatch):
     base = ModuleType("vllm.distributed.kv_transfer.kv_connector.v1.base")
     base.KVConnectorBase_V1 = _ConnectorBase
     base.KVConnectorMetadata = _Metadata
+    base.KVConnectorWorkerMetadata = _Metadata
     base.SupportsHMA = _SupportsHMA
     parallel = ModuleType("vllm.distributed.parallel_state")
     group = _TPGroup()
@@ -135,9 +136,189 @@ def _request(*, tokens=None, logits_start=2, hidden_start=1):
 
 
 def _schedule(request):
+    return _schedule_batch([request])
+
+
+@pytest.fixture
+def cached_connector_module(connector_module, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "speculators_dsv4.block_connector", connector_module
+    )
+    path = ROOT / "src/speculators_dsv4/cached_connector.py"
+    spec = importlib.util.spec_from_file_location("dsv4_cached_connector_test", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    module.base_module = connector_module
+    return module
+
+
+def _cached_request(
+    key, *, read=None, tokens=None, logits_start=2, hidden_start=2, release=()
+):
+    request = _request(
+        tokens=tokens, logits_start=logits_start, hidden_start=hidden_start
+    )
+    request.req_id = request.request_id = "cmpl-" + key + "-0"
+    request.sampling_params.extra_args["kv_transfer_params"][
+        "dsv4_block_verify"
+    ].update(
+        version=3,
+        output_mode="logprobs",
+        profile=False,
+        cache={"read": read, "write": key, "release": list(release)},
+    )
+    return request
+
+
+def _allocated(*groups):
     return SimpleNamespace(
-        scheduled_new_reqs=[request],
-        num_scheduled_tokens={request.req_id: len(request.prompt_token_ids)},
+        blocks=tuple(
+            tuple(
+                SimpleNamespace(is_null=index is None, block_id=index or 0)
+                for index in group
+            )
+            for group in groups
+        )
+    )
+
+
+def test_cached_scheduler_worker_round_trip_and_suffix_packet(
+    cached_connector_module, tmp_path
+):
+    module = cached_connector_module
+    spec = type("AscendSlidingWindowMLASpec", (), {"page_size_bytes": 32})()
+    config = SimpleNamespace(
+        num_blocks=16,
+        kv_cache_groups=[SimpleNamespace(layer_names=["state"], kv_cache_spec=spec)],
+    )
+    scheduler = module.DSV4CachedBlockVerifyConnector(
+        _config(tmp_path, max_num_seqs=2), "scheduler", config
+    )
+    worker = module.DSV4CachedBlockVerifyConnector(
+        _config(tmp_path, max_num_seqs=2), "worker", config
+    )
+    state = torch.arange(128, dtype=torch.float32).reshape(16, 8)
+    worker.register_kv_caches({"state": [state]})
+    expected_state = state[1].clone()
+    first = _cached_request("a" * 32, tokens=[1, 2], logits_start=1, hidden_start=0)
+    assert scheduler.get_num_new_matched_tokens(first, 0) == (0, False)
+    scheduler.update_state_after_alloc(first, _allocated([1]), 0)
+    metadata = scheduler.build_connector_meta(_schedule(first))
+    worker.bind_connector_metadata(metadata)
+    worker.start_load_kv()
+    worker.check_ready("cpu")
+    normalized = torch.ones(2, 4, dtype=torch.bfloat16)
+    head_rows = []
+
+    def head(value):
+        head_rows.append(value.clone())
+        return torch.arange(5).float().expand(value.shape[0], -1)
+
+    model = SimpleNamespace(compute_logits=head)
+    worker.capture(
+        model, torch.tensor([1, 2]), torch.arange(2), (normalized, [normalized] * 3)
+    )
+    scheduler.update_connector_output(
+        SimpleNamespace(kv_connector_worker_meta=worker.build_connector_worker_meta())
+    )
+    scheduler.request_finished(first, None)
+    state.fill_(99)  # Freed vLLM pages may immediately be reused by other requests.
+    second = _cached_request("b" * 32, read="a" * 32, release=["a" * 32])
+    assert scheduler.get_num_new_matched_tokens(second, 0) == (2, False)
+    second.num_computed_tokens = 2
+    scheduler.update_state_after_alloc(second, _allocated([7, 8]), 2)
+    scheduled = _schedule(second)
+    scheduled.num_scheduled_tokens[second.req_id] = 2
+    metadata = scheduler.build_connector_meta(scheduled)
+    worker.bind_connector_metadata(metadata)
+    worker.start_load_kv()
+    worker.check_ready("cpu")
+    assert torch.equal(state[7], expected_state)
+    assert state[8].eq(99).all()  # New page must not receive stale ancestor data.
+    worker.capture(
+        model,
+        torch.tensor([3, 4]),
+        torch.tensor([2, 3]),
+        (normalized, [normalized + i for i in range(3)]),
+    )
+    packet = load_file(metadata.requests[0].filename)
+    assert packet["token_ids"].tolist() == [1, 2, 3, 4]
+    assert packet["hidden_states"].shape == (2, 3, 4)
+    assert packet["logprobs"].shape == (2, 5)
+    assert packet["kv_reuse_metadata"].tolist() == [2, 1, 0]
+    assert [rows.shape[0] for rows in head_rows] == [1, 2]
+    scheduler.update_connector_output(
+        SimpleNamespace(kv_connector_worker_meta=worker.build_connector_worker_meta())
+    )
+    assert set(scheduler._snapshots) == {"b" * 32}
+    # Feedback removes an evicted handle, so the NEXT scheduled request really
+    # computes the full prefix rather than trying to load an absent snapshot.
+    worker.shutdown()
+    scheduler.update_connector_output(
+        SimpleNamespace(kv_connector_worker_meta=worker.build_connector_worker_meta())
+    )
+    assert scheduler.get_num_new_matched_tokens(second, 0) == (0, False)
+
+
+def test_cached_snapshot_availability_requires_all_tp_ranks(cached_connector_module):
+    cls = cached_connector_module.SnapshotAvailability
+    assert cls({"a", "b"}).aggregate(cls({"b", "c"})).keys == {"b"}
+
+
+def test_stateless_server_rejects_snapshot_protocol(ready):
+    request = _cached_request("a" * 32)
+    with pytest.raises(ValueError, match="--dsv4-kv-reuse"):
+        ready.connector.build_connector_meta(_schedule(request))
+
+
+@pytest.mark.parametrize("case", ["missing", "prefix", "output", "native_apc"])
+def test_snapshot_scheduler_rejects_unsafe_cache_reuse(
+    cached_connector_module, tmp_path, case
+):
+    connector = cached_connector_module.DSV4CachedBlockVerifyConnector(
+        _config(tmp_path), "scheduler", None
+    )
+    connector._snapshots["a" * 32] = (1, 2)
+    request = _cached_request("b" * 32, read="a" * 32)
+    if case == "missing":
+        with pytest.raises(ValueError, match="allocation metadata"):
+            connector.build_connector_meta(_schedule(request))
+        return
+    if case == "prefix":
+        request.prompt_token_ids[0] = 0
+    elif case == "output":
+        request.sampling_params.extra_args["kv_transfer_params"]["dsv4_block_verify"][
+            "hidden_start"
+        ] = 0
+    with pytest.raises(ValueError, match="prefix|output rows|prefix caching"):
+        connector.get_num_new_matched_tokens(request, int(case == "native_apc"))
+
+
+def test_restore_failure_is_synchronized_before_forward(
+    cached_connector_module, tmp_path
+):
+    module = cached_connector_module
+    worker = module.DSV4CachedBlockVerifyConnector(_config(tmp_path), "worker", None)
+    metadata = module.base_module.BlockMetadata(
+        [
+            module.CachedBlockRequest(
+                "x", "unused", [1, 2], 1, 1, computed_tokens=1, cache_read="missing"
+            )
+        ]
+    )
+    worker.bind_connector_metadata(metadata)
+    worker.start_load_kv()  # Capture local failure without stranding peers.
+    with pytest.raises(RuntimeError, match="restore failed"):
+        worker.check_ready("cpu")
+
+
+def _schedule_batch(requests):
+    return SimpleNamespace(
+        scheduled_new_reqs=requests,
+        num_scheduled_tokens={
+            request.req_id: len(request.prompt_token_ids) for request in requests
+        },
     )
 
 
@@ -175,7 +356,7 @@ def ready(connector_module, tmp_path):
         output=(normalized, auxiliary),
         calls=calls,
         logits=logits,
-        path=Path(metadata.request.filename),
+        path=Path(metadata.requests[0].filename),
     )
 
 
@@ -183,9 +364,246 @@ def _capture(ready):
     ready.connector.capture(ready.model, ready.input_ids, ready.positions, ready.output)
 
 
+def _batch_ready(
+    module, directory, lengths=(4, 6), *, dp_size=1, dp_rank=0, extended=True
+):
+    connector = module.DSV4BlockVerifyConnector(
+        _config(directory, max_num_seqs=3, dp_size=dp_size, dp_rank=dp_rank),
+        "worker",
+        None,
+    )
+    requests = []
+    for index, length in enumerate(lengths):
+        request = _request(
+            tokens=[index + 1] * length,
+            logits_start=max(0, length - 3),
+            hidden_start=index % length,
+        )
+        request.req_id = f"cmpl-batch-dp{dp_rank}-{index}"
+        if extended:
+            request.sampling_params.extra_args["kv_transfer_params"][
+                "dsv4_block_verify"
+            ].update(
+                version=2,
+                output_mode="greedy" if index % 2 else "logprobs",
+                profile=False,
+            )
+        requests.append(request)
+    metadata = connector.build_connector_meta(_schedule_batch(requests))
+    # Native input preparation may reorder equal-length or unequal-length inputs.
+    # The two NaN tail rows must never appear in any packet or head projection.
+    tokens, positions, hidden, layout = [], [], [], []
+    for index in reversed(range(len(requests))):
+        request = requests[index]
+        length = lengths[index]
+        layout.append((request.req_id, len(tokens), len(tokens) + length))
+        tokens.extend(request.prompt_token_ids)
+        positions.extend(range(length))
+        hidden.append(torch.arange(length * 4).reshape(-1, 4).float() / 8 + index)
+    metadata.forward_layout = layout
+    connector.bind_connector_metadata(metadata)
+    normalized = torch.cat([*hidden, torch.full((2, 4), torch.nan)]).to(torch.bfloat16)
+    auxiliary = [normalized + offset for offset in (10, 20, 30)]
+    weights = torch.arange(20).reshape(4, 5).float() / 40
+    calls = []
+
+    def head(value):
+        calls.append(value.clone())
+        return value.float() @ weights
+
+    return SimpleNamespace(
+        module=module,
+        connector=connector,
+        requests=requests,
+        metadata=metadata,
+        input_ids=torch.tensor(tokens + [0, 0]),
+        positions=torch.tensor(positions + [0, 0]),
+        output=(normalized, auxiliary),
+        model=SimpleNamespace(compute_logits=head),
+        weights=weights,
+        calls=calls,
+    )
+
+
+def _assert_batch_packets(ready):
+    by_id = {request.request_id: request for request in ready.metadata.requests}
+    for request_id, start, end in ready.metadata.forward_layout:
+        request = by_id[request_id]
+        packet = load_file(request.filename)
+        assert packet["token_ids"].tolist() == request.token_ids
+        assert packet["verification_metadata"].tolist() == [
+            request.version,
+            len(request.token_ids),
+            request.logits_start,
+            request.hidden_start,
+        ]
+        expected = torch.log_softmax(
+            ready.output[0][start + request.logits_start : end].float() @ ready.weights,
+            -1,
+        )
+        if request.output_mode == "greedy":
+            assert torch.equal(packet["greedy_token_ids"], expected.argmax(-1))
+            assert "logprobs" not in packet
+        else:
+            torch.testing.assert_close(packet["logprobs"], expected)
+        torch.testing.assert_close(
+            packet["hidden_states"],
+            torch.stack(
+                [
+                    value[start + request.hidden_start : end]
+                    for value in ready.output[1]
+                ],
+                1,
+            ),
+        )
+
+
+@pytest.mark.parametrize("lengths", [(4, 6), (4, 4), (2, 7, 5)])
+@pytest.mark.parametrize("extended", [False, True])
+def test_batch_reorders_and_slices_each_request_with_one_head(
+    connector_module, tmp_path, lengths, extended
+):
+    ready = _batch_ready(connector_module, tmp_path, lengths, extended=extended)
+    _capture(ready)
+    _assert_batch_packets(ready)
+    assert len(ready.calls) == 1
+    assert ready.calls[0].shape == (sum(min(3, length) for length in lengths), 4)
+    assert torch.isfinite(ready.calls[0]).all()
+    assert len(connector_module.test_group.flags) == 2
+    for request in reversed(ready.metadata.requests):
+        _, handle = ready.connector.request_finished(
+            SimpleNamespace(request_id=request.request_id), []
+        )
+        assert handle["hidden_states_path"] == request.filename
+    assert ready.connector._requests == {}
+
+
+def test_batch_identical_prefixes_still_use_native_request_ids(
+    connector_module, tmp_path
+):
+    ready = _batch_ready(connector_module, tmp_path, (4, 4))
+    ready.metadata.requests[1].token_ids = [1] * 4
+    ready.input_ids[:8] = 1
+    _capture(ready)
+    _assert_batch_packets(ready)
+
+
+@pytest.mark.parametrize("failure", ["missing", "duplicate", "unknown", "gap", "size"])
+def test_bad_batch_layout_fails_before_head(connector_module, tmp_path, failure):
+    ready = _batch_ready(connector_module, tmp_path)
+    layout = ready.metadata.forward_layout
+    if failure == "missing":
+        ready.metadata.forward_layout = None
+    elif failure == "duplicate":
+        layout[1] = (layout[0][0], 6, 10)
+    elif failure == "unknown":
+        layout[0] = ("unknown-request", 0, 6)
+    elif failure == "gap":
+        layout[1] = (layout[1][0], 7, 11)
+    else:
+        layout[0] = (layout[0][0], 0, 5)
+    with pytest.raises(RuntimeError, match="packet export failed") as exc_info:
+        _capture(ready)
+    assert "layout" in str(exc_info.value.__cause__)
+    assert not ready.calls
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("field", ["input_ids", "positions"])
+def test_batch_validates_later_prefix_before_any_head_or_publication(
+    connector_module, tmp_path, field
+):
+    ready = _batch_ready(connector_module, tmp_path)
+    getattr(ready, field)[6] += 1
+    with pytest.raises(RuntimeError, match="packet export failed"):
+        _capture(ready)
+    assert not ready.calls
+    assert not list(tmp_path.iterdir())
+
+
+@pytest.mark.parametrize("failure", ["capacity", "invalid_second", "duplicate"])
+def test_scheduler_rejects_entire_invalid_batch_without_registering_ids(
+    connector_module, tmp_path, failure
+):
+    connector = connector_module.DSV4BlockVerifyConnector(
+        _config(tmp_path, max_num_seqs=2), "scheduler", None
+    )
+    requests = [_request() for _ in range(3 if failure == "capacity" else 2)]
+    for index, request in enumerate(requests):
+        request.req_id = f"cmpl-{index}"
+    if failure == "invalid_second":
+        requests[1].num_computed_tokens = 1
+    elif failure == "duplicate":
+        requests[1].req_id = requests[0].req_id
+    with pytest.raises(ValueError):
+        connector.build_connector_meta(_schedule_batch(requests))
+    assert connector._requests == {}
+
+
+def test_worker_layout_hook_uses_post_prepare_order_and_is_scoped_and_idempotent(
+    connector_module, monkeypatch
+):
+    calls = []
+
+    class Runner:
+        def _prepare_inputs(self, schedule, value, *, extra):
+            calls.append((schedule, value, extra))
+            self.input_batch = SimpleNamespace(req_ids=["second", "first"])
+            self.query_start_loc = SimpleNamespace(np=torch.tensor([0, 6, 10, 999]))
+            return "native-result"
+
+    def get_runner(name):
+        assert name == "vllm_ascend.worker.model_runner_v1"
+        return SimpleNamespace(NPUModelRunner=Runner)
+
+    monkeypatch.setattr(connector_module, "import_module", get_runner)
+    connector_module.install_worker_block_layout()
+    wrapped = Runner._prepare_inputs
+    connector_module.install_worker_block_layout()
+    assert Runner._prepare_inputs is wrapped
+    metadata = connector_module.BlockMetadata()
+    for current in (metadata, SimpleNamespace(), None):
+        schedule = SimpleNamespace(kv_connector_metadata=current)
+        assert Runner()._prepare_inputs(schedule, 7, extra=8) == "native-result"
+        assert calls[-1] == (schedule, 7, 8)
+        if current is not None and current is not metadata:
+            assert not hasattr(current, "forward_layout")
+    assert metadata.forward_layout == [("second", 0, 6), ("first", 6, 10)]
+
+
+@pytest.mark.parametrize("profile_flags", [(True, True), (False, True)])
+def test_batch_profiles_share_forward_and_head_time_without_multiplying_work(
+    connector_module, monkeypatch, tmp_path, profile_flags
+):
+    ready = _batch_ready(connector_module, tmp_path)
+    for request, enabled in zip(ready.metadata.requests, profile_flags, strict=True):
+        request.profile = enabled
+    monkeypatch.setattr(connector_module, "has_kv_transfer_group", lambda: True)
+    monkeypatch.setattr(
+        connector_module, "get_kv_transfer_group", lambda: ready.connector
+    )
+    profiler = connector_module.block_forward_profiler("cpu")
+    assert profiler.enabled
+    profiler.record("server_forward", 6.0)
+    # head, then two packet preparations: durations 2, 1, 1 seconds.
+    clock = iter([0.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+    monkeypatch.setattr(
+        "speculators_eval.profiling.time.perf_counter", lambda: next(clock)
+    )
+    ready.connector.capture(
+        ready.model, ready.input_ids, ready.positions, ready.output, profiler=profiler
+    )
+    for request in ready.metadata.requests:
+        packet = load_file(request.filename)
+        if request.profile:
+            assert packet["server_timings"].tolist() == [3.0, 1.0, 1.0]
+        else:
+            assert "server_timings" not in packet
+
+
 def test_scheduler_copies_prefix_and_returns_versioned_handle(ready):
     ready.request.prompt_token_ids[0] = 4
-    assert ready.metadata.request.token_ids == [1, 2, 3, 4]
+    assert ready.metadata.requests[0].token_ids == [1, 2, 3, 4]
     request = SimpleNamespace(request_id=ready.request.req_id)
     delayed, handle = ready.connector.request_finished_all_groups(request, ([], []))
     assert delayed is False
@@ -276,17 +694,17 @@ def test_scheduler_rejects_chunks_cached_work_and_multiple_requests(ready):
     with pytest.raises(ValueError, match="fresh full-prefix"):
         ready.connector.build_connector_meta(scheduled)
     scheduled.scheduled_new_reqs = [request, _request()]
-    with pytest.raises(ValueError, match="only one"):
+    with pytest.raises(ValueError, match="distinct full-prefix"):
         ready.connector.build_connector_meta(scheduled)
     scheduled.scheduled_new_reqs = []
     scheduled.num_scheduled_tokens = {}
-    assert ready.connector.build_connector_meta(scheduled).request is None
+    assert ready.connector.build_connector_meta(scheduled).requests == []
 
 
-def test_connector_requires_single_sequence_and_storage(connector_module, tmp_path):
+def test_connector_requires_positive_capacity_and_storage(connector_module, tmp_path):
     with pytest.raises(ValueError, match="max-num-seqs"):
         connector_module.DSV4BlockVerifyConnector(
-            _config(tmp_path, max_num_seqs=2),
+            _config(tmp_path, max_num_seqs=0),
             "worker",
             None,
         )
@@ -343,7 +761,8 @@ def test_scheduler_caps_head_rows_not_prefix_length(connector_module, tmp_path):
         connector.build_connector_meta(_schedule(request))
     request = _request(tokens=[1] * 129, logits_start=127, hidden_start=0)
     assert (
-        connector.build_connector_meta(_schedule(request)).request.logits_start == 127
+        connector.build_connector_meta(_schedule(request)).requests[0].logits_start
+        == 127
     )
 
 
@@ -521,7 +940,7 @@ def test_atomic_publish_collision_race_preserves_other_artifact(ready, monkeypat
 
 
 def test_root_io_failure_is_collectively_reported(ready, monkeypatch):
-    def fail_write(*args):
+    def fail_write(*args, **kwargs):
         raise OSError("simulated full disk")
 
     monkeypatch.setattr(ready.module, "_save_packet", fail_write)
@@ -575,7 +994,189 @@ class _Collective:
         return result
 
 
-def _run_dp2_round(module, monkeypatch, directory, lengths, *, fault=None):
+@pytest.mark.parametrize("fault_rank", [None, (0, 1), (1, 0)])
+def test_cached_dp2_restore_barrier_includes_idle_engine(
+    cached_connector_module, monkeypatch, tmp_path, fault_rank
+):
+    module = cached_connector_module
+    current = ContextVar("cached_rank")
+    tp_groups, dp_groups = (
+        [_Collective(), _Collective()],
+        [_Collective(), _Collective()],
+    )
+    monkeypatch.setattr(module, "get_tp_group", lambda: tp_groups[current.get()[0]])
+    monkeypatch.setattr(module, "get_dp_group", lambda: dp_groups[current.get()[1]])
+
+    def worker(dp, tp):
+        current.set((dp, tp))
+        connector = module.DSV4CachedBlockVerifyConnector(
+            _config(tmp_path, dp_size=2, dp_rank=dp), "worker", None
+        )
+        # DP1 is idle (no metadata) but must still rendezvous before native MoE.
+        if (dp, tp) == fault_rank:
+            connector._load_error = RuntimeError("rank-local copy failure")
+        try:
+            connector.check_ready("cpu")
+        except RuntimeError as exc:
+            return str(exc)
+        return "ok"
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(worker, dp, tp) for dp in range(2) for tp in range(2)]
+        results = [future.result(timeout=30) for future in futures]
+    assert all(
+        ("restore failed" in result) if fault_rank else result == "ok"
+        for result in results
+    )
+
+
+def test_mixed_cached_and_uncached_batch_respects_worker_reordering(
+    cached_connector_module, tmp_path
+):
+    module = cached_connector_module
+    connector = module.DSV4CachedBlockVerifyConnector(
+        _config(tmp_path, max_num_seqs=2), "worker", None
+    )
+    connector._store = SimpleNamespace(save=lambda *args: True)
+    cached = module.CachedBlockRequest(
+        "cached",
+        str(tmp_path / "cached.safetensors"),
+        [1, 2, 3, 4],
+        2,
+        2,
+        version=3,
+        computed_tokens=2,
+        cache_write="b" * 32,
+    )
+    fresh = module.base_module.BlockRequest(
+        "fresh", str(tmp_path / "fresh.safetensors"), [2, 1, 0], 2, 0
+    )
+    metadata = module.base_module.BlockMetadata(
+        [cached, fresh], forward_layout=[("fresh", 0, 3), ("cached", 3, 5)]
+    )
+    connector.bind_connector_metadata(metadata)
+    hidden = torch.arange(20).reshape(5, 4).to(torch.bfloat16)
+    rows = []
+
+    def head(value):
+        rows.append(value.clone())
+        return value.float() @ torch.arange(20).reshape(4, 5).float() / 100
+
+    connector.capture(
+        SimpleNamespace(compute_logits=head),
+        torch.tensor([2, 1, 0, 3, 4]),
+        torch.tensor([0, 1, 2, 2, 3]),
+        (hidden, [hidden] * 3),
+    )
+    assert torch.equal(rows[0], hidden[2:])
+    cache_packet, fresh_packet = load_file(cached.filename), load_file(fresh.filename)
+    assert torch.equal(
+        cache_packet["hidden_states"], torch.stack([hidden[3:]] * 3, dim=1)
+    )
+    assert torch.equal(
+        fresh_packet["hidden_states"], torch.stack([hidden[:3]] * 3, dim=1)
+    )
+    assert cache_packet["verification_metadata"].tolist() == [3, 4, 2, 2]
+    assert "kv_reuse_metadata" not in fresh_packet
+
+
+@pytest.mark.parametrize(
+    ("lengths", "fault"),
+    [
+        (((4, 6), (3, 7, 5)), None),
+        (((4, 6), ()), None),
+        (((), (3, 7)), None),
+        (((4, 6), (3, 7, 5)), "layout"),
+        (((4, 6), ()), "layout"),
+        (((4, 6), (3, 7)), "pack"),
+        (((4, 6), (3, 7, 5)), "write"),
+        (((4, 6), ()), "write"),
+    ],
+)
+def test_dp2_batched_verification_with_uneven_and_idle_engines(  # noqa: C901
+    connector_module, monkeypatch, tmp_path, lengths, fault
+):
+    module = connector_module
+    current_rank = ContextVar("batched_worker_rank")
+    tp_groups, dp_groups = (
+        [_Collective(), _Collective()],
+        [_Collective(), _Collective()],
+    )
+    monkeypatch.setattr(
+        module, "get_tp_group", lambda: tp_groups[current_rank.get()[0]]
+    )
+    monkeypatch.setattr(
+        module, "get_dp_group", lambda: dp_groups[current_rank.get()[1]]
+    )
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_rank", lambda: current_rank.get()[1]
+    )
+
+    original_pack = module._pack_verification_rows
+
+    def pack_rows(batch, normalized):
+        if fault == "pack" and current_rank.get() == (0, 1):
+            raise RuntimeError("simulated packing allocation failure")
+        return original_pack(batch, normalized)
+
+    monkeypatch.setattr(module, "_pack_verification_rows", pack_rows)
+
+    def worker(dp_rank, tp_rank):
+        current_rank.set((dp_rank, tp_rank))
+        ready = _batch_ready(
+            module, tmp_path, lengths[dp_rank], dp_size=2, dp_rank=dp_rank
+        )
+        if fault == "layout" and (dp_rank, tp_rank) == (0, 1):
+            ready.metadata.forward_layout.reverse()
+        if fault == "write" and (dp_rank, tp_rank) == (0, 0):
+            original = ready.connector._write_output
+
+            def write_packet(request, *args, **kwargs):
+                if request.request_id.endswith("-0"):
+                    raise OSError("second packet write failed")
+                return original(request, *args, **kwargs)
+
+            ready.connector._write_output = write_packet
+
+        def head(hidden):
+            ready.calls.append(hidden.clone())
+            shard = slice(tp_rank * 2, tp_rank * 2 + 2)
+            partial = hidden[:, shard].float() @ ready.weights[shard]
+            logits = tp_groups[dp_rank].all_reduce(partial)
+            return logits if tp_rank == 0 else None
+
+        ready.model.compute_logits = head
+        error = None
+        try:
+            _capture(ready)
+        except RuntimeError as exc:
+            error = exc
+        return ready, dp_rank, tp_rank, error
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(worker, dp, tp) for dp in range(2) for tp in range(2)]
+        workers = [future.result(timeout=30) for future in futures]
+    for ready, dp_rank, tp_rank, error in workers:
+        if fault:
+            assert isinstance(error, RuntimeError)
+            assert "packet export failed" in str(error)
+        else:
+            assert error is None
+            if tp_rank == 0:
+                _assert_batch_packets(ready)
+        projected = bool(lengths[dp_rank]) and not (
+            fault in {"layout", "pack"} and dp_rank == 0
+        )
+        assert len(ready.calls) == int(projected)
+        if projected:
+            assert ready.calls[0].shape[0] == sum(min(3, n) for n in lengths[dp_rank])
+    if not fault:
+        assert len(list(tmp_path.iterdir())) == sum(map(len, lengths))
+
+
+def _run_dp2_round(  # noqa: C901 -- Simulate independent rank/engine failure cases.
+    module, monkeypatch, directory, lengths, *, fault=None, extended=False
+):
     """Four concurrent CPU workers emulate TP2 x DP2 with separate TP/DP groups."""
     current_rank = ContextVar("block_worker_rank")
     tp_groups = [_Collective(), _Collective()]
@@ -605,6 +1206,14 @@ def _run_dp2_round(module, monkeypatch, directory, lengths, *, fault=None):
         auxiliary = [normalized + offset for offset in (10, 20, 30)]
         if length:
             request = _request(tokens=tokens.tolist(), logits_start=length // 2)
+            if extended:
+                request.sampling_params.extra_args["kv_transfer_params"][
+                    "dsv4_block_verify"
+                ].update(
+                    version=2,
+                    output_mode="greedy" if dp_rank == 0 else "logprobs",
+                    profile=True,
+                )
             request.req_id = (
                 "cmpl-collision-0" if fault == "collision" else f"cmpl-dp{dp_rank}-0"
             )
@@ -620,7 +1229,7 @@ def _run_dp2_round(module, monkeypatch, directory, lengths, *, fault=None):
             metadata.data_parallel_rank = 1
         if fault == "write" and (dp_rank, tp_rank) == (0, 0):
 
-            def fail_write(*_args):
+            def fail_write(*_args, **_kwargs):
                 raise OSError("simulated DP0 full disk")
 
             connector._write_output = fail_write
@@ -670,11 +1279,12 @@ def _run_dp2_round(module, monkeypatch, directory, lengths, *, fault=None):
         ((4, 0), "empty_metadata"),
     ],
 )
+@pytest.mark.parametrize("extended", [False, True])
 def test_dp2_uneven_and_idle_engines_keep_packets_and_native_logits_local(
-    connector_module, monkeypatch, tmp_path, lengths, fault
+    connector_module, monkeypatch, tmp_path, lengths, fault, extended
 ):
     workers, weights = _run_dp2_round(
-        connector_module, monkeypatch, tmp_path, lengths, fault=fault
+        connector_module, monkeypatch, tmp_path, lengths, fault=fault, extended=extended
     )
     for worker in workers:
         assert worker.error is None
@@ -682,16 +1292,20 @@ def test_dp2_uneven_and_idle_engines_keep_packets_and_native_logits_local(
         assert worker.calls == ([length - length // 2] if length else [])
         if not length or worker.tp_rank:
             continue
-        request = worker.metadata.request
+        request = worker.metadata.requests[0]
         assert worker.metadata.data_parallel_rank == worker.dp_rank
         packet = load_file(request.filename)
         assert packet["token_ids"].tolist() == [1] * length
-        torch.testing.assert_close(
-            packet["logprobs"],
-            torch.log_softmax(
-                worker.normalized[request.logits_start :].float() @ weights, -1
-            ),
+        expected = torch.log_softmax(
+            worker.normalized[request.logits_start :].float() @ weights, -1
         )
+        if extended and worker.dp_rank == 0:
+            assert torch.equal(packet["greedy_token_ids"], expected.argmax(-1))
+            assert "logprobs" not in packet
+        else:
+            torch.testing.assert_close(packet["logprobs"], expected)
+        if extended:
+            assert packet["server_timings"].shape == (3,)
         torch.testing.assert_close(
             packet["hidden_states"],
             torch.stack([value[1:] for value in worker.auxiliary], 1),
@@ -741,10 +1355,14 @@ class _TinyDraft(torch.nn.Module):
         )
 
 
+@pytest.mark.parametrize("compact", [False, True])
+@pytest.mark.parametrize("profile", [False, True])
 def test_real_connector_packet_to_offline_target_prefill_and_suffix(
     connector_module,
     tmp_path,
     monkeypatch,
+    compact,
+    profile,
 ):
     """Only HTTP/model execution is faked; both transport ends use real code."""
     connector = connector_module.DSV4BlockVerifyConnector(
@@ -791,7 +1409,7 @@ def test_real_connector_packet_to_offline_target_prefill_and_suffix(
 
         def head(hidden):
             recorded.append(
-                (list(prefix), hidden.shape[0], metadata.request.hidden_start)
+                (list(prefix), hidden.shape[0], metadata.requests[0].hidden_start)
             )
             weights = torch.arange(5, dtype=torch.float32).view(1, -1)
             return hidden[:, :1].float() * weights
@@ -821,7 +1439,12 @@ def test_real_connector_packet_to_offline_target_prefill_and_suffix(
         model_name="test-target",
         max_model_len=64,
         verification_mode="block",
+        profile=profile,
     )
+    if compact:
+        target.configure_evaluation(
+            temperature=0.0, requires_target_logits=False, block_output="auto"
+        )
     cache = target.new_cache()
     prefill = target(
         input_ids=torch.tensor([[1, 2, 3]]),
@@ -838,19 +1461,55 @@ def test_real_connector_packet_to_offline_target_prefill_and_suffix(
     assert recorded == [([1, 2, 3], 1, 0), ([1, 2, 3, 4, 0], 2, 3)]
     assert target.num_target_requests == 2
     assert cache.tokens == [1, 2, 3, 4, 0]
-    assert prefill.logits.shape == (1, 1, 5)
-    assert suffix.logits.shape == (1, 2, 5)
-    torch.testing.assert_close(
-        prefill.logits[0, 0],
-        torch.log_softmax(torch.arange(5).float() * 2, 0),
-    )
-    torch.testing.assert_close(
-        suffix.logits[0],
-        torch.log_softmax(torch.tensor([[3.0], [4.0]]) * torch.arange(5), -1),
-    )
+    if compact:
+        assert prefill.logits is suffix.logits is None
+        assert prefill.greedy_token_ids.tolist() == [[4]]
+        assert suffix.greedy_token_ids.tolist() == [[4, 4]]
+    else:
+        assert prefill.logits.shape == (1, 1, 5)
+        assert suffix.logits.shape == (1, 2, 5)
+        torch.testing.assert_close(
+            prefill.logits[0, 0], torch.log_softmax(torch.arange(5).float() * 2, 0)
+        )
+        torch.testing.assert_close(
+            suffix.logits[0],
+            torch.log_softmax(torch.tensor([[3.0], [4.0]]) * torch.arange(5), -1),
+        )
     assert prefill.hidden_states[1].shape == (1, 3, 4)
     torch.testing.assert_close(
         suffix.hidden_states[1],
         torch.tensor([[[13.0] * 4, [14.0] * 4]], dtype=torch.bfloat16),
     )
     assert list(tmp_path.iterdir()) == []
+
+
+def test_compact_argmax_preserves_logsoftmax_rounding_ties(ready):
+    ready.logits.copy_(torch.tensor([[0.0, 1e-8, 0.0, 0.0, 0.0]]).expand(2, -1))
+    assert ready.logits.argmax(-1).tolist() == [1, 1]
+    expected = ready.logits.log_softmax(-1).argmax(-1)
+    assert expected.tolist() == [0, 0]
+    ready.metadata.requests[0].version = 2
+    ready.metadata.requests[0].output_mode = "greedy"
+    _capture(ready)
+    packet = load_file(str(ready.path))
+    assert torch.equal(packet["greedy_token_ids"], expected)
+    assert "logprobs" not in packet
+
+
+def test_compact_packet_reduces_vocabulary_payload_without_changing_hs(ready):
+    ready.connector._vocab_size = 129280
+    logits = torch.zeros(2, 129280)
+    logits[:, 128000] = 1.0
+    ready.model.compute_logits = lambda hidden: logits
+    _capture(ready)
+    full = load_file(str(ready.path))
+    full_bytes = ready.path.stat().st_size
+    compact_path = ready.path.with_name("cmpl-compact-0.safetensors")
+    ready.metadata.requests[0].filename = str(compact_path)
+    ready.metadata.requests[0].version = 2
+    ready.metadata.requests[0].output_mode = "greedy"
+    _capture(ready)
+    compact = load_file(str(compact_path))
+    assert compact["greedy_token_ids"].tolist() == [128000, 128000]
+    assert torch.equal(compact["hidden_states"], full["hidden_states"])
+    assert compact_path.stat().st_size < full_bytes / 100

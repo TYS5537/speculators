@@ -16,9 +16,17 @@ from types import SimpleNamespace
 from uuid import uuid4
 
 from speculators_dsv4 import HS_FORMAT
-from speculators_dsv4.block_protocol import BLOCK_PROTOCOL_VERSION, BLOCK_REQUEST_KEY
+from speculators_dsv4.block_protocol import (
+    BLOCK_EXTENDED_VERSION,
+    BLOCK_KV_VERSION,
+    BLOCK_PROFILE_STAGES,
+    BLOCK_PROTOCOL_VERSION,
+    BLOCK_REQUEST_KEY,
+)
 from speculators_dsv4.contract import make_manifest, validate_layers
 from speculators_dsv4.eval_contract import read_eval_manifest
+from speculators_eval.diagnostics import capture_target_request
+from speculators_eval.profiling import EvaluationProfiler
 
 _LOGPROB_POSITIVE_TOLERANCE = 1e-6
 _TOKEN_BATCH_NDIM = 2
@@ -113,6 +121,7 @@ class DSV4OfflineTarget:
         verification_mode="reference",
         hs_http_endpoint=None,
         hs_http_token=None,
+        profile=False,
     ):
         import torch  # noqa: PLC0415
 
@@ -138,6 +147,7 @@ class DSV4OfflineTarget:
             verification_mode=verification_mode,
             hs_http_endpoint=hs_http_endpoint,
             hs_http_token=hs_http_token,
+            profile=profile,
         )
 
     @classmethod
@@ -155,6 +165,7 @@ class DSV4OfflineTarget:
         verification_mode="reference",
         hs_http_endpoint=None,
         hs_http_token=None,
+        profile=False,
     ):
         """Create strict CPU transport for teacher diagnostics without a drafter."""
         import torch  # noqa: PLC0415
@@ -174,6 +185,7 @@ class DSV4OfflineTarget:
             verification_mode=verification_mode,
             hs_http_endpoint=hs_http_endpoint,
             hs_http_token=hs_http_token,
+            profile=profile,
         )
         return target
 
@@ -191,6 +203,7 @@ class DSV4OfflineTarget:
         verification_mode,
         hs_http_endpoint,
         hs_http_token,
+        profile,
     ):
         self.layer_ids = list(layer_ids)
         validate_layers(self.layer_ids)
@@ -227,6 +240,8 @@ class DSV4OfflineTarget:
         self.timeout = timeout
         self.keep_hidden_states = keep_hidden_states
         self.verification_mode = verification_mode
+        self.block_output_mode = "logprobs"
+        self.profiler = EvaluationProfiler(enabled=profile, device=self.device)
         self.num_target_requests = 0
         generation = dict(report["config"])
         generation_path = Path(report["model_path"]) / "generation_config.json"
@@ -246,6 +261,41 @@ class DSV4OfflineTarget:
     @staticmethod
     def new_cache():
         return TokenHistoryCache()
+
+    def configure_evaluation(
+        self, *, temperature, requires_target_logits, block_output
+    ):
+        """Compact output is safe only when no draft consumer needs target logits."""
+        if block_output not in ("auto", "full"):
+            raise ValueError("DSV4 block output must be auto or full")
+        self.block_output_mode = (
+            "greedy"
+            if self.verification_mode == "block"
+            and block_output == "auto"
+            and temperature == 0.0
+            and not requires_target_logits
+            else "logprobs"
+        )
+
+    @property
+    def block_protocol_version(self):
+        return (
+            BLOCK_EXTENDED_VERSION
+            if self.block_output_mode == "greedy" or self.profiler.enabled
+            else BLOCK_PROTOCOL_VERSION
+        )
+
+    def _completion(self, **kwargs):
+        self.profiler.count("target_prefix_tokens", len(kwargs["prompt"]))
+        with (
+            capture_target_request(
+                request=kwargs,
+                verification_mode=self.verification_mode,
+                output_mode=self.block_output_mode,
+            ),
+            self.profiler.measure("target_rpc", synchronize=False),
+        ):
+            return self.client.completions.create(**kwargs)
 
     def validate_request_budget(
         self, prompt_length, max_new_tokens, max_proposal_tokens
@@ -312,7 +362,7 @@ class DSV4OfflineTarget:
 
         request_id = self._new_request_id()
         self.num_target_requests += 1
-        response = self.client.completions.create(
+        response = self._completion(
             model=self.model_name,
             prompt=prefix,
             max_tokens=1,
@@ -381,19 +431,26 @@ class DSV4OfflineTarget:
     def _validate_block_packet(self, packet, prefix, logits_start, hidden_start):
         import torch  # noqa: PLC0415
 
+        result_field = (
+            "greedy_token_ids" if self.block_output_mode == "greedy" else "logprobs"
+        )
         expected_fields = {
             "token_ids",
             "verification_metadata",
             "layer_ids",
-            "logprobs",
+            result_field,
             "hidden_states",
         }
+        if self.profiler.enabled:
+            expected_fields.add("server_timings")
+        if self.block_protocol_version == BLOCK_KV_VERSION:
+            expected_fields.add("kv_reuse_metadata")
         if set(packet) != expected_fields:
             raise ValueError("Target block packet has missing or unsupported fields")
         identities = {
             "token_ids": prefix,
             "verification_metadata": [
-                BLOCK_PROTOCOL_VERSION,
+                self.block_protocol_version,
                 len(prefix),
                 logits_start,
                 hidden_start,
@@ -408,8 +465,56 @@ class DSV4OfflineTarget:
                 or value.tolist() != expected
             ):
                 raise ValueError(f"Target block packet {name} identity mismatch")
-        logprobs = packet["logprobs"]
-        expected_logits = (len(prefix) - logits_start, self.vocab_size)
+        result = packet[result_field]
+        if self.block_output_mode == "greedy":
+            if (
+                result.dtype != torch.int64
+                or tuple(result.shape) != (len(prefix) - logits_start,)
+                or not ((result >= 0) & (result < self.vocab_size)).all()
+            ):
+                raise ValueError(
+                    "Target block greedy token IDs have invalid shape/dtype/range"
+                )
+        else:
+            self._validate_block_logprobs(result, len(prefix) - logits_start)
+        hidden = packet["hidden_states"]
+        expected_hidden = (
+            len(prefix) - hidden_start,
+            len(self.packet_layer_ids),
+            self.hidden_size,
+        )
+        if (
+            hidden.dtype != torch.bfloat16
+            or tuple(hidden.shape) != expected_hidden
+            or not torch.isfinite(hidden).all()
+        ):
+            raise ValueError(
+                "Target block hidden states must be finite BF16 with shape "
+                f"{expected_hidden}"
+            )
+        if self.profiler.enabled:
+            self._record_server_timings(packet["server_timings"])
+        return result, hidden
+
+    def _record_server_timings(self, timings):
+        import torch  # noqa: PLC0415
+
+        if (
+            timings.dtype != torch.float64
+            or tuple(timings.shape) != (len(BLOCK_PROFILE_STAGES),)
+            or not torch.isfinite(timings).all()
+            or (timings < 0).any()
+        ):
+            raise ValueError(
+                "Target block server timings must be finite nonnegative float64"
+            )
+        for name, seconds in zip(BLOCK_PROFILE_STAGES, timings.tolist(), strict=True):
+            self.profiler.record(name, seconds)
+
+    def _validate_block_logprobs(self, logprobs, rows):
+        import torch  # noqa: PLC0415
+
+        expected_logits = (rows, self.vocab_size)
         if logprobs.dtype != torch.float32 or tuple(logprobs.shape) != expected_logits:
             raise ValueError(
                 f"Target block logprobs must be float32 with shape {expected_logits}"
@@ -426,29 +531,29 @@ class DSV4OfflineTarget:
             totals, torch.ones_like(totals), rtol=1e-3, atol=1e-5
         ).all():
             raise ValueError("Target block full-vocabulary probabilities must sum to 1")
-        hidden = packet["hidden_states"]
-        expected_hidden = (
-            len(prefix) - hidden_start,
-            len(self.packet_layer_ids),
-            self.hidden_size,
-        )
-        if (
-            hidden.dtype != torch.bfloat16
-            or tuple(hidden.shape) != expected_hidden
-            or not torch.isfinite(hidden).all()
-        ):
-            raise ValueError(
-                "Target block hidden states must be finite BF16 with shape "
-                f"{expected_hidden}"
-            )
-        return logprobs, hidden
 
-    def _request_block(self, prefix, *, logits_start, hidden_start):
+    def _request_block(
+        self, prefix, *, logits_start, hidden_start, cache_options=None, dp_rank=None
+    ):
         from safetensors.torch import load_file  # noqa: PLC0415
 
         request_id = self._new_request_id()
         self.num_target_requests += 1
-        response = self.client.completions.create(
+        options = {
+            "version": self.block_protocol_version,
+            "logits_start": logits_start,
+            "hidden_start": hidden_start,
+        }
+        if self.block_protocol_version >= BLOCK_EXTENDED_VERSION:
+            options.update(
+                output_mode=self.block_output_mode, profile=self.profiler.enabled
+            )
+        headers = {"X-Request-Id": request_id}
+        if cache_options is not None:
+            options["cache"] = cache_options
+        if dp_rank is not None:
+            headers["X-data-parallel-rank"] = str(dp_rank)
+        response = self._completion(
             model=self.model_name,
             prompt=prefix,
             max_tokens=1,
@@ -459,7 +564,7 @@ class DSV4OfflineTarget:
             frequency_penalty=0.0,
             presence_penalty=0.0,
             timeout=self.timeout,
-            extra_headers={"X-Request-Id": request_id},
+            extra_headers=headers,
             extra_body={
                 "request_id": request_id,
                 "top_k": 0,
@@ -470,11 +575,7 @@ class DSV4OfflineTarget:
                 "add_special_tokens": False,
                 "return_token_ids": True,
                 "kv_transfer_params": {
-                    BLOCK_REQUEST_KEY: {
-                        "version": BLOCK_PROTOCOL_VERSION,
-                        "logits_start": logits_start,
-                        "hidden_start": hidden_start,
-                    }
+                    BLOCK_REQUEST_KEY: options,
                 },
             },
         )
@@ -483,20 +584,33 @@ class DSV4OfflineTarget:
         if not isinstance(transfer_params, dict):
             raise ValueError("Target did not return DSV4 block transfer parameters")
         version = transfer_params.get("dsv4_block_verify_version")
-        if type(version) is not int or version != BLOCK_PROTOCOL_VERSION:
+        if type(version) is not int or version != self.block_protocol_version:
             # A legacy service may still own an asynchronous HS writer. Only a
             # confirmed block response promises that it is safe to remove its file.
-            raise ValueError("Target did not confirm the DSV4 block protocol version")
-        with self._artifact(
-            transfer_params.get("hidden_states_path"),
-            request_id,
-            block=True,
-        ) as path:
+            raise ValueError(
+                "Target did not confirm the DSV4 block protocol version. "
+                "Update/restart the matching block server, or disable "
+                "--dsv4-kv-reuse and --dsv4-profile and use "
+                "--dsv4-block-output full for the version-1 compatibility path."
+            )
+        with (
+            self.profiler.measure("target_packet", synchronize=False),
+            self._artifact(
+                transfer_params.get("hidden_states_path"), request_id, block=True
+            ) as path,
+        ):
             if getattr(response.choices[0], "prompt_token_ids", None) != prefix:
                 raise ValueError("Target changed/truncated the requested token prefix")
-            return self._validate_block_packet(
-                load_file(str(path), device="cpu"), prefix, logits_start, hidden_start
+            if self.profiler.enabled:
+                self.profiler.count("target_packet_bytes", path.stat().st_size)
+                self.profiler.count(f"{self.block_output_mode}_packets", 1)
+            packet = load_file(str(path), device="cpu")
+            result = self._validate_block_packet(
+                packet, prefix, logits_start, hidden_start
             )
+            if cache_options is not None:
+                return (*result, packet["kv_reuse_metadata"])
+            return result
 
     def __call__(
         self,
@@ -574,18 +688,32 @@ class DSV4OfflineTarget:
     def _forward_block(self, prefix, old_length, cache, output_hidden_states):
         # The same suffix used by reference verification, with one target request.
         # A fresh prefill only needs the final probability row but all prompt HS.
-        logprobs, hidden = self._request_block(
+        result, hidden = self._request_block(
             prefix,
             logits_start=old_length if old_length else len(prefix) - 1,
             hidden_start=old_length if output_hidden_states else len(prefix),
         )
-        logits = logprobs.unsqueeze(0).to(self.device)
-        states = None
-        if output_hidden_states:
-            states = {
-                layer: hidden[:, slot, :].unsqueeze(0).to(self.device)
-                for slot, layer in enumerate(self.layer_ids)
-            }
+        return self._finish_block(result, hidden, prefix, cache, output_hidden_states)
+
+    def _finish_block(self, result, hidden, prefix, cache, output_hidden_states):
+        with self.profiler.measure("target_to_device"):
+            result = result.unsqueeze(0).to(self.device)
+            states = None
+            if output_hidden_states:
+                states = {
+                    layer: hidden[:, slot, :].unsqueeze(0).to(self.device)
+                    for slot, layer in enumerate(self.layer_ids)
+                }
         # No automatic fallback, and no cache commit before complete validation.
         cache.tokens = prefix
-        return SimpleNamespace(logits=logits, hidden_states=states)
+        if self.block_output_mode == "greedy":
+            # Never masquerade compact IDs as real logits: Correction may consume
+            # target distributions in non-anchor mode. The evaluator gates this
+            # path and reconstructs only the original one-hot greedy probabilities.
+            return SimpleNamespace(
+                logits=None,
+                greedy_token_ids=result,
+                vocab_size=self.vocab_size,
+                hidden_states=states,
+            )
+        return SimpleNamespace(logits=result, hidden_states=states)

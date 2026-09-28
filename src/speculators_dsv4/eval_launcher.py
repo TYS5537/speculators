@@ -79,6 +79,8 @@ class LaunchPlan:
     verification_mode: str
     startup_timeout: float
     shutdown_timeout: float
+    target_max_num_seqs: int
+    target_max_num_batched_tokens: int
     interrupted_signal: int | None = field(default=None, repr=False)
 
     @property
@@ -92,6 +94,8 @@ class LaunchPlan:
             "run_id": self.run_id,
             "mode": f"single-host-managed-{self.verification_mode}",
             "verification_mode": self.verification_mode,
+            "target_kv_reuse": "--dsv4-kv-reuse" in self.target_command,
+            "draft_kv_reuse": "--draft-kv-reuse" in self.eval_command,
             "online_speedup_benchmark": False,
             "output_dir": str(self.output_dir),
             "hidden_states_path": str(self.hidden_states_path),
@@ -103,6 +107,8 @@ class LaunchPlan:
             "eval_num_workers": len(self.eval_devices),
             "shared_device": self.shared_device,
             "target_memory_utilization": self.target_memory_utilization,
+            "target_max_num_seqs": self.target_max_num_seqs,
+            "target_max_num_batched_tokens": self.target_max_num_batched_tokens,
             "runtime_quantization": {"method": self.target_quantization},
             "checkpoint_signature": self.report["checkpoint_signature"],
             "auxiliary_hs_ids": self.layer_ids,
@@ -134,6 +140,18 @@ def parse_args(argv=None):
         help="Comma-separated physical evaluation NPU IDs; one draft worker per NPU",
     )
     parser.add_argument("--target-tp-size", type=int, default=None)
+    parser.add_argument(
+        "--target-max-num-seqs",
+        type=int,
+        default=1,
+        help="Concurrent full prefixes per target engine; defaults to one",
+    )
+    parser.add_argument(
+        "--target-max-num-batched-tokens",
+        type=int,
+        default=None,
+        help="Total prefix-token budget per target step; defaults to max-model-len",
+    )
     parser.add_argument("--target-python", default=sys.executable)
     parser.add_argument("--eval-python", default=sys.executable)
     parser.add_argument("--target-quantization", default=None)
@@ -143,6 +161,11 @@ def parse_args(argv=None):
         default="block",
         help="Block: one full-prefix forward; reference: one request per position",
     )
+    parser.add_argument("--dsv4-block-output", choices=["auto", "full"], default="auto")
+    parser.add_argument("--dsv4-profile", action="store_true")
+    parser.add_argument("--dsv4-kv-reuse", action="store_true")
+    parser.add_argument("--draft-kv-reuse", action="store_true")
+    parser.add_argument("--dsv4-kv-cache-mb", type=int, default=1024)
     parser.add_argument(
         "--target-memory-utilization",
         type=float,
@@ -218,11 +241,29 @@ def _validate_options(args):
         or args.max_model_len <= 1
     ):
         raise ValueError("Invalid sample count, generation length or context limit")
+    _validate_batch_limits(args)
     if not args.datasets_root.exists():
         raise ValueError(f"Dataset path does not exist: {args.datasets_root}")
     for executable in (args.target_python, args.eval_python):
         if not executable or executable.startswith("-") or "\x00" in executable:
             raise ValueError("Specify a Python executable, not shell command arguments")
+
+
+def _validate_batch_limits(args):
+    if getattr(args, "dsv4_kv_reuse", False) and args.verification_mode != "block":
+        raise ValueError("--dsv4-kv-reuse requires block verification")
+    if getattr(args, "dsv4_kv_cache_mb", 1024) <= 0:
+        raise ValueError("--dsv4-kv-cache-mb must be positive")
+    if args.target_max_num_seqs < 1:
+        raise ValueError("--target-max-num-seqs must be positive")
+    if (
+        args.target_max_num_batched_tokens is not None
+        and args.target_max_num_batched_tokens < args.max_model_len
+    ):
+        raise ValueError(
+            "--target-max-num-batched-tokens must be at least max-model-len "
+            "because chunked prefill is disabled"
+        )
 
 
 def _device_config(args):
@@ -302,6 +343,11 @@ def _target_command(
         "--target-layer-ids",
         *map(str, layers),
         *(["--dsv4-block-verify"] if args.verification_mode == "block" else []),
+        *(
+            ["--dsv4-kv-reuse", "--dsv4-kv-cache-mb", str(args.dsv4_kv_cache_mb)]
+            if getattr(args, "dsv4_kv_reuse", False)
+            else []
+        ),
         "--",
         "--tensor-parallel-size",
         str(tp_size),
@@ -315,11 +361,9 @@ def _target_command(
         "--max-model-len",
         str(args.max_model_len),
         "--max-num-batched-tokens",
-        str(args.max_model_len),
+        str(args.target_max_num_batched_tokens or args.max_model_len),
         "--max-num-seqs",
-        # Block export supports one scheduled request. Multiple draft workers
-        # share this target through its request queue, not batched verification.
-        "1",
+        str(args.target_max_num_seqs),
         "--block-size",
         "128",
         "--host",
@@ -358,6 +402,8 @@ def _eval_command(
         "dsv4-vllm",
         "--dsv4-verification-mode",
         args.verification_mode,
+        "--dsv4-block-output",
+        args.dsv4_block_output,
         "--verifier-model",
         report["model_path"],
         "--draft-model",
@@ -393,6 +439,12 @@ def _eval_command(
         "--draft-attn-impl",
         "sdpa",
     ]
+    if args.dsv4_profile:
+        command.append("--dsv4-profile")
+    if getattr(args, "draft_kv_reuse", False):
+        command.append("--draft-kv-reuse")
+    if getattr(args, "dsv4_kv_reuse", False):
+        command.append("--dsv4-kv-reuse")
     if len(eval_devices) > 1:
         command.extend(["--ascend-devices", ",".join(map(str, eval_devices))])
     else:
@@ -480,6 +532,10 @@ def build_plan(args, *, run_id=None, port=None):
         verification_mode=args.verification_mode,
         startup_timeout=args.startup_timeout,
         shutdown_timeout=args.shutdown_timeout,
+        target_max_num_seqs=args.target_max_num_seqs,
+        target_max_num_batched_tokens=(
+            args.target_max_num_batched_tokens or args.max_model_len
+        ),
     )
 
 
@@ -637,10 +693,12 @@ def run_plan(plan):
     plan.hidden_states_path.mkdir(parents=True, exist_ok=False)
     logger.info("Run directory: %s", plan.output_dir)
     logger.info(
-        "Evaluation NPUs: %s (%d draft worker(s)); target requests are queued "
-        "with max-num-seqs=1",
+        "Evaluation NPUs: %s (%d draft worker(s)); target max-num-seqs=%d, "
+        "max-num-batched-tokens=%d",
         plan.eval_devices,
         len(plan.eval_devices),
+        plan.target_max_num_seqs,
+        plan.target_max_num_batched_tokens,
     )
     if plan.shared_device:
         logger.warning(

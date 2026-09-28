@@ -40,6 +40,9 @@ testing, not validated end-to-end support.
   defaults to block verification, with per-position reference verification
   available explicitly. **This has not been validated on A3 hardware and is not
   intended to measure online throughput or speedup.**
+- Optional block-only target KV snapshots with accepted-tail replay, DP affinity
+  and a bounded host-memory cache. Disabled by default; no compressor-state crop,
+  draft checkpoint change or training change. Hardware validation is still needed.
 - A single-command, single-host evaluation launcher that starts the local target,
   waits for readiness, runs evaluation, and cleans up its own child processes.
   It supports separate devices, or explicitly authorized device sharing with a
@@ -581,8 +584,8 @@ DP1/DP2/DP4 numerical comparisons, and they are not throughput benchmarks.
 The ordinary HS/reference service can still enable full-logprob diagnostics
 with `DSV4_EVAL=1`. The automated offline launcher remains DP1-only. The dedicated
 `--dsv4-block-verify` service supports single-host DP1/DP2, with eager execution,
-synchronous scheduling and one scheduled sequence per DP engine. It does not
-support DP4.
+synchronous scheduling and opt-in batching of full prefixes per DP engine
+(one by default). It does not support DP4.
 
 On the trainer host:
 
@@ -898,8 +901,9 @@ evaluation device loads only the current dense drafter and its required target I
 weights, rather than the entire 284B target. Qwen still defaults to
 `--target-backend hf`, with its existing local target and cache paths unchanged.
 
-Both modes recompute the full prefix and never apply `DynamicCache.crop` to V4's
-compressed attention state:
+By default both modes recompute the full prefix and never apply `DynamicCache.crop`
+to V4's compressed attention state. Block mode has a separate experimental
+`DSV4_KV_REUSE=1` option described below:
 
 - `block`: A proposal containing `k` draft tokens sends one target request and
   runs one full-prefix forward pass. A dedicated connector obtains the final
@@ -911,6 +915,11 @@ compressed attention state:
   rows per round by default, including the bonus row. Exceeding this limit raises
   an error to prevent an accidental export of a huge vocabulary tensor for a long
   prefix.
+- With `DSV4_BLOCK_OUTPUT=auto` (the default), temperature-zero block evaluation
+  transfers only the argmax token ID per verification row instead of the full
+  vocabulary, unless Correction consumes target logits. The required BF16 HS are
+  unchanged. Nonzero temperatures and `DSV4_BLOCK_OUTPUT=full` retain complete
+  probabilities. This is a transport optimization, not cached target decoding.
 - `reference`: Retains the original `k+1` full-prefix requests. Each request
   obtains the full-vocabulary raw log-probabilities at its final position, and
   the last request also reads the auxiliary HS. This serves as a correctness
@@ -919,8 +928,8 @@ compressed attention state:
 Both modes use probabilities from the running quantized target for acceptance,
 not probabilities reconstructed by a frozen norm/head on the evaluation device.
 Draft proposals, rejection sampling, and per-position statistics follow the same
-rules. Block mode still prefills the prefix on every round; it does not provide
-incremental KV caching or an online performance implementation. Changing forward
+rules. Default block mode still prefills the prefix on every round; neither mode
+is an online performance implementation. Changing forward
 pass shapes can change floating-point or quantized results. Compare probabilities,
 HS, and sampling boundaries; bitwise equality with reference mode or online
 token-by-token execution is not guaranteed. A mode or service-protocol mismatch
@@ -936,6 +945,261 @@ overwriting an existing file. Unsupported directories or shared filesystems fail
 explicitly, with no fallback to non-atomic writes. Only TP rank 0 publishes files,
 and write failures are synchronized with the other TP ranks. Publication completes
 before the HTTP response, so the client does not read a partially written file.
+
+### Concurrent block verification
+
+The dedicated block service can batch requests from independent draft workers
+in one native target forward. It defaults to `MAX_NUM_SEQS=1` **per DP engine**
+to preserve the previous memory budget. To opt in on the target host:
+
+```bash
+DSV4_BLOCK_VERIFY=1 MAX_NUM_SEQS=2 \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+Keep the existing multi-device `EVAL_NPU` list on the evaluation host and use
+`VERIFICATION_MODE=block`. Those workers already send independent HTTP requests;
+no new client protocol or draft checkpoint is needed. Update/restart only the
+dedicated evaluation server when it is idle, not a service used for training.
+
+`MAX_NUM_SEQS=2` with `DP_SIZE=2` permits up to four scheduled requests across
+the two engines, **not** four requests per TP rank. Actual batches depend on
+queued requests, KV capacity, and `MAX_NUM_BATCHED_TOKENS`: this is the sum of
+full-prefix lengths in a step, per DP engine. The server script retains its
+4096-token default. Two 3000-token prefixes therefore cannot share that step.
+If memory allows, `MAX_NUM_BATCHED_TOKENS=8192` can accommodate two prefixes up
+to the unchanged 4096-token context limit. Raising the budget increases activation
+memory and can cause OOM; start with two sequences and the existing token budget.
+The managed `dspark_dsv4_single_eval.sh` accepts the same two environment variables
+(Python: `--target-max-num-seqs`, `--target-max-num-batched-tokens`) and records
+them in `launcher.json`. It still creates a DP1 target.
+
+The worker maps the native packed-row order back to request IDs after input
+preparation; scheduler-list order is not assumed. Each engine projects all
+verification suffixes in one native TP-head call, then publishes a separate
+probability/HS packet per request. Requests may have different lengths, HS
+offsets and compact/full output modes. Invalid layouts fail before the head;
+TP/DP peers synchronize export failures, including idle engines. No partial
+request is substituted into evaluation results.
+
+Batching changes execution shape, not acceptance rules or sample limits. Compare
+acceptance and outputs against `MAX_NUM_SEQS=1` on the same data: floating-point
+or quantized rounding can still differ, so bitwise equality and a particular
+speedup are not guaranteed. Batching alone does not enable KV reuse; the separate
+snapshot option below is needed to avoid repeated full-prefix forwards.
+
+### Optional target KV reuse (experimental)
+
+Update **both** checkouts. Enable the option on a dedicated, idle evaluation
+server, then on the evaluation client. Do not restart a server used for training.
+Existing model/checkpoint paths, TP8 x DP2 topology, datasets and limits are kept.
+
+```bash
+# Target host. 1024 MiB of cache payload per TP/DP worker in HOST RAM.
+DSV4_BLOCK_VERIFY=1 DSV4_KV_REUSE=1 DSV4_KV_CACHE_MB=1024 \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+
+# Evaluation host. Start with a small A/B validation before a full run.
+VERIFICATION_MODE=block DSV4_KV_REUSE=1 DSV4_PROFILE=1 \
+  MAX_SAMPLES=3 MAX_NEW_TOKENS=128 OUTPUT_DIR=dspark_dsv4_kv_smoke \
+  bash examples/evaluate/dspark_dsv4_offline_eval.sh
+```
+
+The managed `dspark_dsv4_single_eval.sh` forwards `DSV4_KV_REUSE` to both processes
+and `DSV4_KV_CACHE_MB` to the target. Python equivalents are `--dsv4-kv-reuse` and
+server-only `--dsv4-kv-cache-mb`. Defaults remain **off**, and `reference` rejects
+the reuse flag. The snapshot server also accepts ordinary v1/v2 block clients;
+the ordinary block server rejects v3 cached clients instead of silently ignoring
+the option. For the A/B control, use `DSV4_KV_REUSE=0` with the same other settings
+and a different `OUTPUT_DIR`; the cached server can serve both runs.
+
+How this differs from ordinary Qwen cache cropping:
+
+- The first prompt computes the complete prefix. An immutable snapshot holds
+  native C4/C128 attention, SWA, compressor state and indexer scales. Snapshot
+  copies follow validated physical page strides, not guessed tensor layouts.
+  The write-only HS extraction cache is not a target attention dependency and
+  is not copied.
+- Subsequent requests load those pages into newly allocated native vLLM blocks,
+  mark the prefix as externally computed, and forward only new tokens. All
+  attention/compression kernels and target LM-head computation remain native.
+- Full acceptance promotes the trial snapshot. After a rejection, the client
+  restores the previous confirmed snapshot and makes one extra request to replay
+  **only the accepted tail** before the next verification. It never crops or
+  retains a compressor state contaminated by rejected tokens.
+- After the first response, the client pins the sample to its original DP engine
+  with `X-data-parallel-rank`. TP workers retain their own cache pages. Availability
+  is intersected across workers, and restore failures synchronize across TP/DP
+  before model collectives, including idle engines.
+- Each worker retains at most 64 snapshots and the configured byte budget using
+  LRU eviction. Consumed ancestors are released on following requests. Final or
+  abandoned samples can remain in this bounded LRU until eviction/server shutdown;
+  they do not hold vLLM block allocations. If a snapshot has been evicted, the
+  request recomputes the complete prefix. An oversized snapshot is not saved.
+  Budget misses are distinct from protocol, copy or validation errors: those
+  errors stop evaluation, rather than substituting a result or skipping a sample.
+
+`1024` is per target process: TP8 x DP2 can retain approximately **16 GiB host
+RAM** of snapshot payload in total, plus metadata/transient copies. No second
+model-sized persistent NPU cache is allocated; a layer-sized transfer buffer is
+still needed. Copying pages and accepted-tail replay have real costs, so this is
+not an in-place online serving KV implementation and no speedup is guaranteed.
+The draft/Correction head and training path are unchanged.
+
+With `DSV4_PROFILE=1`, `timing.json` adds `kv_reused_tokens`, `kv_computed_tokens`,
+`kv_commit_requests`, `kv_snapshot_misses` and `kv_snapshot_unsaved`. `target_rpc`
+includes page transfers and extra commit requests; the existing `server_forward`
+timer alone does not include snapshot copies. `eval_backend.json` distinguishes
+snapshot replay from full-prefix evaluation.
+
+This is pinned to vLLM 0.26.0 / Ascend 0.26.0rc1 and the existing eager, synchronous
+V1 bridge. CPU tests exercise page remapping, state isolation across rejection,
+bounded eviction, DP affinity and control flow; **Ascend kernel parity and speed
+have not been measured**. Different prefill/decode shapes can change BF16 or
+quantized rounding. Compare generated tokens, acceptance length and probabilities
+on the same short samples before enabling it for reported evaluation results.
+
+### Draft-side context/KV reuse (independent of target reuse)
+
+The evaluator also offers `DRAFT_KV_REUSE=1` (`--draft-kv-reuse`). It is **off by
+default** for on-device A/B validation. Unlike `DSV4_KV_REUSE`, this is local to
+each draft worker, works with both `reference` and `block` targets, and does not
+require target-side changes or a server restart:
+
+```bash
+VERIFICATION_MODE=block DRAFT_KV_REUSE=1 \
+  bash examples/evaluate/dspark_dsv4_offline_eval.sh
+```
+
+The managed single-host script forwards the same variable to the evaluator
+only. Qwen's `dspark_offline_jsonl.sh` also supports it. Keep the existing model
+paths, devices, data, sampling parameters and target settings fixed; compare
+`DRAFT_KV_REUSE=0` and `1` in different output directories. The target snapshot
+switch can stay off or be enabled separately after its own validation.
+
+Each sample caches the token-local fused verifier context and its per-draft-layer
+rotated K/V on the **draft device**, using the existing native attention layers.
+After the initial prompt, only newly confirmed context rows are fused/projected.
+The full attention mask, absolute RoPE positions, sliding-window semantics and
+MMuse block conditioning remain unchanged. All synthetic draft-block K/V and the
+zero anchor placeholder are discarded after every proposal, including fully
+accepted proposals: the next round uses the verifier's real states instead.
+Samples/workers never share this cache. No trained parameter, checkpoint format,
+Correction/Selector computation or training path is changed.
+
+This saves repeated context fusion and K/V projection; it does **not** remove
+attention over the history, dynamic-cache concatenation, target requests, or
+Correction's sequential dependencies. It consumes extra draft-device memory
+proportional to prefix length: approximately one fused hidden vector and two
+K/V vectors per draft layer per context token. Default/linear/YaRN/Llama3 RoPE
+are supported; dynamic, LongRoPE and unknown attention layouts fail explicitly
+when opted in, since older keys may otherwise have the wrong rotation.
+
+With `DSV4_PROFILE=1`, `timing.json` adds `draft_context_reused_tokens` and
+`draft_context_projected_tokens` (the latter includes the one placeholder row per
+round). `draft_propose` measures the complete proposal, not only projections.
+The startup log and `eval_backend.json` record the switch; managed launches also
+record it in `launcher.json`.
+
+Acceptance/support-probability diagnostics now remain on-device until the end of
+each sample, eliminating their two per-round `.tolist()` synchronizations on both
+cached and uncached paths. Their JSON/CSV contents and RNG draw order are retained.
+CPU tests cover native DSpark/MMuse layers, FP32/BF16, full/sliding attention,
+real Correction/Selector proposals and end-to-end decoding. **Ascend throughput
+and numerical parity still require hardware validation**: shorter projection
+shapes can change low-precision rounding, so bitwise equality is not guaranteed.
+
+### Compact greedy results and diagnostic timings
+
+Update both target and evaluation checkouts before using compact block output.
+The server must be restarted to load its updated connector; do not interrupt a
+service used by another job. Version 2 explicitly identifies compact output and
+optional timings. The updated server still accepts version-1 full-probability
+clients. There is no silent protocol fallback. To use an older block server, set
+`DSV4_BLOCK_OUTPUT=full DSV4_PROFILE=0 DSV4_KV_REUSE=0` on the evaluation host.
+
+Compact mode retains the native full-vocabulary LM-head projection and FP32
+log-softmax so rounding-related argmax ties agree with the full path. Only token
+IDs cross the device/host and network boundaries for probability rows; HS still
+cross those boundaries. The evaluator reconstructs the original FP32 one-hot
+probabilities and leaves rejection sampling, RNG draws, EOS handling and metrics
+unchanged. `sample_from_anchor=False` with logits Correction requires real target
+logits, so auto mode retains the full path for that configuration. No checkpoint
+conversion or retraining is required.
+
+Both evaluation scripts support these variables:
+
+```bash
+# Evaluation host: optional synchronized diagnosis, retaining your other settings.
+VERIFICATION_MODE=block DSV4_BLOCK_OUTPUT=auto DSV4_PROFILE=1 \
+  bash examples/evaluate/dspark_dsv4_offline_eval.sh
+
+# Full-probability control run; use a separate output directory.
+VERIFICATION_MODE=block DSV4_BLOCK_OUTPUT=full DSV4_PROFILE=1 \
+  OUTPUT_DIR=dspark_dsv4_full_profile \
+  bash examples/evaluate/dspark_dsv4_offline_eval.sh
+```
+
+`DSV4_PROFILE=1` forwards `--dsv4-profile`, logs cumulative timings after the first
+sample and at normal progress intervals, and writes `timing.json`. Parallel
+workers write their own reports; the parent merges them per dataset. Timings
+include `generation`, `draft_propose`, `target_rpc`, `target_packet` (download,
+read, validation and cleanup), and `target_to_device`. Block mode also reports
+`server_forward`, `server_head` and `server_packet_prepare` (before file
+publication). Counters include output tokens, target prefix tokens and packet
+bytes. Reference mode does not report the block-only transport/server stages.
+For a batch, shared forward/head durations are divided equally among its requests
+so summing reports does not multiply the same target work. These shares are not
+individual request latencies; their call counts count profiled requests, not
+native forwards. If only some requests enable profiling, only their shares are
+reported. Packet preparation remains measured separately per request.
+
+These are **nested, non-additive diagnostic times**, not a serving benchmark:
+`target_rpc` includes queueing, server computation/export and HTTP overhead;
+its server sub-stages do not measure queue time separately. Worker totals sum
+work across concurrent processes, not dataset wall time. Model loading is outside
+these timers. Profiling synchronizes devices and adds overhead, so leave
+`DSV4_PROFILE=0` (the default) for ordinary evaluation/timing comparisons. Neither
+compact output nor profiling changes the configured batch capacity, full-prefix
+recomputation, sample caps or generation budget. Hardware parity and throughput
+still require an Ascend run.
+
+### Failed samples and malformed HTTP responses
+
+Evaluation captures prompt-formatting and generation exceptions, then re-raises
+the original error: **no automatic retry, skipped sample, or replacement result**.
+Successful samples do not write diagnostic files. Failure capture is always on,
+independent of `DSV4_PROFILE`, `--skip-artifacts`, and the progress display.
+
+On the evaluation host, the error log prints an absolute diagnostic directory:
+
+- Single worker: `$OUTPUT_DIR/errors/sample-<selected-index>-<unique-id>/`
+- Parallel workers: `$OUTPUT_DIR/_shards/<dataset>/shard_<worker>/errors/sample-.../`
+
+`error.json` records the dataset and record, **1-based index after selection and
+shuffling** (not the original JSONL line or completed-progress count), 0-based
+worker shard, device assignment, sampling settings, and exception. For DSV4 it
+also includes the latest request ID, full prefix token IDs, block protocol
+options, and whether the exception happened inside the RPC. A later draft/packet
+failure must not be interpreted as a failed RPC just because a prior request is
+listed. Use the request ID to correlate with the target host's service log.
+With `DSV4_PROFILE=1`, the error report also retains this worker's cumulative
+dataset timings, even though the dataset did not finish. These are not per-sample
+timings and include failed client calls.
+
+For `JSONDecodeError`, `response_body.txt` saves the decoded response text from
+the exception, not the original wire bytes. `error.json` includes its length,
+failure position/line/column and a short surrounding snippet. The offset counts
+Unicode characters, not UTF-8 bytes. HTTP 200 alone does not prove valid JSON;
+inspect this capture before blaming a prompt, NaN, or a particular operator.
+
+Artifacts contain sample and response data; review/redact them before sharing.
+Only allowlisted request/settings fields are saved, never client objects,
+authentication headers or bearer-token environment variables. POSIX diagnostic
+directories are created with mode `0700`. If saving fails (for example, a full
+disk), a warning is logged and the original evaluation error is still raised.
+This does not create a server log or alter the target service; its logs remain
+on the target host.
 
 ### Single-host entry point (start with a few samples)
 
@@ -1013,10 +1277,12 @@ Duplicate/invalid device IDs are rejected, and overlap checks cover **all**
 evaluation devices. `launcher.json` records `eval_devices` and `eval_num_workers`;
 the legacy `eval_device` remains an integer for one worker and is null for many.
 
-This is draft-side data parallelism, **not eight-way batched target verification**.
-The target keeps `--max-num-seqs 1`, as required by the block connector; concurrent
-clients queue their target requests. More draft workers do not guarantee linear
-speedup and may require a larger `TARGET_REQUEST_TIMEOUT` for queueing. Multiple
+This is draft-side data parallelism; it does not automatically set eight-way
+target batching. The target defaults to `--max-num-seqs 1`; set `MAX_NUM_SEQS=2`
+and budget `MAX_NUM_BATCHED_TOKENS` to opt in to batched target verification.
+Excess concurrent clients queue their requests. More draft workers do not
+guarantee linear speedup and may require a larger `TARGET_REQUEST_TIMEOUT` for
+queueing. Multiple
 workers, like the single-worker launcher, still need real A3 runtime validation.
 Failed worker startup or evaluation stops its siblings; the managed launcher also
 cleans up its owned process group and target. No unrelated service is stopped.
@@ -1085,7 +1351,7 @@ and `--dry-run`.
 By default, the single entry point enables `--dsv4-block-verify` on the target and
 `--dsv4-verification-mode block` on the client. `--max-logprobs 0` disables the
 unneeded full-vocabulary HTTP response allowance; raw probabilities in the file
-are unaffected. The service enforces `max_num_seqs=1` and accepts only requests
+are unaffected. The service defaults to `max_num_seqs=1` and accepts only requests
 using the block-verification protocol with `max_tokens=1`. It cannot also serve
 training HS collection or ordinary generation. Setting
 `--verification-mode reference` (or `VERIFICATION_MODE=reference` in the shell)
@@ -1253,8 +1519,10 @@ VERIFICATION_MODE=block EVAL_NPU=0 MAX_SAMPLES=4 MAX_NEW_TOKENS=64 \
 `DSV4_BLOCK_VERIFY=1` adds `--dsv4-block-verify` before the launcher's `--`, takes
 precedence over `DSV4_EVAL`, and uses `--max-logprobs 0 --generation-config vllm`.
 It defaults `MAX_NUM_SEQS` to **1 per DP engine** (two simultaneous prefixes at
-DP2), preserving 64 for training/reference. An explicit incompatible value is
-rejected, as are DP4, graph mode and async scheduling. `TP_SIZE=8`, `DP_SIZE=2`,
+DP2), preserving 64 for training/reference. Explicit positive values enable
+batched verification; DP4, graph mode and async scheduling remain rejected.
+`MAX_NUM_BATCHED_TOKENS` defaults to 4096 per engine; increase only with sufficient
+memory. `TP_SIZE=8`, `DP_SIZE=2`,
 paths and the saved endpoint remain unchanged. The evaluator's `EVAL_NPU` worker
 count is independent of target DP. Sixteen draft workers queue against two target
 engines, not sixteen target replicas.
@@ -1458,6 +1726,7 @@ Environments with the full training dependencies should also run:
 pytest tests/unit/evaluate/test_dspark_offline_eval.py \
   tests/unit/evaluate/test_dsv4_offline_target.py \
   tests/unit/evaluate/test_dsv4_block_connector.py \
+  tests/unit/evaluate/test_dsv4_kv_snapshots.py \
   tests/unit/evaluate/test_dsv4_teacher_parity.py
 
 pytest tests/unit/models/test_mmuse_optional_features.py \

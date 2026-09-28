@@ -460,6 +460,40 @@ class OfflineEvalDatasetTests(unittest.TestCase):
                     self.assertNotIn("artifact", case.names)
                     self.assertEqual(case.stats.elapsed_s, 0.0)
 
+    def test_failed_selected_record_is_saved_without_retry_or_progress_increment(self):
+        for stage in ("prompt", "draft"):
+            with self.subTest(stage=stage), tempfile.TemporaryDirectory() as directory:
+                output_dir = Path(directory)
+                progress = output_dir / "worker.count"
+                case = _DatasetRun(
+                    self.evaluator,
+                    count=8,
+                    max_samples=5,
+                    worker_shard_index=1,
+                    worker_num_shards=3,
+                    worker_progress_path=progress,
+                    output_dir=output_dir,
+                    no_progress=True,
+                    skip_artifacts=True,
+                )
+                case.fail_at = (stage, 2)
+                with self.assertRaises(RuntimeError) as caught:
+                    case.run()
+                self.assertIs(caught.exception, case.failure)
+                self.assertEqual(case.calls[stage], 2)
+                self.assertEqual(progress.read_text(), "1")
+                (path,) = output_dir.glob("errors/*/error.json")
+                sample = json.loads(path.read_text())["sample"]
+                selected = case.evaluator._select_eval_records(
+                    case.records, dataset_name="custom", max_samples=5, seed=17
+                )
+                self.assertEqual(sample["selected_index"], 5)
+                self.assertEqual(sample["record"], selected[4])
+                self.assertEqual(sample["dataset"], "group/custom")
+                self.assertEqual(sample["worker"]["shard_index"], 1)
+                self.assertEqual(sample["settings"]["seed"], 17)
+                self.assertNotIn("last_target_request", sample)
+
     def test_base_shard_aggregation_uses_max_time_and_retains_zero_time_guard(self):
         rows = [
             reporting.summary_row(

@@ -39,6 +39,9 @@ DSV4_MANIFEST_TIMEOUT="${DSV4_MANIFEST_TIMEOUT:-600}"
 export DSV4_EVAL="${DSV4_EVAL:-1}"  # 0: training HS; 1: reference evaluation.
 # Opt in to a dedicated block service; takes precedence over DSV4_EVAL.
 DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-0}"
+# Optional target KV reuse. Budget is HOST RAM per target process, not NPU HBM.
+DSV4_KV_REUSE="${DSV4_KV_REUSE:-0}"
+DSV4_KV_CACHE_MB="${DSV4_KV_CACHE_MB:-1024}"
 DSV4_EXECUTION_MODE="${DSV4_EXECUTION_MODE:-eager}"
 DSV4_ASYNC_SCHEDULING="${DSV4_ASYNC_SCHEDULING:-0}"
 target_bridge_args=()
@@ -53,14 +56,30 @@ case "$DSV4_BLOCK_VERIFY" in
       echo "Block verification requires eager execution and DSV4_ASYNC_SCHEDULING=0." >&2
       exit 2
     fi
-    MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"  # One prefix per DP engine, not per server.
-    if [[ "$MAX_NUM_SEQS" != 1 ]]; then
-      echo "Block verification requires MAX_NUM_SEQS=1 per DP engine." >&2
+    # Per DP engine. Opt in to 2 or more for batched verification; budget memory
+    # and MAX_NUM_BATCHED_TOKENS for the sum of the complete prefixes in a batch.
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+    if [[ ! "$MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]]; then
+      echo "Block verification requires a positive integer MAX_NUM_SEQS." >&2
       exit 2
     fi
     target_bridge_args=(--dsv4-block-verify)
     ;;
   *) printf '%s\n' 'DSV4_BLOCK_VERIFY must be 0 or 1.' >&2; exit 2 ;;
+esac
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+case "$DSV4_KV_REUSE" in
+  0) ;;
+  1)
+    if [[ "$DSV4_BLOCK_VERIFY" != 1 ]]; then
+      echo "DSV4_KV_REUSE=1 requires DSV4_BLOCK_VERIFY=1." >&2; exit 2
+    fi
+    if [[ ! "$DSV4_KV_CACHE_MB" =~ ^[1-9][0-9]*$ ]]; then
+      echo "DSV4_KV_CACHE_MB must be a positive integer (host MiB per target rank)." >&2; exit 2
+    fi
+    target_bridge_args+=(--dsv4-kv-reuse --dsv4-kv-cache-mb "$DSV4_KV_CACHE_MB")
+    ;;
+  *) echo 'DSV4_KV_REUSE must be 0 or 1.' >&2; exit 2 ;;
 esac
 case "$DSV4_EXECUTION_MODE" in
   eager|full-decode-only) ;;
@@ -129,6 +148,9 @@ printf 'DSV4 HS execution mode: %s; async scheduling: %s\n' \
   "$DSV4_EXECUTION_MODE" "$DSV4_ASYNC_SCHEDULING"
 printf 'DSV4 block verification: %s; max sequences per DP engine: %s\n' \
   "$DSV4_BLOCK_VERIFY" "$MAX_NUM_SEQS"
+printf 'DSV4 prefix-token budget per DP engine per step: %s\n' "$MAX_NUM_BATCHED_TOKENS"
+printf 'DSV4 target KV reuse: %s; host cache budget per rank: %s MiB\n' \
+  "$DSV4_KV_REUSE" "$DSV4_KV_CACHE_MB"
 printf 'DSV4 HS topology: TP=%s, global DP=%s, local DP=%s, start rank=%s, headless=%s\n' \
   "$TP_SIZE" "$DP_SIZE" "$DP_SIZE_LOCAL" "$DP_START_RANK" "$HEADLESS"
 if [[ "$DP_SIZE" == 4 ]]; then
@@ -215,7 +237,7 @@ setsid env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
     --tokenizer-mode deepseek_v4 \
     "${target_http_args[@]}" \
     --max-model-len 4096 \
-    --max-num-batched-tokens 4096 \
+    --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --block-size 128 \
     --additional-config '{"enable_flashcomm1": false, "enable_dsa_cp": false}' &
