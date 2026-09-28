@@ -42,6 +42,8 @@ DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-0}"
 # Optional target KV reuse. Budget is HOST RAM per target process, not NPU HBM.
 DSV4_KV_REUSE="${DSV4_KV_REUSE:-0}"
 DSV4_KV_CACHE_MB="${DSV4_KV_CACHE_MB:-1024}"
+# Greedy trajectory generation + extraction; dedicated replay eval, no snapshots.
+DSV4_GREEDY_REPLAY="${DSV4_GREEDY_REPLAY:-0}"
 DSV4_EXECUTION_MODE="${DSV4_EXECUTION_MODE:-eager}"
 DSV4_ASYNC_SCHEDULING="${DSV4_ASYNC_SCHEDULING:-0}"
 target_bridge_args=()
@@ -56,9 +58,10 @@ case "$DSV4_BLOCK_VERIFY" in
       echo "Block verification requires eager execution and DSV4_ASYNC_SCHEDULING=0." >&2
       exit 2
     fi
-    # Per DP engine. Opt in to 2 or more for batched verification; budget memory
-    # and MAX_NUM_BATCHED_TOKENS for the sum of the complete prefixes in a batch.
-    MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
+    # Per DP engine: DP2 permits up to 32 requests across both engines.
+    # Actual batches also need enough draft clients, KV capacity and token budget.
+    # Override with MAX_NUM_SEQS=1 to restore the earlier low-memory setting.
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
     if [[ ! "$MAX_NUM_SEQS" =~ ^[1-9][0-9]*$ ]]; then
       echo "Block verification requires a positive integer MAX_NUM_SEQS." >&2
       exit 2
@@ -67,6 +70,8 @@ case "$DSV4_BLOCK_VERIFY" in
     ;;
   *) printf '%s\n' 'DSV4_BLOCK_VERIFY must be 0 or 1.' >&2; exit 2 ;;
 esac
+# Keep the token budget separate from the concurrency limit. KV hits compute only
+# the new suffix; cold/missed full prefixes can still queue behind this budget.
 MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
 case "$DSV4_KV_REUSE" in
   0) ;;
@@ -80,6 +85,17 @@ case "$DSV4_KV_REUSE" in
     target_bridge_args+=(--dsv4-kv-reuse --dsv4-kv-cache-mb "$DSV4_KV_CACHE_MB")
     ;;
   *) echo 'DSV4_KV_REUSE must be 0 or 1.' >&2; exit 2 ;;
+esac
+case "$DSV4_GREEDY_REPLAY" in
+  0) ;;
+  1)
+    if [[ "$DSV4_BLOCK_VERIFY" != 1 || "$DSV4_KV_REUSE" != 0 ]]; then
+      echo 'DSV4_GREEDY_REPLAY=1 requires DSV4_BLOCK_VERIFY=1 and DSV4_KV_REUSE=0.' >&2
+      exit 2
+    fi
+    target_bridge_args+=(--dsv4-greedy-replay)
+    ;;
+  *) echo 'DSV4_GREEDY_REPLAY must be 0 or 1.' >&2; exit 2 ;;
 esac
 case "$DSV4_EXECUTION_MODE" in
   eager|full-decode-only) ;;

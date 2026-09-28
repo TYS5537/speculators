@@ -165,6 +165,34 @@ class EvalWorkerTests(unittest.TestCase):
         self.assertEqual(report["counters"]["samples"], 11)
         self.assertEqual(report["stages"]["target_rpc"], {"seconds": 22.0, "calls": 11})
 
+    def test_replay_cache_identity_and_audit_budget_reach_every_worker(self):
+        self.args.dsv4_verification_mode = "replay"
+        self.args.dsv4_replay_cache = self.root / "traces"
+        self.args.dsv4_replay_cache_tag = "runtime-a"
+        self.args.dsv4_replay_audit_samples = 2
+        with (
+            patch.object(
+                eval_parallel.subprocess,
+                "Popen",
+                side_effect=self.fake_completed_worker,
+            ) as launch,
+            patch.dict(
+                self.module.os.environ, {"OPENAI_API_KEY": "fixture-private-key"}
+            ),
+        ):
+            self.module.run_ascend_data_parallel(self.args)
+        self.assertEqual(launch.call_count, 8)
+        for worker in launch.call_args_list:
+            command = worker.args[0]
+            for flag, value in (
+                ("--dsv4-replay-cache", str(self.args.dsv4_replay_cache.resolve())),
+                ("--dsv4-replay-cache-tag", "runtime-a"),
+                ("--dsv4-replay-audit-samples", "2"),
+            ):
+                self.assertEqual(self.flag(command, flag), value)
+            self.assertNotIn("--ascend-devices", command)
+            self.assertNotIn("--dsv4-kv-reuse", command)
+
     def test_eight_workers_merge_uneven_and_empty_shards_in_both_modes(self):
         for mode, endpoint in (
             ("block", None),

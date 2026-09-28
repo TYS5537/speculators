@@ -89,6 +89,42 @@ class LauncherFixture(unittest.TestCase):
 
 
 class PlanningTests(LauncherFixture):
+    def test_replay_selects_dedicated_target_and_forwards_cache_options(self):
+        cache = self.root / "reusable traces"
+        plan = self.plan(
+            "--verification-mode",
+            "replay",
+            "--dsv4-replay-cache",
+            str(cache),
+            "--dsv4-replay-cache-tag",
+            "npu-stack-a",
+            "--dsv4-replay-audit-samples",
+            "2",
+        )
+        self.assertIn("--dsv4-block-verify", plan.target_command)
+        self.assertIn("--dsv4-greedy-replay", plan.target_command)
+        self.assertNotIn("--dsv4-kv-reuse", plan.target_command)
+        self.assertEqual(self.flag(plan.target_command, "--max-logprobs"), "0")
+        self.assertEqual(plan.public_metadata()["verification_mode"], "replay")
+        for option, value in (
+            ("--dsv4-verification-mode", "replay"),
+            ("--dsv4-replay-cache", str(cache.resolve())),
+            ("--dsv4-replay-cache-tag", "npu-stack-a"),
+            ("--dsv4-replay-audit-samples", "2"),
+        ):
+            self.assertEqual(self.flag(plan.eval_command, option), value)
+        self.assertNotIn("--dsv4-greedy-replay", self.plan().target_command)
+
+    def test_replay_conflicts_fail_before_launch(self):
+        for options in (
+            ["--temperature", "1"],
+            ["--dsv4-block-output", "full"],
+            ["--dsv4-kv-reuse"],
+            ["--dsv4-replay-audit-samples", "-1"],
+        ):
+            with self.subTest(options=options), self.assertRaises(ValueError):
+                self.plan("--verification-mode", "replay", *options)
+
     def test_draft_cache_is_eval_only_and_independent_of_target_cache(self):
         default = self.plan()
         self.assertNotIn("--draft-kv-reuse", default.eval_command)

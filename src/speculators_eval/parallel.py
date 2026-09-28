@@ -59,6 +59,17 @@ def target_worker_args(args: argparse.Namespace) -> list[str]:
         result.append("--dsv4-profile")
     if getattr(args, "dsv4_kv_reuse", False):
         result.append("--dsv4-kv-reuse")
+    if getattr(args, "dsv4_verification_mode", "reference") == "replay":
+        result.extend(
+            [
+                "--dsv4-replay-cache",
+                str(args.dsv4_replay_cache.resolve()),
+                "--dsv4-replay-cache-tag",
+                args.dsv4_replay_cache_tag,
+                "--dsv4-replay-audit-samples",
+                str(args.dsv4_replay_audit_samples),
+            ]
+        )
     if args.served_model_name:
         result.extend(["--served-model-name", args.served_model_name])
     if args.keep_target_hs:

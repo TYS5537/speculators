@@ -158,6 +158,7 @@ class LaunchScriptTests(unittest.TestCase):
             "DSV4_EVAL": "0",
             "DSV4_BLOCK_VERIFY": "0",
             "DSV4_KV_REUSE": "0",
+            "DSV4_GREEDY_REPLAY": "0",
             "MAX_NUM_SEQS": "",
             "MAX_NUM_BATCHED_TOKENS": "",
             "DSV4_EXECUTION_MODE": "",
@@ -228,6 +229,28 @@ class LaunchScriptTests(unittest.TestCase):
                 result = self.run_script("server", **overrides)
                 self.assertNotEqual(result.returncode, 0)
 
+    def test_server_replay_is_opt_in_and_cannot_use_host_snapshots(self):
+        result = self.run_script("server", DSV4_BLOCK_VERIFY="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("--dsv4-greedy-replay", self.capture.read_text().splitlines())
+        result = self.run_script(
+            "server", DSV4_BLOCK_VERIFY="1", DSV4_GREEDY_REPLAY="1"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertIn("--dsv4-block-verify", args)
+        self.assertLess(args.index("--dsv4-greedy-replay"), args.index("--"))
+        self.assertNotIn("--dsv4-kv-reuse", args)
+        for overrides in (
+            {"DSV4_GREEDY_REPLAY": "1"},
+            {"DSV4_BLOCK_VERIFY": "1", "DSV4_GREEDY_REPLAY": "bad"},
+            {"DSV4_BLOCK_VERIFY": "1", "DSV4_GREEDY_REPLAY": "1", "DSV4_KV_REUSE": "1"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self.run_script("server", **overrides)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("DSV4_GREEDY_REPLAY", result.stderr)
+
     def test_eval_dataset_and_device_wiring(self):
         for kind, devices in (
             ("offline", "2"),
@@ -296,7 +319,7 @@ class LaunchScriptTests(unittest.TestCase):
                         self.assertEqual(args[args.index("--eval-device") + 1], devices)
                         self.assertEqual(
                             args[args.index("--target-max-num-seqs") + 1],
-                            "2" if "," in devices else "1",
+                            "2" if "," in devices else "16",
                         )
                         self.assertEqual(
                             args[args.index("--target-max-num-batched-tokens") + 1],
@@ -390,6 +413,13 @@ class LaunchScriptTests(unittest.TestCase):
             "DSV4_MAX_MODEL_LEN": ("--dsv4-max-model-len", "4096", "8192"),
             "VERIFICATION_MODE": ("--dsv4-verification-mode", "reference", "block"),
             "DSV4_BLOCK_OUTPUT": ("--dsv4-block-output", "auto", "full"),
+            "DSV4_REPLAY_CACHE": (
+                "--dsv4-replay-cache",
+                "dsv4_greedy_traces",
+                "/fixture/cache traces",
+            ),
+            "DSV4_REPLAY_CACHE_TAG": ("--dsv4-replay-cache-tag", "", "runtime-a"),
+            "DSV4_REPLAY_AUDIT_SAMPLES": ("--dsv4-replay-audit-samples", "0", "2"),
         }
         script = ROOT / "examples/evaluate/dspark_dsv4_offline_eval.sh"
         for use_overrides in (False, True):
@@ -694,13 +724,22 @@ exec() {
                     ("--tensor-parallel-size", "8"),
                     ("--data-parallel-size", dp),
                     ("--data-parallel-size-local", dp),
-                    ("--max-num-seqs", "1"),
+                    ("--max-num-seqs", "16"),
+                    ("--max-num-batched-tokens", "4096"),
                     ("--max-logprobs", "0"),
                     ("--generation-config", "vllm"),
                 ):
                     self.assertEqual(args[args.index(flag) + 1], expected)
                 self.assertNotIn("--logprobs-mode", args)
                 self.assertIn("--no-async-scheduling", args)
+                self.assertIn("max sequences per DP engine: 16", result.stdout)
+
+    def test_server_block_concurrency_can_restore_low_memory_limit(self):
+        result = self.run_script("server", DSV4_BLOCK_VERIFY="1", MAX_NUM_SEQS="1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(args[args.index("--max-num-seqs") + 1], "1")
+        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "4096")
 
     def test_server_rejects_unsafe_block_options_before_launch(self):
         for overrides in (

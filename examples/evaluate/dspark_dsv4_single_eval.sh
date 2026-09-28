@@ -14,8 +14,12 @@ DATASETS="${DATASETS-gsm8k,math500}"
 : "${DSV4_KV_REUSE:=0}"
 : "${DRAFT_KV_REUSE:=0}"  # Draft-only; works with either target mode.
 : "${DSV4_KV_CACHE_MB:=1024}"  # Host RAM per target process.
-# Target defaults to one prefix per step. Opt in to MAX_NUM_SEQS=2;
-# MAX_NUM_BATCHED_TOKENS budgets their summed full lengths (more needs memory).
+: "${DSV4_REPLAY_CACHE:=dsv4_greedy_traces}"
+: "${DSV4_REPLAY_CACHE_TAG:=}"
+: "${DSV4_REPLAY_AUDIT_SAMPLES:=0}"
+# Target concurrency cap is 16 (this managed launcher creates one DP engine).
+# Token budget stays separate: KV hits need only their new suffix; cold prefixes
+# may queue. More concurrent sequences need more KV/activation memory.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -41,9 +45,12 @@ cmd=(
   --eval-device "$EVAL_NPU"
   --verification-mode "${VERIFICATION_MODE:-block}"
   --dsv4-block-output "$DSV4_BLOCK_OUTPUT"
+  --dsv4-replay-cache "$DSV4_REPLAY_CACHE"
+  --dsv4-replay-cache-tag "$DSV4_REPLAY_CACHE_TAG"
+  --dsv4-replay-audit-samples "$DSV4_REPLAY_AUDIT_SAMPLES"
   --port "${VLLM_PORT:-0}"
   --max-model-len "${DSV4_MAX_MODEL_LEN:-4096}"
-  --target-max-num-seqs "${MAX_NUM_SEQS:-1}"
+  --target-max-num-seqs "${MAX_NUM_SEQS:-16}"
   --target-max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS:-${DSV4_MAX_MODEL_LEN:-4096}}"
   --startup-timeout "${STARTUP_TIMEOUT:-1800}"
   --shutdown-timeout "${SHUTDOWN_TIMEOUT:-30}"

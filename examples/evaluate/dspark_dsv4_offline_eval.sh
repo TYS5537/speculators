@@ -2,6 +2,7 @@
 # Experimental DSV4 acceptance-length reference evaluation through an HS server.
 # Start the target with DSV4_EVAL=1 using the matching --dsv4 HS bridge first.
 # VERIFICATION_MODE=block requires a dedicated --dsv4-block-verify target instead.
+# VERIFICATION_MODE=replay requires DSV4_GREEDY_REPLAY=1 on that block target.
 # Only the dense draft and target IO weights are loaded on the evaluation device.
 # Full-prefix target recomputation and file/API transfers are NOT serving speed.
 # Multi-NPU progress is aggregated in one bar, or periodic snapshots under nohup.
@@ -21,6 +22,10 @@ DATASETS="${DATASETS-gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,
 : "${DSV4_KV_REUSE:=0}"
 # Draft-only context/KV cache; independent of target reuse, no server changes.
 : "${DRAFT_KV_REUSE:=0}"
+# VERIFICATION_MODE=replay needs a DSV4_GREEDY_REPLAY=1 target; reuse across drafts.
+: "${DSV4_REPLAY_CACHE:=dsv4_greedy_traces}"
+: "${DSV4_REPLAY_CACHE_TAG:=}"
+: "${DSV4_REPLAY_AUDIT_SAMPLES:=0}"  # First N samples per worker also run live block.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -51,6 +56,9 @@ cmd=(
   --target-backend dsv4-vllm
   --dsv4-verification-mode "${VERIFICATION_MODE:-reference}"
   --dsv4-block-output "$DSV4_BLOCK_OUTPUT"
+  --dsv4-replay-cache "$DSV4_REPLAY_CACHE"
+  --dsv4-replay-cache-tag "$DSV4_REPLAY_CACHE_TAG"
+  --dsv4-replay-audit-samples "$DSV4_REPLAY_AUDIT_SAMPLES"
   --verifier-model "$VERIFIER_MODEL"
   --draft-model "$DRAFT_MODEL"
   --datasets-root "$DATASETS_ROOT"

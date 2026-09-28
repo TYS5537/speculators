@@ -222,6 +222,7 @@ class DSV4OfflineTarget:
             remote_manifest = self.http_transfer.validate_manifest(manifest)
         else:
             remote_manifest = read_eval_manifest(self.hidden_states_path, manifest)
+        self.manifest = remote_manifest
         self.packet_layer_ids = [*self.layer_ids, manifest["teacher_hs_id"]]
         if max_model_len <= 1 or not math.isfinite(timeout) or timeout <= 0:
             raise ValueError("Invalid target context limit or request timeout")

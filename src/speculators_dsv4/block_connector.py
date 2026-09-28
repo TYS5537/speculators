@@ -314,7 +314,8 @@ class DSV4BlockVerifyConnector(KVConnectorBase_V1, SupportsHMA):
         if not metadata.requests:
             return []
         batch = self._batch_layout(metadata)
-        length = sum(request.query_length for request, _ in batch)
+        # A replay connector may interleave native decode rows with extraction.
+        length = max(start + request.query_length for request, start in batch)
         if (
             input_ids is None
             or input_ids.ndim != 1

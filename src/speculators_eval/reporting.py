@@ -37,6 +37,7 @@ RESULT_COLUMNS = [
     "position_support_accept_rate_sums",
     "position_accepted_counts",
     "position_proposed_counts",
+    "probability_diagnostics_available",
 ]
 
 
@@ -51,6 +52,7 @@ class EvalStats:
     position_accepted_counts: list[int] = field(default_factory=list)
     position_accept_prob_sums: list[float] = field(default_factory=list)
     position_support_accept_rate_sums: list[float] = field(default_factory=list)
+    probability_diagnostics_available: bool = True
 
     @property
     def acceptance_length(self) -> float:
@@ -83,6 +85,8 @@ class EvalStats:
 
     @property
     def position_accept_prob_means(self) -> list[float]:
+        if not self.probability_diagnostics_available:
+            return []
         return [
             value / proposed if proposed else 0.0
             for value, proposed in zip(
@@ -94,6 +98,8 @@ class EvalStats:
 
     @property
     def position_support_accept_rate_means(self) -> list[float]:
+        if not self.probability_diagnostics_available:
+            return []
         return [
             value / proposed if proposed else 0.0
             for value, proposed in zip(
@@ -118,6 +124,8 @@ class EvalStats:
             strict=True,
         ):
             self.add_proposal_positions(int(proposal_len), int(accepted_len))
+        if not self.probability_diagnostics_available:
+            return  # Replay knows prefix counts, not off-trajectory probabilities.
         for proposal_len, accept_probs, support_accept_rates in zip(
             proposal_lengths,
             accept_prob_lists,
@@ -233,6 +241,9 @@ def aggregate_rows(dataset: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             position_support_accept_rate_sums[idx] += value
 
     stats = EvalStats(
+        probability_diagnostics_available=all(
+            row.get("probability_diagnostics_available", True) for row in rows
+        ),
         elapsed_s=max((float(row["elapsed_s"]) for row in rows), default=0.0),
         total_output_tokens=sum(int(row["total_output_tokens"]) for row in rows),
         num_proposals=sum(int(row["num_proposals"]) for row in rows),
@@ -288,6 +299,7 @@ def add_base_speedup_metrics(
 def summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str, Any]:
     return {
         "dataset": dataset,
+        "probability_diagnostics_available": stats.probability_diagnostics_available,
         "num_requests": num_requests,
         "elapsed_s": stats.elapsed_s,
         "requests_per_second": num_requests / stats.elapsed_s if stats.elapsed_s else 0,
@@ -310,9 +322,15 @@ def summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str, 
         "position_support_accept_rate_means": json.dumps(
             stats.position_support_accept_rate_means
         ),
-        "position_accept_prob_sums": json.dumps(stats.position_accept_prob_sums),
+        "position_accept_prob_sums": json.dumps(
+            stats.position_accept_prob_sums
+            if stats.probability_diagnostics_available
+            else []
+        ),
         "position_support_accept_rate_sums": json.dumps(
             stats.position_support_accept_rate_sums
+            if stats.probability_diagnostics_available
+            else []
         ),
         "position_accepted_counts": json.dumps(stats.position_accepted_counts),
         "position_proposed_counts": json.dumps(stats.position_proposed_counts),

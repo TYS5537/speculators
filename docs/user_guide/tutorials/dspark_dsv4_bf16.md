@@ -584,8 +584,8 @@ DP1/DP2/DP4 numerical comparisons, and they are not throughput benchmarks.
 The ordinary HS/reference service can still enable full-logprob diagnostics
 with `DSV4_EVAL=1`. The automated offline launcher remains DP1-only. The dedicated
 `--dsv4-block-verify` service supports single-host DP1/DP2, with eager execution,
-synchronous scheduling and opt-in batching of full prefixes per DP engine
-(one by default). It does not support DP4.
+synchronous scheduling and batching per DP engine (the supplied server script
+defaults to a cap of 16). It does not support DP4.
 
 On the trainer host:
 
@@ -949,11 +949,12 @@ before the HTTP response, so the client does not read a partially written file.
 ### Concurrent block verification
 
 The dedicated block service can batch requests from independent draft workers
-in one native target forward. It defaults to `MAX_NUM_SEQS=1` **per DP engine**
-to preserve the previous memory budget. To opt in on the target host:
+in one native target forward. The server script defaults to `MAX_NUM_SEQS=16`
+**per DP engine** in block mode; its training/reference default remains 64.
+Set the limit explicitly on the target host if desired:
 
 ```bash
-DSV4_BLOCK_VERIFY=1 MAX_NUM_SEQS=2 \
+DSV4_BLOCK_VERIFY=1 MAX_NUM_SEQS=16 \
   bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
@@ -962,17 +963,28 @@ Keep the existing multi-device `EVAL_NPU` list on the evaluation host and use
 no new client protocol or draft checkpoint is needed. Update/restart only the
 dedicated evaluation server when it is idle, not a service used for training.
 
-`MAX_NUM_SEQS=2` with `DP_SIZE=2` permits up to four scheduled requests across
-the two engines, **not** four requests per TP rank. Actual batches depend on
-queued requests, KV capacity, and `MAX_NUM_BATCHED_TOKENS`: this is the sum of
-full-prefix lengths in a step, per DP engine. The server script retains its
-4096-token default. Two 3000-token prefixes therefore cannot share that step.
-If memory allows, `MAX_NUM_BATCHED_TOKENS=8192` can accommodate two prefixes up
-to the unchanged 4096-token context limit. Raising the budget increases activation
-memory and can cause OOM; start with two sequences and the existing token budget.
-The managed `dspark_dsv4_single_eval.sh` accepts the same two environment variables
-(Python: `--target-max-num-seqs`, `--target-max-num-batched-tokens`) and records
-them in `launcher.json`. It still creates a DP1 target.
+`MAX_NUM_SEQS=16` with `DP_SIZE=2` permits up to 32 scheduled requests across
+the two engines, **not** 16 requests per TP rank. The current evaluator has one
+synchronous draft worker per listed NPU: 16 evaluation NPUs supply at most 16
+outstanding target requests in total, not 16 per DP engine. A higher target cap
+does not create additional clients or guarantee that every batch fills it.
+
+Actual batches also depend on KV capacity and `MAX_NUM_BATCHED_TOKENS`, the sum
+of tokens computed in one step per DP engine. Without snapshot hits this counts
+full prefixes; a snapshot hit counts only the uncached suffix. The server script
+retains its 4096-token budget rather than multiplying it by the concurrency cap.
+Two uncached 3000-token prefixes therefore cannot share that step, while many
+short cached suffixes can. If memory allows, `MAX_NUM_BATCHED_TOKENS=8192` can
+accommodate two uncached prefixes up to the unchanged 4096-token context limit.
+Raising either limit can increase memory use and cause OOM. Use `MAX_NUM_SEQS=1`
+to restore the earlier low-concurrency configuration; no 16-way A3 memory or
+throughput result is implied by these defaults.
+
+The managed `dspark_dsv4_single_eval.sh` also defaults to a cap of 16 and accepts
+the same two environment variables (Python: `--target-max-num-seqs`,
+`--target-max-num-batched-tokens`), recorded in `launcher.json`. It still creates
+a DP1 target. Direct Python launcher calls retain their conservative default of
+one sequence unless `--target-max-num-seqs` is passed.
 
 The worker maps the native packed-row order back to request IDs after input
 preparation; scheduler-list order is not assumed. Each engine projects all
@@ -1277,9 +1289,9 @@ Duplicate/invalid device IDs are rejected, and overlap checks cover **all**
 evaluation devices. `launcher.json` records `eval_devices` and `eval_num_workers`;
 the legacy `eval_device` remains an integer for one worker and is null for many.
 
-This is draft-side data parallelism; it does not automatically set eight-way
-target batching. The target defaults to `--max-num-seqs 1`; set `MAX_NUM_SEQS=2`
-and budget `MAX_NUM_BATCHED_TOKENS` to opt in to batched target verification.
+This is draft-side data parallelism; it does not guarantee eight-way target
+batches. The shell launchers default to `MAX_NUM_SEQS=16` per target engine;
+`MAX_NUM_BATCHED_TOKENS`, KV capacity and ready requests still bound actual batches.
 Excess concurrent clients queue their requests. More draft workers do not
 guarantee linear speedup and may require a larger `TARGET_REQUEST_TIMEOUT` for
 queueing. Multiple
@@ -1700,6 +1712,93 @@ the head remains a registered module under FSDP. Full-vocabulary runs keep the
 original projection path. CPU regressions do not validate NPU kernel behavior or
 full-model multi-device throughput.
 
+## Experimental greedy trajectory replay
+
+`VERIFICATION_MODE=replay` avoids target RPCs at every speculative round. It first
+asks the native target to generate one greedy trajectory, then extracts and caches
+its auxiliary hidden states. Local replay runs the unchanged draft proposal loop
+against that trajectory, exposing only the committed prefix's hidden states. It
+counts actual accepted prefixes, not the training validation probability-overlap
+proxy. The existing `reference` and `block` modes remain available and unchanged.
+
+This mode requires `TEMPERATURE=0`, `DSV4_BLOCK_OUTPUT=auto`, and a draft that does
+not consume full target logits (for example, non-anchor logits Correction is not
+supported). It rejects target host snapshots and base-speedup measurement. Draft
+KV/context reuse is independent and remains optional. No retraining or checkpoint
+conversion is required.
+
+Restart a **dedicated evaluation target** with the updated checkout:
+
+```bash
+DSV4_BLOCK_VERIFY=1 DSV4_GREEDY_REPLAY=1 DSV4_KV_REUSE=0 \
+  bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+Keep the existing model paths, TP/DP and endpoint settings. Do not restart a target
+that is serving an active training run just to enable this optional evaluator.
+When invoking `scripts/launch_vllm.py` directly, the equivalent new launcher flag is
+`--dsv4-greedy-replay`, alongside `--dsv4 --dsv4-block-verify` and the usual
+`--provenance-dir` for that run. Replay retains the block backend's eager execution
+and no-async/no-chunked-prefill restrictions; it is not a serving-speed benchmark.
+
+On the evaluation machine, first run a small live parity audit:
+
+```bash
+VERIFICATION_MODE=replay DSV4_KV_REUSE=0 DSV4_BLOCK_OUTPUT=auto \
+  DSV4_REPLAY_CACHE=./dsv4_greedy_traces DSV4_REPLAY_CACHE_TAG=stack-v1 \
+  DSV4_REPLAY_AUDIT_SAMPLES=2 EVAL_NPU=0 DATASETS=aime25 MAX_SAMPLES=2 \
+  OUTPUT_DIR=./dsv4_replay_audit \
+  bash examples/evaluate/dspark_dsv4_offline_eval.sh
+```
+
+`DSV4_REPLAY_AUDIT_SAMPLES` runs the first N samples **per worker** through both
+replay and the original live block verifier. Output IDs, every proposal length and
+every accepted-prefix length must match, or evaluation fails. After checking a
+representative set on the actual NPU/runtime, set it to `0` for normal replay and
+restore the desired `EVAL_NPU`, dataset and sample settings. Use a new output
+directory, but keep the same replay cache directory and tag across draft
+checkpoints. The managed single-host script also accepts `VERIFICATION_MODE=replay`
+and these cache/audit options.
+
+Cold-cache work consists of one native greedy generation request plus checked
+hidden-state extraction requests with at most 128 output rows each. Generation
+requests the full `MAX_NEW_TOKENS` budget, then trims locally at the evaluator's
+first stop token; early EOS therefore does not shorten the initial native request.
+Each extracted next-token argmax must match the native trajectory. A mismatch
+fails without publishing that trace; use live `block` evaluation for such cases.
+Increase `TARGET_REQUEST_TIMEOUT` if a complete native generation needs more than
+the default 120 seconds. This changes the timeout, not execution speed.
+
+Warm-cache replay makes no target generation/verification RPCs. Startup and prompt
+formatting still need the target manifest/tokenizer service, so this is not a
+disconnected evaluator. Cache loading and draft computation still take time.
+The trace identity includes target checkpoint/quantization metadata, auxiliary
+layers, tokenized prompt, generation budget, stop IDs and cache tag, but not draft
+weights. Change `DSV4_REPLAY_CACHE_TAG` when changing server software, hardware or
+numeric execution settings: these are not all automatically fingerprinted. Cache
+files are checksum-validated and immutable; an invalid existing entry raises an
+error instead of silently overwriting it.
+
+Use a sufficiently large local disk for `DSV4_REPLAY_CACHE`. Hidden-state storage
+is approximately `(prompt + generated - 1) * layers * hidden_size * 2` bytes per
+sample, plus token IDs/metadata. There is no automatic eviction. With five layers
+and hidden size 4096, 4096 stored positions consume about 160 MiB per sample.
+
+Summary acceptance counts and position acceptance rates use the existing formula.
+Full-probability diagnostics are unavailable: their arrays are empty and
+`probability_diagnostics_available=false`; no off-trajectory probabilities are
+invented. `eval_backend.json` marks replay as experimental. With `DSV4_PROFILE=1`,
+`timing.json` also reports cache hits/misses, trace preparation, local proposals
+and successful audits. Reported elapsed time includes preparation/cache IO/audits,
+not online speculative throughput.
+
+CPU tests cover the control flow, cache integrity and acceptance boundaries, not
+Ascend numerical equivalence or performance. Native decoding and prefills can
+differ numerically; matching argmax during extraction alone does not prove equal
+hidden states or draft acceptance. The optional live audit is necessary when
+validating this experimental path on a new deployment. Keep live `block` results
+as the reference and revert to that mode if the audit fails.
+
 ## Local tests
 
 Control-logic tests that do not require torch:
@@ -1726,6 +1825,7 @@ Environments with the full training dependencies should also run:
 pytest tests/unit/evaluate/test_dspark_offline_eval.py \
   tests/unit/evaluate/test_dsv4_offline_target.py \
   tests/unit/evaluate/test_dsv4_block_connector.py \
+  tests/unit/evaluate/test_dsv4_replay.py \
   tests/unit/evaluate/test_dsv4_kv_snapshots.py \
   tests/unit/evaluate/test_dsv4_teacher_parity.py
 

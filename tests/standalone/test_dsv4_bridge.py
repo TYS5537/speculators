@@ -208,6 +208,34 @@ class RuntimeTests(unittest.TestCase):
             retained.append(auxiliary[-1])
         self.assertEqual([teacher.value for teacher in retained], [7, 8, 9, 10])
 
+    def test_replay_connector_enables_block_hooks_and_execution_guards(self):
+        config = runtime_config()
+        config.kv_transfer_config = SimpleNamespace(kv_connector="DSV4ReplayConnector")
+        config.parallel_config.data_parallel_size = 2
+        config.parallel_config.data_parallel_size_local = 2
+        config.parallel_config.enable_expert_parallel = True
+        connector = ModuleType("speculators_dsv4.block_connector")
+        connector.install_worker_block_layout = Mock()
+        connector.export_block = Mock()
+        connector.block_forward_profiler = Mock(return_value=EvaluationProfiler())
+        with patch.dict(sys.modules, {connector.__name__: connector}):
+            model = self.make_model(config)
+            model.set_aux_hidden_state_layers((1, 11, 21, 30, 40, 43))
+            positions = SimpleNamespace(device="cpu")
+            output = model.forward(None, positions)
+        self.assertTrue(model._block_verify)
+        connector.install_worker_block_layout.assert_called_once_with()
+        connector.export_block.assert_called_once_with(
+            model,
+            None,
+            positions,
+            output,
+            profiler=connector.block_forward_profiler.return_value,
+        )
+        config.scheduler_config.async_scheduling = True
+        with self.assertRaisesRegex(ValueError, "block verification"):
+            self.make_model(config)
+
     def test_block_export_rejects_graph_and_async(self):
         for graph, asynchronous in ((True, False), (False, True), (True, True)):
             config = runtime_config()
@@ -485,6 +513,21 @@ class LauncherTests(unittest.TestCase):
         for extra in (["--dsv4-kv-reuse"], ["--dsv4-kv-cache-mb", "0"]):
             with self.subTest(extra=extra), self.assertRaises(ValueError):
                 self.launch_dsv4(launcher_extra=extra)
+
+    def test_greedy_replay_selects_explicit_connector_and_rejects_conflicts(self):
+        cmd = self.launch_dsv4(block=True, launcher_extra=["--dsv4-greedy-replay"])
+        transfer = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])
+        self.assertEqual(transfer["kv_connector"], "DSV4ReplayConnector")
+        self.assertEqual(
+            transfer["kv_connector_module_path"], "speculators_dsv4.replay_connector"
+        )
+        self.assertNotIn("kv_cache_mb", transfer["kv_connector_extra_config"])
+        for block, extra in (
+            (False, ["--dsv4-greedy-replay"]),
+            (True, ["--dsv4-greedy-replay", "--dsv4-kv-reuse"]),
+        ):
+            with self.subTest(block=block, extra=extra), self.assertRaises(ValueError):
+                self.launch_dsv4(block=block, launcher_extra=extra)
 
     def test_dsv4_passes_quantization_options_unchanged(self):
         for extra, method in (

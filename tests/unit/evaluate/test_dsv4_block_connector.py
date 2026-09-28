@@ -171,6 +171,115 @@ def _cached_request(
     return request
 
 
+@pytest.fixture
+def replay_connector_module(connector_module, monkeypatch):
+    monkeypatch.setitem(
+        sys.modules, "speculators_dsv4.block_connector", connector_module
+    )
+    path = ROOT / "src/speculators_dsv4/replay_connector.py"
+    spec = importlib.util.spec_from_file_location("dsv4_replay_connector_test", path)
+    module = importlib.util.module_from_spec(spec)
+    monkeypatch.setitem(sys.modules, spec.name, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _generation_request():
+    request = _request(tokens=[1, 2])
+    request.req_id = request.request_id = "cmpl-native-0"
+    request.sampling_params.temperature = 0.0
+    request.sampling_params.max_tokens = 20
+    request.sampling_params.extra_args = {
+        "kv_transfer_params": {"dsv4_greedy_trace": {"version": 1}}
+    }
+    return request
+
+
+def test_replay_native_decode_has_no_artifacts(replay_connector_module, tmp_path):
+    module = replay_connector_module
+    connector = module.DSV4ReplayConnector(_config(tmp_path), "scheduler", None)
+    request = _generation_request()
+    metadata = connector.build_connector_meta(_schedule(request))
+    assert metadata.requests == []
+    for length in (1, 2):
+        metadata = connector.build_connector_meta(
+            SimpleNamespace(
+                scheduled_new_reqs=[],
+                num_scheduled_tokens={request.req_id: length},
+            )
+        )
+        connector.bind_connector_metadata(metadata)
+        model = SimpleNamespace(compute_logits=lambda _: pytest.fail("No export head"))
+        hidden = torch.zeros(length, 4, dtype=torch.bfloat16)
+        connector.capture(
+            model,
+            torch.ones(length).long(),
+            torch.arange(length),
+            (hidden, [hidden] * 3),
+        )
+    assert not list(tmp_path.iterdir())
+    assert connector.request_finished(request, [])[1] == {
+        "dsv4_greedy_trace": {"version": 1}
+    }
+    assert not connector._generating
+
+
+def test_replay_mixed_layout_extracts_only_verification_rows(
+    replay_connector_module, tmp_path
+):
+    connector = replay_connector_module.DSV4ReplayConnector(
+        _config(tmp_path, max_num_seqs=2), "scheduler", None
+    )
+    generation = _generation_request()
+    block = _request(tokens=[3, 4], logits_start=1, hidden_start=0)
+    metadata = connector.build_connector_meta(_schedule_batch([block, generation]))
+    # Native worker packs generation first despite the scheduler's list order.
+    metadata.forward_layout = [(generation.req_id, 0, 2), (block.req_id, 2, 4)]
+    connector.bind_connector_metadata(metadata)
+    hidden = torch.arange(16, dtype=torch.bfloat16).reshape(4, 4)
+    rows = []
+
+    def head(value):
+        rows.append(value.clone())
+        return torch.zeros(value.shape[0], 5)
+
+    connector.capture(
+        SimpleNamespace(compute_logits=head),
+        torch.tensor([1, 2, 3, 4]),
+        torch.tensor([0, 1, 0, 1]),
+        (hidden, [hidden] * 3),
+    )
+    torch.testing.assert_close(rows[0], hidden[3:4])
+    packet = load_file(str(tmp_path / f"{block.req_id}.safetensors"))
+    torch.testing.assert_close(packet["hidden_states"][:, 0], hidden[2:4])
+    assert len(list(tmp_path.iterdir())) == 1
+
+
+@pytest.mark.parametrize(
+    "fault", ["temperature", "protocol", "budget", "unknown", "resume"]
+)
+def test_replay_scheduler_fails_closed(replay_connector_module, tmp_path, fault):
+    connector = replay_connector_module.DSV4ReplayConnector(
+        _config(tmp_path), "scheduler", None
+    )
+    request = _generation_request()
+    schedule = _schedule(request)
+    if fault == "temperature":
+        request.sampling_params.temperature = 1.0
+    elif fault == "protocol":
+        request.sampling_params.extra_args["kv_transfer_params"]["dsv4_greedy_trace"][
+            "version"
+        ] = True
+    elif fault == "budget":
+        schedule.num_scheduled_tokens[request.req_id] = 1
+    elif fault == "unknown":
+        schedule.scheduled_new_reqs = []
+    else:
+        connector.build_connector_meta(schedule)
+    with pytest.raises(ValueError):
+        connector.build_connector_meta(schedule)
+
+
 def _allocated(*groups):
     return SimpleNamespace(
         blocks=tuple(

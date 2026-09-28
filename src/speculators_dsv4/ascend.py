@@ -11,7 +11,11 @@ import torch
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.models.deepseek_v4 import AscendDeepseekV4ForCausalLM
 
-from speculators_dsv4.block_protocol import BLOCK_CONNECTOR, KV_CONNECTOR
+from speculators_dsv4.block_protocol import (
+    BLOCK_CONNECTOR,
+    KV_CONNECTOR,
+    REPLAY_CONNECTOR,
+)
 from speculators_dsv4.contract import (
     replace_teacher_hidden,
     validate_config,
@@ -52,7 +56,7 @@ class SpeculatorsDeepseekV4ForCausalLM(AscendDeepseekV4ForCausalLM):
         parallel = vllm_config.parallel_config
         self._block_verify = getattr(
             getattr(vllm_config, "kv_transfer_config", None), "kv_connector", None
-        ) in (BLOCK_CONNECTOR, KV_CONNECTOR)
+        ) in (BLOCK_CONNECTOR, KV_CONNECTOR, REPLAY_CONNECTOR)
         execution, asynchronous = validate_execution_config(
             vllm_config, block_verify=self._block_verify
         )

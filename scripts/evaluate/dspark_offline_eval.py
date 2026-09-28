@@ -385,6 +385,15 @@ def verify_draft_tokens(
         )
 
     draft_token_count = int(proposal.draft_token_count)
+    if getattr(target_model, "is_greedy_replay", False) is True:
+        replayed = target_model.verify_proposal(
+            proposal=proposal,
+            cache=past_key_values_target,
+            start=start,
+            stop_token_ids=stop_token_ids,
+        )
+        if replayed is not None:
+            return VerificationResult(**replayed)
     verify_length = draft_token_count + 1
     target_output = target_model(
         input_ids=proposal.verify_input_ids,
@@ -635,8 +644,16 @@ def generate_decoding_sample(
         num_output_tokens=output_ids.shape[1] - num_input_tokens,
         proposal_lengths=proposal_lengths,
         accepted_draft_lengths=accepted_draft_lengths,
-        accept_prob_lists=_probability_rows_to_lists(accept_prob_rows),
-        support_accept_rate_lists=_probability_rows_to_lists(support_accept_rate_rows),
+        accept_prob_lists=(
+            _probability_rows_to_lists(accept_prob_rows)
+            if getattr(target_model, "probability_diagnostics_available", True)
+            else []
+        ),
+        support_accept_rate_lists=(
+            _probability_rows_to_lists(support_accept_rate_rows)
+            if getattr(target_model, "probability_diagnostics_available", True)
+            else []
+        ),
     )
 
 
@@ -1191,17 +1208,29 @@ class DSparkOfflineRunner:
                 self.max_proposal_tokens,
             )
         with torch.inference_mode():
-            return generate_decoding_sample(
-                target_model=self.target_model,
-                input_ids=input_ids,
-                max_new_tokens=int(self.args.max_new_tokens),
-                max_proposal_tokens=self.max_proposal_tokens,
-                temperature=float(self.args.temperature),
-                stop_token_ids=stop_token_ids,
-                init_context=self._init_context,
-                propose=self._propose,
-                update=self._update,
-            )
+            replay = getattr(self.target_model, "is_greedy_replay", False) is True
+            if replay:
+                self.target_model.prepare_sample(
+                    input_ids, int(self.args.max_new_tokens), stop_token_ids
+                )
+
+            def generate():
+                return generate_decoding_sample(
+                    target_model=self.target_model,
+                    input_ids=input_ids,
+                    max_new_tokens=int(self.args.max_new_tokens),
+                    max_proposal_tokens=self.max_proposal_tokens,
+                    temperature=float(self.args.temperature),
+                    stop_token_ids=stop_token_ids,
+                    init_context=self._init_context,
+                    propose=self._propose,
+                    update=self._update,
+                )
+
+            response = generate()
+            if replay:
+                self.target_model.audit(generate, response)
+            return response
 
 
 class BaseModelOfflineRunner:
@@ -1346,7 +1375,14 @@ def _evaluate_dataset(
         num_shards=getattr(args, "worker_num_shards", 1),
     )
 
-    stats = EvalStats()
+    stats = EvalStats(
+        probability_diagnostics_available=getattr(
+            getattr(runner, "target_model", None),
+            "probability_diagnostics_available",
+            True,
+        )
+        is not False
+    )
     profiler = (
         getattr(getattr(runner, "target_model", None), "profiler", None)
         or EvaluationProfiler()
@@ -1526,14 +1562,18 @@ def _write_backend_metadata(args, report):
         "target_backend": "dsv4-vllm",
         "verification_mode": mode,
         "verification": (
-            "immutable-kv-snapshot-accepted-tail-replay"
+            "checked-native-greedy-trajectory-replay"
+            if mode == "replay"
+            else "immutable-kv-snapshot-accepted-tail-replay"
             if getattr(args, "dsv4_kv_reuse", False)
             else "full-prefix-block-recompute"
             if mode == "block"
             else "full-prefix-per-position-recompute"
         ),
         "probability_source": (
-            "target_native_full_vocabulary_head_packet"
+            "cached-native-greedy-tokens-no-off-trajectory-probabilities"
+            if mode == "replay"
+            else "target_native_full_vocabulary_head_packet"
             if mode == "block"
             else "target_api_full_vocabulary_logprobs"
         ),
@@ -1554,11 +1594,37 @@ def _write_backend_metadata(args, report):
         "acceptance_length": "1 + accepted_draft_tokens / proposals",
         "position_accept_rates": "accepted_prefix_count / proposed_count",
     }
+    if mode == "replay":
+        metadata.update(
+            replay_cache=str(args.dsv4_replay_cache.resolve()),
+            replay_cache_tag=args.dsv4_replay_cache_tag,
+            replay_audit_samples_per_worker=args.dsv4_replay_audit_samples,
+            probability_diagnostics_available=False,
+            timing_scope=(
+                "cache preparation + local replay + optional live audits; "
+                "NOT serving speed"
+            ),
+            experimental=True,
+        )
     with (args.output_dir / "eval_backend.json").open("w", encoding="utf-8") as stream:
         json.dump(metadata, stream, indent=2)
 
 
 def run(args: argparse.Namespace) -> None:
+    if getattr(args, "dsv4_verification_mode", "reference") == "replay":
+        if (
+            getattr(args, "target_backend", "hf") != "dsv4-vllm"
+            or args.temperature != 0.0
+            or getattr(args, "dsv4_kv_reuse", False)
+            or getattr(args, "dsv4_block_output", "auto") != "auto"
+            or getattr(args, "measure_base_speedup", False)
+        ):
+            raise ValueError(
+                "Replay requires dsv4-vllm, temperature=0, auto output, "
+                "no target snapshots/base-speedup"
+            )
+        if args.dsv4_replay_audit_samples < 0:
+            raise ValueError("Replay audit sample count must be nonnegative")
     if getattr(args, "dsv4_kv_reuse", False) and (
         getattr(args, "target_backend", "hf") != "dsv4-vllm"
         or getattr(args, "dsv4_verification_mode", "reference") != "block"
@@ -1750,6 +1816,16 @@ def _load_dsv4_target(
     )
     resources.callback(client.close)
     target_class = DSV4OfflineTarget
+    target_options = {}
+    if args.dsv4_verification_mode == "replay":
+        from speculators_dsv4.replay import DSV4GreedyReplayTarget  # noqa: PLC0415
+
+        target_class = DSV4GreedyReplayTarget
+        target_options = {
+            "replay_cache": args.dsv4_replay_cache,
+            "replay_tag": args.dsv4_replay_cache_tag,
+            "audit_samples": args.dsv4_replay_audit_samples,
+        }
     if getattr(args, "dsv4_kv_reuse", False):
         from speculators_dsv4.cached_target import DSV4CachedTarget  # noqa: PLC0415
 
@@ -1767,6 +1843,7 @@ def _load_dsv4_target(
         hs_http_endpoint=setup.hs_http_endpoint,
         hs_http_token=os.environ.get("DSV4_HS_HTTP_TOKEN"),
         profile=getattr(args, "dsv4_profile", False),
+        **target_options,
     )
     endpoint = urlsplit(args.vllm_endpoint)
     root_path = endpoint.path.rstrip("/").removesuffix("/v1")
@@ -1783,14 +1860,21 @@ def _load_dsv4_target(
         target_model.generation_config.eos_token_id,
         vocab_size=setup.target_config["vocab_size"],
     )
-    logger.warning(
-        "DSV4 %s verification uses %s and native target "
-        "probabilities. Reported elapsed time is NOT online speculative speed.",
-        args.dsv4_verification_mode,
-        "host KV snapshots with accepted-tail replay"
-        if getattr(args, "dsv4_kv_reuse", False)
-        else "full-prefix recomputation",
-    )
+    if args.dsv4_verification_mode == "replay":
+        logger.warning(
+            "Experimental DSV4 greedy trajectory replay: acceptance counts only; "
+            "no target probability diagnostics. Timings include cache preparation "
+            "and optional live audits, NOT online speculative speed."
+        )
+    else:
+        logger.warning(
+            "DSV4 %s verification uses %s and native target "
+            "probabilities. Reported elapsed time is NOT online speculative speed.",
+            args.dsv4_verification_mode,
+            "host KV snapshots with accepted-tail replay"
+            if getattr(args, "dsv4_kv_reuse", False)
+            else "full-prefix recomputation",
+        )
     return target_model, tokenizer
 
 
@@ -1898,7 +1982,19 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--served-model-name", default=None)
     parser.add_argument("--dsv4-max-model-len", type=int, default=4096)
     parser.add_argument(
-        "--dsv4-verification-mode", choices=["reference", "block"], default="reference"
+        "--dsv4-verification-mode",
+        choices=["reference", "block", "replay"],
+        default="reference",
+    )
+    parser.add_argument(
+        "--dsv4-replay-cache", type=Path, default=Path("dsv4_greedy_traces")
+    )
+    parser.add_argument("--dsv4-replay-cache-tag", default="")
+    parser.add_argument(
+        "--dsv4-replay-audit-samples",
+        type=int,
+        default=0,
+        help="Compare the first N samples per worker against live block decoding",
     )
     parser.add_argument(
         "--dsv4-kv-reuse",

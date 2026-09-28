@@ -242,6 +242,11 @@ def parse_args():
         ),
     )
     train_parser.add_argument(
+        "--dsv4-greedy-replay",
+        action="store_true",
+        help="Allow native greedy trace generation on a dedicated block server",
+    )
+    train_parser.add_argument(
         "--dsv4-kv-reuse",
         action="store_true",
         help="Opt-in bounded host KV snapshots; requires --dsv4-block-verify",
@@ -647,6 +652,8 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
             BLOCK_CONNECTOR_MODULE,
             KV_CONNECTOR,
             KV_CONNECTOR_MODULE,
+            REPLAY_CONNECTOR,
+            REPLAY_CONNECTOR_MODULE,
         )
 
         reuse = getattr(args, "dsv4_kv_reuse", False)
@@ -664,6 +671,9 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
             kv_transfer_config["kv_connector_extra_config"]["kv_cache_mb"] = (
                 args.dsv4_kv_cache_mb
             )
+        if getattr(args, "dsv4_greedy_replay", False):
+            kv_transfer_config["kv_connector"] = REPLAY_CONNECTOR
+            kv_transfer_config["kv_connector_module_path"] = REPLAY_CONNECTOR_MODULE
 
     cmd = [
         sys.executable,
@@ -791,6 +801,12 @@ def _build_eval_cmd(args, vllm_args):
 
 
 def _validate_dsv4_flags(args):
+    if getattr(args, "dsv4_greedy_replay", False) and (
+        not args.dsv4_block_verify or getattr(args, "dsv4_kv_reuse", False)
+    ):
+        raise ValueError(
+            "--dsv4-greedy-replay requires block verification without KV snapshots"
+        )
     if getattr(args, "dsv4_kv_reuse", False) and not args.dsv4_block_verify:
         raise ValueError("--dsv4-kv-reuse requires --dsv4-block-verify.")
     if getattr(args, "dsv4_kv_cache_mb", 1024) <= 0:

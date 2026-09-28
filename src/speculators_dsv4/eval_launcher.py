@@ -157,11 +157,17 @@ def parse_args(argv=None):
     parser.add_argument("--target-quantization", default=None)
     parser.add_argument(
         "--verification-mode",
-        choices=["block", "reference"],
+        choices=["block", "reference", "replay"],
         default="block",
-        help="Block: one full-prefix forward; reference: one request per position",
+        help="Block: one forward per block; reference: one request per position; "
+        "replay: cache a checked greedy trajectory, then verify locally",
     )
     parser.add_argument("--dsv4-block-output", choices=["auto", "full"], default="auto")
+    parser.add_argument(
+        "--dsv4-replay-cache", type=Path, default=Path("dsv4_greedy_traces")
+    )
+    parser.add_argument("--dsv4-replay-cache-tag", default="")
+    parser.add_argument("--dsv4-replay-audit-samples", type=int, default=0)
     parser.add_argument("--dsv4-profile", action="store_true")
     parser.add_argument("--dsv4-kv-reuse", action="store_true")
     parser.add_argument("--draft-kv-reuse", action="store_true")
@@ -227,8 +233,16 @@ def choose_port(requested):
 
 
 def _validate_options(args):
-    if args.verification_mode not in {"block", "reference"}:
-        raise ValueError("--verification-mode must be block or reference")
+    if args.verification_mode not in {"block", "reference", "replay"}:
+        raise ValueError("--verification-mode must be block, reference or replay")
+    if args.verification_mode == "replay" and (
+        args.temperature != 0.0
+        or args.dsv4_block_output != "auto"
+        or getattr(args, "dsv4_replay_audit_samples", 0) < 0
+    ):
+        raise ValueError(
+            "Replay requires temperature=0, auto output and nonnegative audit samples"
+        )
     for name in ("startup_timeout", "shutdown_timeout", "target_request_timeout"):
         value = getattr(args, name)
         if not math.isfinite(value) or value <= 0:
@@ -342,7 +356,12 @@ def _target_command(
         str(hs_path),
         "--target-layer-ids",
         *map(str, layers),
-        *(["--dsv4-block-verify"] if args.verification_mode == "block" else []),
+        *(
+            ["--dsv4-block-verify"]
+            if args.verification_mode in {"block", "replay"}
+            else []
+        ),
+        *(["--dsv4-greedy-replay"] if args.verification_mode == "replay" else []),
         *(
             ["--dsv4-kv-reuse", "--dsv4-kv-cache-mb", str(args.dsv4_kv_cache_mb)]
             if getattr(args, "dsv4_kv_reuse", False)
@@ -377,7 +396,7 @@ def _target_command(
         "--max-logprobs",
         # Block probabilities use the shared artifact, not full-vocabulary JSON.
         "0"
-        if args.verification_mode == "block"
+        if args.verification_mode in {"block", "replay"}
         else str(report["config"]["vocab_size"]),
         "--logprobs-mode",
         "raw_logprobs",
@@ -441,6 +460,17 @@ def _eval_command(
     ]
     if args.dsv4_profile:
         command.append("--dsv4-profile")
+    if args.verification_mode == "replay":
+        command.extend(
+            [
+                "--dsv4-replay-cache",
+                str(args.dsv4_replay_cache.resolve()),
+                "--dsv4-replay-cache-tag",
+                args.dsv4_replay_cache_tag,
+                "--dsv4-replay-audit-samples",
+                str(args.dsv4_replay_audit_samples),
+            ]
+        )
     if getattr(args, "draft_kv_reuse", False):
         command.append("--draft-kv-reuse")
     if getattr(args, "dsv4_kv_reuse", False):

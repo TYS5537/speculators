@@ -12,6 +12,10 @@ BLOCK_PROFILE_STAGES = ("server_forward", "server_head", "server_packet_prepare"
 BLOCK_REQUEST_KEY = "dsv4_block_verify"
 BLOCK_CONNECTOR = "DSV4BlockVerifyConnector"
 BLOCK_CONNECTOR_MODULE = "speculators_dsv4.block_connector"
+GREEDY_REQUEST_KEY = "dsv4_greedy_trace"
+GREEDY_VERSION = 1
+REPLAY_CONNECTOR = "DSV4ReplayConnector"
+REPLAY_CONNECTOR_MODULE = "speculators_dsv4.replay_connector"
 
 
 def validate_block_request(value, prompt_length):
