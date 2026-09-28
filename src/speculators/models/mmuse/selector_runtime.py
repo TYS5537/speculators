@@ -266,11 +266,13 @@ class MMuseSelectorMixin:
         anchor_token_ids: torch.Tensor,
         loss_mask: torch.Tensor,
         teacher_previous_token_ids: torch.Tensor,
+        *,
+        select_path: bool = True,
     ) -> tuple[
         torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
-        torch.Tensor,
-        torch.Tensor,
+        torch.Tensor | None,
         torch.Tensor,
     ]:
         """Build selector rollout scores and its restricted-Top-K train loss.
@@ -280,7 +282,8 @@ class MMuseSelectorMixin:
         the teacher/realized predecessor row and distils the verifier distribution
         restricted to the current Top-K. This avoids materializing an
         ``anchors x positions x K x K`` autograd graph. The existing
-        full-vocabulary draft loss is untouched.
+        full-vocabulary draft loss is untouched. Teacher-only Correction callers
+        can skip the unused discrete path; its two outputs are then ``None``.
         """
         if self.candidate_selector is None:
             raise RuntimeError("DFlash2 candidate selector is not enabled")
@@ -318,12 +321,14 @@ class MMuseSelectorMixin:
             active_hidden,
             teacher_previous_token_ids[:, start_position:],
         )
-        selected_ids, realized_logits = self._dflash2_select_topk_path(
-            candidate_ids,
-            unary_logits,
-            hidden_blocks,
-            anchor_token_ids,
-        )
+        selected_ids = realized_logits = None
+        if select_path:
+            selected_ids, realized_logits = self._dflash2_select_topk_path(
+                candidate_ids,
+                unary_logits,
+                hidden_blocks,
+                anchor_token_ids,
+            )
 
         target_topk_logits = active_targets.gather(-1, active_candidates)
         target_topk_probs = torch.softmax(target_topk_logits.float(), dim=-1).detach()

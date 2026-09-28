@@ -124,6 +124,9 @@ def _assert_block_call(model, inputs):
     torch.testing.assert_close(args[3], inputs["block_tokens"][:, 0])
     assert args[4] is inputs["aligned_loss_mask"]
     assert kwargs["teacher_previous_token_ids"] is inputs["prev_token_ids"]
+    assert kwargs["select_path"] == (
+        model.config.selector_correction_feedback == "static"
+    )
     assert grad_enabled
 
 

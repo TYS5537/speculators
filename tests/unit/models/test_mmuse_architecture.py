@@ -14,6 +14,7 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.models.dflash import DFlashDraftModel, DFlashSpeculatorConfig
 from speculators.models.dspark import DSparkDraftModel, DSparkSpeculatorConfig
 from speculators.models.mmuse import MMuseDraftModel, MMuseSpeculatorConfig
+from speculators.models.mmuse import core as mmuse_core
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 
@@ -208,6 +209,115 @@ def test_disabled_mmuse_preserves_baseline_initialization_and_backbone(
         torch.testing.assert_close(expected_loss, actual_loss, rtol=0, atol=0)
         for name, value in expected_metrics.items():
             torch.testing.assert_close(value, actual_metrics[name], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("training", [False, True])
+@pytest.mark.parametrize("diagnostics", [False, True])
+@pytest.mark.parametrize("sample", [False, True])
+@pytest.mark.parametrize("bf16", [False, True])
+def test_bestarch_skips_unused_work_with_exact_output_and_gradient_parity(
+    monkeypatch, training, diagnostics, sample, bf16
+):
+    monkeypatch.delenv("MMUSE_PROFILE_FORWARD", raising=False)
+    torch.manual_seed(951)
+    model = MMuseDraftModel(
+        _config(
+            MMuseSpeculatorConfig,
+            sample_from_anchor=sample,
+            markov_rank=4,
+            enable_correction_head=True,
+            correction_output_mode="logits",
+            correction_hidden_size=16,
+            correction_num_heads=4,
+            correction_rank=8,
+            correction_hidden_aux_loss=True,
+            correction_hidden_feedback=True,
+            correction_project_corrected_hidden=True,
+            correction_with_markov=True,
+            correction_base_diagnostics=diagnostics,
+            correction_rollout_metrics=False,
+            selector_correction_feedback="corrected",
+            dflash_context_residual=True,
+            dflash_block_position_embedding=True,
+            dflash_gated_layer_fusion=True,
+            dflash2_dynamic_conv=True,
+            dflash2_conv_group_size=4,
+            dflash2_candidate_selector=True,
+            dflash2_selector_rank=4,
+            dflash2_selector_top_k=3,
+        )
+    ).train(training)
+    # Exercise nonzero corrections/gates, including frozen verifier weights.
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.normal_(std=0.1)
+    reference = copy.deepcopy(model)
+    inputs = {
+        "hidden_states": torch.randn(1, 8, 32),
+        "input_ids": torch.arange(1, 9).unsqueeze(0),
+        "loss_mask": torch.tensor([[1, 1, 0, 1, 1, 1, 1, 1]]),
+        "verifier_last_hidden_states": torch.randn(1, 8, 16),
+        "document_ids": torch.zeros(1, 8, dtype=torch.long),
+        "max_anchors": 2,
+    }
+    reference_base = []
+    reference_logits = []
+    backbone = reference._backbone_forward
+    block_outputs = reference._dflash2_block_outputs
+    compute = mmuse_core.compute_metrics
+
+    def record_backbone(*args, **kwargs):
+        result = backbone(*args, **kwargs)
+        reference_base.append(result[1])
+        return result
+
+    def old_block_outputs(*args, **kwargs):
+        kwargs["select_path"] = True
+        return block_outputs(*args, **kwargs)
+
+    def old_metrics(logits, *args, **kwargs):
+        reference_logits.append(logits.detach().clone())
+        kwargs["base_logits"] = reference_base[0]
+        return compute(logits, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(reference, "_backbone_forward", record_backbone)
+        patch.setattr(reference, "_dflash2_block_outputs", old_block_outputs)
+        patch.setattr(mmuse_core, "compute_metrics", old_metrics)
+        torch.manual_seed(321)
+        with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+            _, expected_loss, expected_metrics = reference(**inputs)
+        expected_loss.backward()
+        expected_rng = torch.random.get_rng_state()
+
+    def forbidden_search(*_args, **_kwargs):
+        pytest.fail("Corrected teacher forcing must skip the unused greedy walk")
+
+    def check_metrics(logits, *args, **kwargs):
+        assert (kwargs["base_logits"] is not None) == (diagnostics and not training)
+        torch.testing.assert_close(logits, reference_logits[0], rtol=0, atol=0)
+        return compute(logits, *args, **kwargs)
+
+    monkeypatch.setattr(model, "_dflash2_select_topk_path", forbidden_search)
+    monkeypatch.setattr(mmuse_core, "compute_metrics", check_metrics)
+    # Optional timing must not affect the same numerical/gradient contract.
+    monkeypatch.setenv("MMUSE_PROFILE_FORWARD", "1")
+    torch.manual_seed(321)
+    with torch.autocast("cpu", dtype=torch.bfloat16, enabled=bf16):
+        _, actual_loss, actual_metrics = model(**inputs)
+    actual_loss.backward()
+    torch.testing.assert_close(actual_loss, expected_loss, rtol=0, atol=0)
+    assert actual_metrics.keys() == expected_metrics.keys()
+    for name, expected in expected_metrics.items():
+        torch.testing.assert_close(actual_metrics[name], expected, rtol=0, atol=0)
+    for name, parameter in model.named_parameters():
+        expected = reference.get_parameter(name).grad
+        if expected is None:
+            assert parameter.grad is None
+        else:
+            torch.testing.assert_close(parameter.grad, expected, rtol=0, atol=0)
+    assert torch.equal(torch.random.get_rng_state(), expected_rng)
+    assert reference.state_dict().keys() == model.state_dict().keys()
 
 
 @pytest.mark.parametrize(

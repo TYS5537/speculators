@@ -24,6 +24,7 @@ from speculators.models.mmuse.parallel_correction import (
     add_parallel_projected_residual,
     build_parallel_logit_kwargs,
 )
+from speculators.models.mmuse.profiling import start_forward_profile
 from speculators.models.mmuse.rollout_state import RolloutFeedbackState
 from speculators.models.mmuse.rollout_validation import (
     validate_selector_logit_features,
@@ -560,6 +561,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             block_tokens[:, 0],
             aligned_loss_mask,
             teacher_previous_token_ids=prev_token_ids,
+            select_path=self.config.selector_correction_feedback == "static",
         )
         selector_initial_logits = None
         if not self.config.sample_from_anchor:
@@ -590,6 +592,8 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
                 )
                 selector_previous_logits_mask = block_positions > 0
         else:
+            if selector_candidate_logits is None or selector_selected_ids is None:
+                raise RuntimeError("Static Selector conditioning requires a path")
             selector_inputs = self._selector_correction_inputs(
                 selector_candidate_ids,
                 selector_candidate_logits,
@@ -1414,6 +1418,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
         dpace_alpha: float = 0.5,
         **kwargs,
     ):
+        profile = start_forward_profile(self, input_ids.device)
         tv_loss_fn = kwargs.pop("tv_loss_fn", None)
         correction_output_mode = (
             getattr(self.correction_head, "output_mode", "hidden")
@@ -1446,6 +1451,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             ),
             **kwargs,
         )
+        profile.mark("backbone")
 
         # DSpark: add the active sequential correction and predict confidence.
         num_blocks = max_anchors
@@ -1471,6 +1477,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             block_positions=blocks.positions,
             correction_output_mode=correction_output_mode,
         )
+        profile.mark("selector_conditioning")
         selector_loss = selector_conditioning.selector_loss
         confidence_logits = None
         prev_emb = None
@@ -1526,6 +1533,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
 
         if logits is None:
             raise RuntimeError("DSpark forward did not produce draft logits")
+        profile.mark("correction_markov")
 
         proposal_candidate_ids = None
         proposal_candidate_logits = None
@@ -1540,6 +1548,8 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
                     teacher_previous_token_ids=blocks.previous_token_ids,
                 )
             )
+            if candidate_logits is None or selected_ids is None:
+                raise RuntimeError("Standalone Selector requires a proposal path")
             candidate_logits = self._dflash2_proposal_logits(
                 candidate_ids,
                 candidate_logits,
@@ -1562,7 +1572,11 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             confidence_logits = self.confidence_head(conf_features).reshape(
                 1, mask_tokens_size
             )
+        profile.mark("proposal_confidence")
 
+        include_diagnostics = (
+            not self.training and self.config.correction_base_diagnostics
+        )
         loss, metrics = compute_metrics(
             logits,
             targets,
@@ -1579,8 +1593,8 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             ssal_decay_weight=ssal_decay_weight,
             base_logits=(
                 base_logits
-                if self.markov_head is not None
-                or (self.correction_head is not None and base_logits is not None)
+                if include_diagnostics
+                and (self.markov_head is not None or self.correction_head is not None)
                 else None
             ),
             rollout_logits=rollout_logits,
@@ -1595,6 +1609,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             target_argmax_ids=target_argmax_ids,
             tv_loss_fn=tv_loss_fn,
         )
+        profile.mark("loss_metrics")
         loss, metrics = self._add_auxiliary_losses(
             loss,
             metrics,
@@ -1606,10 +1621,10 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
         )
         metrics = select_logged_metrics(
             metrics,
-            include_diagnostics=(
-                not self.training and self.config.correction_base_diagnostics
-            ),
+            include_diagnostics=include_diagnostics,
         )
+        profile.mark("auxiliary")
+        profile.finish()
         return None, loss, metrics
 
     @torch.compiler.disable

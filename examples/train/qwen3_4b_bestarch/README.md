@@ -52,3 +52,17 @@ All three retain `--training-recipe legacy`, `--loss-implementation legacy`, the
 There is no fixed global batch of 512 sequences. On six devices the packed text-token capacity is 6 * 3072 = 18,432 per update, including padding capacity but excluding synthetic draft anchor positions. The number of original samples depends on their lengths.
 
 These scripts reuse prepared data and existing vocabulary mappings; they do not regenerate datasets. Without explicit vocabulary sizing, existing `d2t.npy`/`t2d.npy` are reused, otherwise the full target vocabulary is used. Preserve the original tokenizer/template/thinking masks and use identical data/mapping files for MMuse comparisons. DSpark versus MMuse is not an architecture-only ablation because optimizer/LR/decay/schedule differ. No pre-refactor bitwise parity is promised.
+
+## Optional MMuse forward profiling
+
+The normal training path skips the unused greedy Selector walk in `corrected` teacher forcing and does not compute base diagnostics that would be discarded by the compact logger. Static Selector conditioning, standalone Selector proposals, actual inference rollout, losses and checkpoint parameter names/shapes are unchanged. Full base diagnostics remain available during validation with `--correction-base-diagnostics`. DSpark's implementation is unchanged.
+
+For a diagnostic run, set the optional profiling environment variable before starting either MMuse script:
+
+```bash
+MMUSE_PROFILE_FORWARD=50 bash examples/train/qwen3_4b_bestarch/train_mmuse_upstream_optimizer.sh
+```
+
+This prints a `MMuse forward profile` line on rank zero every 50 training forwards, beginning with call 0. The stages are `backbone`, `selector_conditioning`, `correction_markov`, `proposal_confidence`, `loss_metrics`, and `auxiliary`, each in milliseconds. The backbone stage includes verifier target-logit reconstruction and the initial draft LM-head projection; Correction includes its final projection and Markov collaboration. `call` is a process-local forward counter, not the saved global step; validation does not advance it. No TensorBoard writer or checkpoint field is added.
+
+Unset the variable or use `MMUSE_PROFILE_FORWARD=0` for normal training (the default). Profiling synchronizes the device between stages and can slow sampled steps; discard startup samples and compare steady-state end-to-end `fwd_ms` with profiling disabled. The stage total excludes the Trainer's post-forward supervision synchronization, so it is not identical to `fwd_ms`. Enabling profiling or changing source files does not update an already-running training process.

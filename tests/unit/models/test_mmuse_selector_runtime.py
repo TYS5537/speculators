@@ -273,3 +273,50 @@ def test_shape_guards_remain_before_selector_execution(method, field, replacemen
     finally:
         handle.remove()
     assert calls == []
+
+
+@pytest.mark.parametrize("sample", [False, True])
+@pytest.mark.parametrize(("block", "top_k"), [(1, 1), (3, 3), (7, 3)])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+def test_teacher_only_outputs_skip_search_without_changing_loss_or_gradients(
+    monkeypatch, sample, block, top_k, dtype
+):
+    torch.manual_seed(381)
+    host = _SelectorHost(sample=sample, block=block, top_k=top_k).to(dtype)
+    inputs = _inputs(block)
+    for name, value in inputs.items():
+        if value.is_floating_point():
+            inputs[name] = value.detach().to(dtype).requires_grad_(value.requires_grad)
+
+    def run(**kwargs):
+        return host._dflash2_block_outputs(
+            inputs["logits"],
+            inputs["targets"],
+            inputs["hidden"],
+            inputs["anchors"],
+            inputs["mask"],
+            inputs["teacher_ids"],
+            **kwargs,
+        )
+
+    expected = run()
+    leaves = [inputs["logits"], inputs["hidden"], *host.parameters()]
+    expected_gradients = torch.autograd.grad(expected[2], leaves)
+
+    def forbidden_search(*_args, **_kwargs):
+        pytest.fail("Teacher-only conditioning must not search a rollout path")
+
+    monkeypatch.setattr(host, "_dflash2_select_topk_path", forbidden_search)
+    rng_before = torch.random.get_rng_state()
+    actual = run(select_path=False)
+    assert actual[1] is None
+    assert actual[3] is None
+    for index in (0, 2, 4):
+        torch.testing.assert_close(actual[index], expected[index], rtol=0, atol=0)
+    actual_gradients = torch.autograd.grad(actual[2], leaves)
+    for actual_gradient, expected_gradient in zip(
+        actual_gradients, expected_gradients, strict=True
+    ):
+        torch.testing.assert_close(actual_gradient, expected_gradient, rtol=0, atol=0)
+    assert torch.equal(torch.random.get_rng_state(), rng_before)
+    assert inputs["targets"].grad is None
