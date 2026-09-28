@@ -214,8 +214,14 @@ class LaunchScriptTests(unittest.TestCase):
             ("single", "8,9,10,11,12,13,14,15"),
         ):
             script = ROOT / f"examples/evaluate/dspark_dsv4_{kind}_eval.sh"
+            default_datasets = (
+                "gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,"
+                "alpaca,arena-hard-v2"
+                if kind == "offline"
+                else "gsm8k,math500"
+            )
             for datasets, expected in (
-                (None, "gsm8k,math500"),
+                (None, default_datasets),
                 ("aime24,humaneval", "aime24,humaneval"),
                 ("", ""),
             ):
@@ -269,6 +275,77 @@ class LaunchScriptTests(unittest.TestCase):
                             )
                         else:
                             self.assertNotIn("--ascend-devices", args)
+
+    def test_offline_eval_saved_paths_and_runtime_defaults_allow_overrides(self):
+        settings = {
+            "VERIFIER_MODEL": (
+                "--verifier-model",
+                "/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16",
+                "/fixture/other target",
+            ),
+            "DRAFT_MODEL": (
+                "--draft-model",
+                "output/dspark_dsv4_flash_bestArch/checkpoints/9/",
+                "/fixture/other draft",
+            ),
+            "DATASETS_ROOT": (
+                "--datasets-root",
+                "../DeepSpec/eval_datasets",
+                "/fixture/other data",
+            ),
+            "HS_PATH": (
+                "--hidden-states-path",
+                "/mnt/nfs/dataset/tmp_hs",
+                "/fixture/hs",
+            ),
+            "VLLM_ENDPOINT": (
+                "--vllm-endpoint",
+                "http://80.48.17.187:8001/v1",
+                "http://target.fixture:9001/v1",
+            ),
+            "EVAL_NPU": ("--ascend-devices", ",".join(map(str, range(16))), "8,9"),
+            "MAX_SAMPLES": ("--max-samples", "500", "12"),
+            "MAX_NEW_TOKENS": ("--max-new-tokens", "2048", "128"),
+            "DSV4_MAX_MODEL_LEN": ("--dsv4-max-model-len", "4096", "8192"),
+            "VERIFICATION_MODE": ("--dsv4-verification-mode", "reference", "block"),
+        }
+        script = ROOT / "examples/evaluate/dspark_dsv4_offline_eval.sh"
+        for use_overrides in (False, True):
+            with self.subTest(use_overrides=use_overrides):
+                environment = _shell_environment(
+                    {
+                        **{
+                            name: override if use_overrides else None
+                            for name, (_, _, override) in settings.items()
+                        },
+                        "HS_HTTP_ENDPOINT": "",
+                        "KEEP_TARGET_HS": "0",
+                        "SERVED_MODEL_NAME": "",
+                    }
+                )
+                source = r"""exec() { printf '%s\0' "$@"; }"""
+                source += f"\nsource {shlex.quote(script.as_posix())}\n"
+                result = subprocess.run(  # noqa: S603 -- Capture argv, no real eval.
+                    [BASH, "--noprofile", "--norc"],
+                    input=source,
+                    cwd=self.root,
+                    env=environment,
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    check=False,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertTrue(result.stdout.endswith("\0"))
+                args = result.stdout.split("\0")[:-1]
+                for flag, default, override in settings.values():
+                    self.assertEqual(args.count(flag), 1)
+                    self.assertEqual(
+                        args[args.index(flag) + 1],
+                        override if use_overrides else default,
+                    )
+                devices = settings["EVAL_NPU"][2 if use_overrides else 1]
+                self.assertIn(f"ASCEND_RT_VISIBLE_DEVICES={devices}", args)
 
     def test_http_eval_and_sidecar_wiring_without_shared_storage(self):
         for sidecar in (False, True):

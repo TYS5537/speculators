@@ -8,7 +8,7 @@ set -euo pipefail
 
 # Dataset selection: edit the comma-separated JSONL names/stems here.
 # Environment overrides are supported; DATASETS="" evaluates all discovered files.
-DATASETS="${DATASETS-gsm8k,math500}"
+DATASETS="${DATASETS-gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,alpaca,arena-hard-v2}"
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -16,9 +16,9 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
 
 # Local copy of the target checkpoint; its directory may differ from the server's.
 # Preserve shard timestamps when copying: they are part of the checkpoint signature.
-: "${VERIFIER_MODEL:?Set VERIFIER_MODEL to the local matching DSV4 checkpoint}"
-: "${DRAFT_MODEL:?Set DRAFT_MODEL to the trained DSV4 DSpark checkpoint}"
-: "${DATASETS_ROOT:?Set DATASETS_ROOT to a JSONL file or directory of JSONL files}"
+: "${VERIFIER_MODEL:=/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
+: "${DRAFT_MODEL:=output/dspark_dsv4_flash_bestArch/checkpoints/9/}"
+: "${DATASETS_ROOT:=../DeepSpec/eval_datasets}"
 # HTTP mode needs no shared HS mount. HS_PATH then holds temporary local downloads.
 # Export the same DSV4_HS_HTTP_TOKEN on both machines; never put it in CLI arguments.
 HS_HTTP_ENDPOINT="${HS_HTTP_ENDPOINT:-}"
@@ -27,11 +27,11 @@ if [[ -n "$HS_HTTP_ENDPOINT" ]]; then
   export DSV4_HS_HTTP_TOKEN
   HS_PATH="${HS_PATH:-${OUTPUT_DIR:-dspark_dsv4_reference_eval}/target-hs-downloads}"
 else
-  : "${HS_PATH:?Set HS_PATH to the shared HS server directory at the same absolute path}"
+  : "${HS_PATH:=/mnt/nfs/dataset/tmp_hs}"
 fi
-: "${VLLM_ENDPOINT:?Set VLLM_ENDPOINT to the trusted target service URL ending in /v1}"
+: "${VLLM_ENDPOINT:=http://80.48.17.187:8001/v1}"
 # One draft worker per listed physical NPU; keep these separate from target devices.
-: "${EVAL_NPU:?Set EVAL_NPU to comma-separated evaluation-only NPU IDs}"
+: "${EVAL_NPU:=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 
 cmd=(
   python3 scripts/evaluate/dspark_offline_eval.py
@@ -45,8 +45,8 @@ cmd=(
   --dsv4-max-model-len "${DSV4_MAX_MODEL_LEN:-4096}"
   --target-request-timeout "${TARGET_REQUEST_TIMEOUT:-120}"
   --output-dir "${OUTPUT_DIR:-dspark_dsv4_reference_eval}"
-  --max-samples "${MAX_SAMPLES:-4}"
-  --max-new-tokens "${MAX_NEW_TOKENS:-64}"
+  --max-samples "${MAX_SAMPLES:-500}"
+  --max-new-tokens "${MAX_NEW_TOKENS:-2048}"
   --temperature "${TEMPERATURE:-0.0}"
   --seed "${SEED:-980406}"
   --enable-thinking "${ENABLE_THINKING:-false}"

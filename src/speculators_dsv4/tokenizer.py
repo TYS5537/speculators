@@ -50,7 +50,7 @@ class DSV4ServerTokenizer:
         return list(value)
 
     def _tokenize(self, body: dict[str, Any]) -> list[int]:
-        response = self.client.post("/tokenize", cast_to=dict, body=body)
+        response = self.client.post("/tokenize", cast_to=dict[str, Any], body=body)
         if not isinstance(response, Mapping):
             raise ValueError("DSV4 /tokenize did not return a JSON object")
         token_ids = self._validate_ids(response.get("tokens"))

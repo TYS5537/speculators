@@ -5,6 +5,7 @@
 import sys
 import unittest
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock, patch
 
 from speculators_dsv4.tokenizer import DSV4ServerTokenizer
@@ -27,7 +28,7 @@ class DSV4ServerTokenizerTests(unittest.TestCase):
         self.assertEqual(ids, [1, 5, 9])
         self.client.post.assert_called_once_with(
             "/tokenize",
-            cast_to=dict,
+            cast_to=dict[str, Any],
             body={
                 "model": "target",
                 "messages": messages,
@@ -70,7 +71,7 @@ class DSV4ServerTokenizerTests(unittest.TestCase):
             self.tokenizer(raw)
         self.client.post.assert_called_once_with(
             "/tokenize",
-            cast_to=dict,
+            cast_to=dict[str, Any],
             body={"model": "target", "prompt": raw, "add_special_tokens": False},
         )
 
