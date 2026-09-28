@@ -266,14 +266,15 @@ class RuntimeTests(unittest.TestCase):
             retained.append(auxiliary[-1])
         self.assertEqual([value.value for value in retained], [7, 8, 9, 10])
 
-    def test_dp2_rejects_block_verification_before_native_model_init(self):
+    def test_dp2_block_model_preserves_native_parallel_config(self):
         config = runtime_config()
         config.parallel_config.data_parallel_size = 2
         config.parallel_config.data_parallel_size_local = 2
         config.parallel_config.enable_expert_parallel = True
         config.kv_transfer_config = SimpleNamespace(kv_connector=BLOCK_CONNECTOR)
-        with self.assertRaisesRegex(ValueError, "block verification"):
-            self.make_model(config)
+        model = self.make_model(config)
+        self.assertIs(model.vllm_config, config)
+        self.assertTrue(model._block_verify)
 
     def test_dp4_workers_keep_independent_teacher_captures(self):
         # Four Python model instances, not real HCCL/HS-file integration.
@@ -761,6 +762,24 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(connector["kv_connector"], "ExampleHiddenStatesConnector")
         self.assertNotIn("kv_connector_module_path", connector)
         self.assertNotIn("--max-num-seqs", cmd)
+
+    def test_block_verification_launches_tp8_dp2_without_collapsing_topology(self):
+        with patch.dict(
+            os.environ,
+            {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16)))},
+        ):
+            cmd = self.launch_dsv4(
+                block=True,
+                extra=["-tp", "8", "-dp", "2", "-ep"],
+            )
+        self.assertEqual(cmd[cmd.index("-tp") + 1], "8")
+        self.assertEqual(cmd[cmd.index("-dp") + 1], "2")
+        self.assertEqual(cmd[cmd.index("--data-parallel-size-local") + 1], "2")
+        self.assertEqual(cmd[cmd.index("--max-num-seqs") + 1], "1")
+        self.assertIn("--enforce-eager", cmd)
+        self.assertIn("--no-async-scheduling", cmd)
+        connector = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])
+        self.assertEqual(connector["kv_connector"], BLOCK_CONNECTOR)
 
     def test_block_verification_rejects_multiple_sequence_configuration(self):
         for extra in (

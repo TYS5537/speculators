@@ -1,9 +1,10 @@
 """Opt-in, single-request DSV4 verification export for vLLM 0.26.0.
 
-The model hook runs on every TP rank and uses the native target LM head. Only
-TP rank zero publishes the selected probabilities and HS, synchronously and
-atomically before the completion response. No target KV state is exported or
-rolled back, and no full-prefix vocabulary tensor is constructed.
+The model hook runs on every TP rank and uses the native target LM head. Each
+DP engine owns at most one request; its TP rank zero publishes the probabilities
+and HS atomically before the completion response. Idle DP engines join error
+synchronization without projecting logits or writing files. No target KV state
+is exported or rolled back, and no full-prefix vocabulary tensor is constructed.
 """
 
 # ruff: noqa: ARG002 -- Preserve vLLM connector method keyword signatures.
@@ -24,13 +25,18 @@ from vllm.distributed.kv_transfer.kv_connector.v1.base import (
     KVConnectorMetadata,
     SupportsHMA,
 )
-from vllm.distributed.parallel_state import get_tensor_model_parallel_rank, get_tp_group
+from vllm.distributed.parallel_state import (
+    get_dp_group,
+    get_tensor_model_parallel_rank,
+    get_tp_group,
+)
 
 from speculators_dsv4.block_protocol import (
     BLOCK_PROTOCOL_VERSION,
     BLOCK_REQUEST_KEY,
     validate_block_request,
 )
+from speculators_dsv4.parallel import validate_parallel_config
 
 _HIDDEN_NDIM = 2
 
@@ -47,6 +53,7 @@ class BlockRequest:
 @dataclass
 class BlockMetadata(KVConnectorMetadata):
     request: BlockRequest | None = None
+    data_parallel_rank: int = 0
 
 
 def _save_packet(tensors, filename):
@@ -71,6 +78,10 @@ class DSV4BlockVerifyConnector(KVConnectorBase_V1, SupportsHMA):
 
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
+        parallel = vllm_config.parallel_config
+        validate_parallel_config(parallel, block_verify=True)
+        self._dp_size = parallel.data_parallel_size
+        self._dp_rank = parallel.data_parallel_rank
         if vllm_config.scheduler_config.max_num_seqs != 1:
             raise ValueError("DSV4 block verification requires --max-num-seqs 1")
         self._storage_path = Path(
@@ -110,7 +121,7 @@ class DSV4BlockVerifyConnector(KVConnectorBase_V1, SupportsHMA):
                 raise ValueError(
                     "Block verification requires a fresh full-prefix request"
                 )
-            return BlockMetadata()
+            return BlockMetadata(data_parallel_rank=self._dp_rank)
         if len(requests) != 1 or set(scheduled) != {requests[0].req_id}:
             raise ValueError("Block verification supports only one complete prefix")
         request = requests[0]
@@ -160,7 +171,8 @@ class DSV4BlockVerifyConnector(KVConnectorBase_V1, SupportsHMA):
         return BlockMetadata(
             BlockRequest(
                 request.req_id, filename, list(tokens), logits_start, hidden_start
-            )
+            ),
+            data_parallel_rank=self._dp_rank,
         )
 
     def request_finished(self, request, block_ids):
@@ -189,14 +201,52 @@ class DSV4BlockVerifyConnector(KVConnectorBase_V1, SupportsHMA):
         pass  # Publication is synchronous inside the model's forward call.
 
     def capture(self, model, input_ids, positions, output):
+        normalized, auxiliary = output
+        request, error = None, None
+        try:
+            request = self._capture_request(input_ids, positions, output)
+        except Exception as exc:  # noqa: BLE001 -- Synchronize before raising.
+            error = exc
+        # A rank-local validation error must not leave its TP peers in the head's
+        # gather. Idle/profile forwards also participate: with DP2 the native
+        # Ascend runner coordinates their MoE forwards with the active engine.
+        failed = torch.tensor(
+            [int(error is not None)], dtype=torch.int32, device=normalized.device
+        )
+        failed = get_tp_group().all_reduce(failed)
+        if not failed.item() and request is not None:
+            # The native head communicates ONLY within this TP group, so DP
+            # engines may project different row counts (or no rows when idle).
+            logits = model.compute_logits(
+                normalized[request.logits_start : len(request.token_ids)]
+            )
+            if get_tensor_model_parallel_rank() == 0:
+                try:
+                    self._write_output(request, logits, auxiliary)
+                except Exception as exc:  # noqa: BLE001 -- Report IO errors to peers.
+                    error = exc
+                    failed.fill_(1)
+        failed = get_tp_group().all_reduce(failed)
+        if self._dp_size > 1:
+            # Do not return early for missing/empty metadata: the idle engine's
+            # dummy forward must rendezvous here too, before its next MoE step.
+            failed = get_dp_group().all_reduce(failed)
+        if failed.item():
+            raise RuntimeError(
+                "DSV4 block packet export failed on a target TP/DP rank"
+            ) from error
+
+    def _capture_request(self, input_ids, positions, output):
         if not self.has_connector_metadata():
-            return  # vLLM profiling/warmup, not an evaluation request.
+            return None  # Profiling/warmup or a DP engine's idle dummy forward.
         metadata = self._get_connector_metadata()
         if not isinstance(metadata, BlockMetadata):
             raise ValueError("Unexpected DSV4 block connector metadata")
+        if metadata.data_parallel_rank != self._dp_rank:
+            raise ValueError("Block request metadata belongs to another DP engine")
         request = metadata.request
         if request is None:
-            return
+            return None
         length = len(request.token_ids)
         if (
             input_ids is None
@@ -225,23 +275,7 @@ class DSV4BlockVerifyConnector(KVConnectorBase_V1, SupportsHMA):
             )
         ):
             raise ValueError("Block forward hidden-state shape/dtype mismatch")
-        # All TP ranks must enter the native head's collectives, even when
-        # LogitsProcessor returns None on non-root ranks. Slice BEFORE the head.
-        logits = model.compute_logits(normalized[request.logits_start : length])
-        error = None
-        if get_tensor_model_parallel_rank() == 0:
-            try:
-                self._write_output(request, logits, auxiliary)
-            except Exception as exc:  # noqa: BLE001 -- Sync failures across TP ranks.
-                error = exc
-        failed = torch.tensor(
-            [int(error is not None)], dtype=torch.int32, device=normalized.device
-        )
-        failed = get_tp_group().all_reduce(failed)
-        if failed.item():
-            raise RuntimeError(
-                "DSV4 block packet export failed on the target TP rank"
-            ) from error
+        return request
 
     def _write_output(self, request, logits, auxiliary):
         length = len(request.token_ids)

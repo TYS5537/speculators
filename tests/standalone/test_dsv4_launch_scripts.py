@@ -156,6 +156,8 @@ class LaunchScriptTests(unittest.TestCase):
             "NUM_TRAIN_NPUS": "16",
             "TARGET_QUANTIZATION": "",
             "DSV4_EVAL": "0",
+            "DSV4_BLOCK_VERIFY": "0",
+            "MAX_NUM_SEQS": "",
             "DSV4_EXECUTION_MODE": "",
             "DSV4_ASYNC_SCHEDULING": "",
             "DSV4_EXTERNAL_ARROW": "0",
@@ -564,8 +566,74 @@ exec() {
         self.assertLess(args.index("--dsv4-execution-mode"), args.index("--"))
         self.assertGreater(args.index("--no-async-scheduling"), args.index("--"))
         self.assertNotIn("--async-scheduling", args)
+        self.assertNotIn("--dsv4-block-verify", args)
+        self.assertEqual(args[args.index("--max-num-seqs") + 1], "64")
         self.assertIn("execution mode: eager; async scheduling: 0", result.stdout)
         self.assertRegex(self.signals.read_text(), r"^-TERM -- -[1-9][0-9]*\n$")
+
+    def test_server_preserves_user_paths_and_reference_defaults(self):
+        result = self.run_script(
+            "server",
+            MODEL=None,
+            HS_PATH=None,
+            VLLM_HOST="",
+            VLLM_PORT=None,
+            TARGET_LOCAL_IP=None,
+            TARGET_IFNAME=None,
+            DSV4_EVAL=None,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertIn("/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16", args)
+        for flag, expected in (
+            ("--hidden-states-path", "/mnt/nfs/dataset/tmp_hs"),
+            ("--host", "80.48.17.187"),
+            ("--port", "8001"),
+            ("--dsv4-manifest-timeout", "600"),
+            ("--max-num-seqs", "64"),
+            ("--max-logprobs", "129280"),
+            ("--logprobs-mode", "raw_logprobs"),
+        ):
+            self.assertEqual(args[args.index(flag) + 1], expected)
+        self.assertEqual(self.proxy_environment()["HCCL_IF_IP"], "80.48.17.187")
+        self.assertEqual(self.proxy_environment()["HCCL_SOCKET_IFNAME"], "enp48s3u1u1")
+
+    def test_server_block_opt_in_preserves_dp_and_disables_http_logprobs(self):
+        for dp in ("1", "2"):
+            with self.subTest(dp=dp):
+                result = self.run_script(
+                    "server", DP_SIZE=dp, DSV4_BLOCK_VERIFY="1", DSV4_EVAL="1"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                args = self.capture.read_text().splitlines()
+                self.assertLess(args.index("--dsv4-block-verify"), args.index("--"))
+                for flag, expected in (
+                    ("--tensor-parallel-size", "8"),
+                    ("--data-parallel-size", dp),
+                    ("--data-parallel-size-local", dp),
+                    ("--max-num-seqs", "1"),
+                    ("--max-logprobs", "0"),
+                    ("--generation-config", "vllm"),
+                ):
+                    self.assertEqual(args[args.index(flag) + 1], expected)
+                self.assertNotIn("--logprobs-mode", args)
+                self.assertIn("--no-async-scheduling", args)
+
+    def test_server_rejects_unsafe_block_options_before_launch(self):
+        for overrides in (
+            {"DSV4_BLOCK_VERIFY": "2"},
+            {"DP_SIZE": "4"},
+            {"MAX_NUM_SEQS": "64"},
+            {"DSV4_ASYNC_SCHEDULING": "1"},
+            {"DSV4_EXECUTION_MODE": "full-decode-only"},
+        ):
+            with self.subTest(overrides=overrides):
+                result = self.run_script(
+                    "server", **{"DSV4_BLOCK_VERIFY": "1", **overrides}
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.checkpoint_capture.exists())
+                self.assertFalse(self.capture.exists())
 
     def test_two_host_head_starts_local_engines_and_keeps_http_readiness(self):
         result = self.run_script("server", DP_SIZE="4", DP_ADDRESS="10.0.0.10")
@@ -580,7 +648,7 @@ exec() {
             ("--data-parallel-address", "10.0.0.10"),
             ("--data-parallel-rpc-port", "13345"),
             ("--data-parallel-backend", "mp"),
-            ("--dsv4-manifest-timeout", "300"),
+            ("--dsv4-manifest-timeout", "600"),
         ):
             self.assertEqual(args[args.index(flag) + 1], expected)
         self.assertLess(args.index("--dsv4-manifest-timeout"), args.index("--"))
@@ -617,9 +685,13 @@ exec() {
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.proxy_environment(), communication)
 
-    def test_master_defaults_to_186_for_api_and_dp_rendezvous(self):
+    def test_explicit_dp4_master_sets_api_and_rendezvous(self):
         result = self.run_script(
-            "server", DP_SIZE="4", VLLM_HOST="", TARGET_LOCAL_IP="80.48.17.186"
+            "server",
+            DP_SIZE="4",
+            VLLM_HOST="",
+            TARGET_LOCAL_IP="80.48.17.186",
+            TARGET_MASTER_IP="80.48.17.186",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.capture.read_text().splitlines()
@@ -642,6 +714,7 @@ exec() {
                     "server",
                     DP_SIZE="4",
                     DP_START_RANK=rank,
+                    TARGET_MASTER_IP="80.48.17.186",
                     VLLM_HOST="",
                     TARGET_LOCAL_IP=None,
                     TARGET_IFNAME=None,
@@ -667,6 +740,7 @@ exec() {
             DP_SIZE="4",
             DP_START_RANK="2",
             TARGET_WORKER_IP="10.0.0.88",
+            TARGET_MASTER_IP="80.48.17.186",
             TARGET_LOCAL_IP=None,
             TARGET_IFNAME=None,
         )
@@ -683,6 +757,7 @@ exec() {
             DP_SIZE="4",
             DP_START_RANK="2",
             TARGET_LOCAL_IP="80.48.17.187",
+            TARGET_MASTER_IP="80.48.17.186",
             TARGET_IFNAME="worker-nic",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -865,7 +940,7 @@ exec() {
                         ("--data-parallel-size-local", "2"),
                         ("--max-model-len", "4096"),
                         ("--max-num-batched-tokens", "4096"),
-                        ("--max-num-seqs", "1"),
+                        ("--max-num-seqs", "64"),
                     ):
                         self.assertEqual(args[args.index(flag) + 1], value)
 

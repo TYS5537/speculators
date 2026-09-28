@@ -10,13 +10,13 @@ VLLM_NPUS="${VLLM_NPUS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-2}"  # Global DP. DP4 uses two target hosts; DP1/2 uses one.
 DP_START_RANK="${DP_START_RANK:-0}"
-TARGET_MASTER_IP="${TARGET_MASTER_IP:-80.48.17.186}"
+TARGET_MASTER_IP="${TARGET_MASTER_IP:-80.48.17.187}"
 TARGET_WORKER_IP="${TARGET_WORKER_IP:-80.48.17.187}"
 DP_ADDRESS="${DP_ADDRESS:-}"
 DP_RPC_PORT="${DP_RPC_PORT:-13345}"
 VLLM_HOST="${VLLM_HOST:-$TARGET_MASTER_IP}"
 VLLM_PORT="${VLLM_PORT:-8001}"
-# User-provided topology: head .186, headless worker .187, same NIC on both.
+# Saved single-host endpoint: .187. DP4 needs distinct head/worker IP overrides.
 # Override TARGET_LOCAL_IP/TARGET_IFNAME on other machines. Explicitly empty
 # values retain backend interface selection on single-host DP1/2 only.
 # Explicit per-backend environment settings take precedence over these defaults.
@@ -34,11 +34,34 @@ if [[ -n "$TARGET_IFNAME" ]]; then
   export TP_SOCKET_IFNAME="${TP_SOCKET_IFNAME:-$TARGET_IFNAME}"
   export HCCL_SOCKET_IFNAME="${HCCL_SOCKET_IFNAME:-$TARGET_IFNAME}"
 fi
-VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-1800}"
-DSV4_MANIFEST_TIMEOUT="${DSV4_MANIFEST_TIMEOUT:-300}"
-export DSV4_EVAL="${DSV4_EVAL:-0}"
+VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-3600}"
+DSV4_MANIFEST_TIMEOUT="${DSV4_MANIFEST_TIMEOUT:-600}"
+export DSV4_EVAL="${DSV4_EVAL:-1}"  # 0: training HS; 1: reference evaluation.
+# Opt in to a dedicated block service; takes precedence over DSV4_EVAL.
+DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-0}"
 DSV4_EXECUTION_MODE="${DSV4_EXECUTION_MODE:-eager}"
 DSV4_ASYNC_SCHEDULING="${DSV4_ASYNC_SCHEDULING:-0}"
+target_bridge_args=()
+case "$DSV4_BLOCK_VERIFY" in
+  0) MAX_NUM_SEQS="${MAX_NUM_SEQS:-64}" ;;
+  1)
+    if [[ "$DP_SIZE" != 1 && "$DP_SIZE" != 2 ]]; then
+      echo "DSV4_BLOCK_VERIFY=1 requires single-host DP_SIZE=1 or 2." >&2
+      exit 2
+    fi
+    if [[ "$DSV4_EXECUTION_MODE" != eager || "$DSV4_ASYNC_SCHEDULING" != 0 ]]; then
+      echo "Block verification requires eager execution and DSV4_ASYNC_SCHEDULING=0." >&2
+      exit 2
+    fi
+    MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"  # One prefix per DP engine, not per server.
+    if [[ "$MAX_NUM_SEQS" != 1 ]]; then
+      echo "Block verification requires MAX_NUM_SEQS=1 per DP engine." >&2
+      exit 2
+    fi
+    target_bridge_args=(--dsv4-block-verify)
+    ;;
+  *) printf '%s\n' 'DSV4_BLOCK_VERIFY must be 0 or 1.' >&2; exit 2 ;;
+esac
 case "$DSV4_EXECUTION_MODE" in
   eager|full-decode-only) ;;
   *) printf '%s\n' 'DSV4_EXECUTION_MODE must be eager or full-decode-only.' >&2; exit 2 ;;
@@ -104,6 +127,8 @@ if [[ ! "$DSV4_MANIFEST_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
 fi
 printf 'DSV4 HS execution mode: %s; async scheduling: %s\n' \
   "$DSV4_EXECUTION_MODE" "$DSV4_ASYNC_SCHEDULING"
+printf 'DSV4 block verification: %s; max sequences per DP engine: %s\n' \
+  "$DSV4_BLOCK_VERIFY" "$MAX_NUM_SEQS"
 printf 'DSV4 HS topology: TP=%s, global DP=%s, local DP=%s, start rank=%s, headless=%s\n' \
   "$TP_SIZE" "$DP_SIZE" "$DP_SIZE_LOCAL" "$DP_START_RANK" "$HEADLESS"
 if [[ "$DP_SIZE" == 4 ]]; then
@@ -130,6 +155,10 @@ case "${DSV4_EVAL:-0}" in
     exit 1
     ;;
 esac
+if [[ "$DSV4_BLOCK_VERIFY" == 1 ]]; then
+  # Full-vocabulary probabilities travel in the block packet, not HTTP logprobs.
+  target_eval_args=(--max-logprobs 0 --generation-config vllm)
+fi
 READY_HOST="$VLLM_HOST"
 case "$READY_HOST" in
   0.0.0.0) READY_HOST=127.0.0.1 ;;
@@ -167,6 +196,7 @@ setsid env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" \
   python scripts/launch_vllm.py "$MODEL" \
     --dsv4 \
+    "${target_bridge_args[@]}" \
     --dsv4-execution-mode "$DSV4_EXECUTION_MODE" \
     --dsv4-manifest-timeout "$DSV4_MANIFEST_TIMEOUT" \
     --hidden-states-path "$HS_PATH" \
@@ -186,7 +216,7 @@ setsid env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
     "${target_http_args[@]}" \
     --max-model-len 4096 \
     --max-num-batched-tokens 4096 \
-    --max-num-seqs 1 \
+    --max-num-seqs "$MAX_NUM_SEQS" \
     --block-size 128 \
     --additional-config '{"enable_flashcomm1": false, "enable_dsa_cp": false}' &
 VLLM_PID=$!

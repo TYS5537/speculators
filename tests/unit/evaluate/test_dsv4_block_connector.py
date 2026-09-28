@@ -4,7 +4,10 @@
 
 import importlib.util
 import sys
+from concurrent.futures import ThreadPoolExecutor
+from contextvars import ContextVar
 from pathlib import Path
+from threading import Barrier, Lock
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -47,7 +50,7 @@ class _TPGroup:
 
     def all_reduce(self, tensor):
         self.flags.append(tensor.detach().clone())
-        if self.remote_error:
+        if self.remote_error and len(self.flags) == 2:
             return torch.ones_like(tensor)
         return tensor
 
@@ -65,6 +68,7 @@ def connector_module(monkeypatch):
     group = _TPGroup()
     parallel.get_tensor_model_parallel_rank = lambda: 0
     parallel.get_tp_group = lambda: group
+    parallel.get_dp_group = lambda: pytest.fail("DP1 must not use a DP collective")
     for name, module in (
         (transfer.__name__, transfer),
         (base.__name__, base),
@@ -81,9 +85,15 @@ def connector_module(monkeypatch):
     return module
 
 
-def _config(directory, *, max_num_seqs=1, **extra):
+def _config(directory, *, max_num_seqs=1, dp_size=1, dp_rank=0, **extra):
     settings = {"shared_storage_path": str(directory), **extra}
     return SimpleNamespace(
+        parallel_config=SimpleNamespace(
+            data_parallel_size=dp_size,
+            data_parallel_size_local=dp_size,
+            data_parallel_rank=dp_rank,
+            enable_expert_parallel=dp_size > 1,
+        ),
         scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
         kv_transfer_config=SimpleNamespace(get_from_extra_config=settings.get),
         speculative_config=SimpleNamespace(
@@ -288,6 +298,17 @@ def test_connector_requires_single_sequence_and_storage(connector_module, tmp_pa
         )
 
 
+def test_connector_rechecks_block_topology_without_launcher(connector_module, tmp_path):
+    config = _config(tmp_path, dp_size=2)
+    config.parallel_config.enable_expert_parallel = False
+    with pytest.raises(ValueError, match="expert-parallel"):
+        connector_module.DSV4BlockVerifyConnector(config, "worker", None)
+    with pytest.raises(ValueError, match="single-host"):
+        connector_module.DSV4BlockVerifyConnector(
+            _config(tmp_path, dp_size=4), "worker", None
+        )
+
+
 def test_connector_never_loads_or_defers_kv(ready):
     assert ready.connector.get_num_new_matched_tokens(None, 0) == (0, False)
     ready.connector.update_state_after_alloc(None, None, 0)
@@ -347,7 +368,7 @@ def test_capture_projects_only_normalized_suffix_and_real_packet_roundtrip(ready
         torch.stack([value[1:4] for value in ready.output[1]], 1),
     )
     assert list(ready.path.parent.iterdir()) == [ready.path]
-    assert len(ready.module.test_group.flags) == 1
+    assert len(ready.module.test_group.flags) == 2
     assert ready.module.test_group.flags[0].dtype == torch.int32
     assert ready.module.test_group.flags[0].item() == 0
 
@@ -368,7 +389,7 @@ def test_nonroot_also_enters_native_head_before_rank_gate(ready, monkeypatch):
     _capture(ready)
     assert events.index("head") < events.index("rank")
     assert not ready.path.exists()
-    assert len(ready.module.test_group.flags) == 1
+    assert len(ready.module.test_group.flags) == 2
 
 
 def test_capture_skips_warmup_and_rejects_wrong_metadata(ready):
@@ -378,8 +399,24 @@ def test_capture_skips_warmup_and_rejects_wrong_metadata(ready):
     _capture(ready)
     assert not ready.calls
     ready.connector.bind_connector_metadata(object())
-    with pytest.raises(ValueError, match="metadata"):
+    with pytest.raises(RuntimeError, match="packet export failed") as exc_info:
         _capture(ready)
+    assert "metadata" in str(exc_info.value.__cause__)
+
+
+def test_completed_request_is_not_reexported_by_following_dummy_forward(ready):
+    _capture(ready)
+    packet = ready.path.read_bytes()
+    # Mirrors vLLM finalization: cleared metadata precedes an idle dummy forward.
+    ready.connector.bind_connector_metadata(None)
+    ready.connector.capture(
+        ready.model,
+        torch.tensor([0]),
+        torch.tensor([0]),
+        (ready.output[0][:1], [value[:1] for value in ready.output[1]]),
+    )
+    assert len(ready.calls) == 1
+    assert ready.path.read_bytes() == packet
 
 
 @pytest.mark.parametrize("field", ["input_ids", "positions"])
@@ -387,8 +424,9 @@ def test_capture_rejects_prefix_position_mismatch_before_head(ready, field):
     value = getattr(ready, field).clone()
     value[0] += 1
     setattr(ready, field, value)
-    with pytest.raises(ValueError, match="tokens/positions"):
+    with pytest.raises(RuntimeError, match="packet export failed") as exc_info:
         _capture(ready)
+    assert "tokens/positions" in str(exc_info.value.__cause__)
     assert not ready.calls
 
 
@@ -405,8 +443,9 @@ def test_capture_rejects_bad_hidden_shape_or_dtype(ready, case):
     else:
         auxiliary.pop()
     ready.output = (normalized, auxiliary)
-    with pytest.raises(ValueError, match="shape/dtype"):
+    with pytest.raises(RuntimeError, match="packet export failed") as exc_info:
         _capture(ready)
+    assert "shape/dtype" in str(exc_info.value.__cause__)
     assert not ready.calls
 
 
@@ -422,7 +461,7 @@ def test_capture_rejects_nonfinite_export(ready, case):
         _capture(ready)
     assert isinstance(exc_info.value.__cause__, ValueError)
     assert "nonfinite" in str(exc_info.value.__cause__)
-    assert ready.module.test_group.flags[0].item() == 1
+    assert ready.module.test_group.flags[-1].item() == 1
     assert not ready.path.exists()
 
 
@@ -489,7 +528,7 @@ def test_root_io_failure_is_collectively_reported(ready, monkeypatch):
     with pytest.raises(RuntimeError, match="packet export failed") as exc_info:
         _capture(ready)
     assert isinstance(exc_info.value.__cause__, OSError)
-    assert ready.module.test_group.flags[0].item() == 1
+    assert ready.module.test_group.flags[-1].item() == 1
 
 
 def test_nonroot_receives_root_failure_after_native_head(ready, monkeypatch):
@@ -514,6 +553,179 @@ def test_export_dispatch_requires_correct_connector(ready, monkeypatch):
         ready.model, ready.input_ids, ready.positions, ready.output
     )
     assert ready.path.exists()
+
+
+class _Collective:
+    """Bounded CPU rendezvous: catches skipped/misordered TP/DP calls, not HCCL."""
+
+    def __init__(self):
+        self.barrier = Barrier(2, timeout=10)
+        self.lock = Lock()
+        self.values = []
+
+    def all_reduce(self, value):
+        with self.lock:
+            self.values.append(value.clone())
+        leader = self.barrier.wait()
+        result = torch.stack(self.values).sum(0).to(value.dtype)
+        self.barrier.wait()
+        if leader == 0:
+            self.values.clear()
+        self.barrier.wait()
+        return result
+
+
+def _run_dp2_round(module, monkeypatch, directory, lengths, *, fault=None):
+    """Four concurrent CPU workers emulate TP2 x DP2 with separate TP/DP groups."""
+    current_rank = ContextVar("block_worker_rank")
+    tp_groups = [_Collective(), _Collective()]
+    dp_groups = [_Collective(), _Collective()]
+    monkeypatch.setattr(
+        module, "get_tp_group", lambda: tp_groups[current_rank.get()[0]]
+    )
+    monkeypatch.setattr(
+        module, "get_dp_group", lambda: dp_groups[current_rank.get()[1]]
+    )
+    monkeypatch.setattr(
+        module, "get_tensor_model_parallel_rank", lambda: current_rank.get()[1]
+    )
+    weights = torch.arange(20).reshape(4, 5).float() / 40
+
+    def worker(dp_rank, tp_rank):
+        current_rank.set((dp_rank, tp_rank))
+        connector = module.DSV4BlockVerifyConnector(
+            _config(directory, dp_size=2, dp_rank=dp_rank), "worker", None
+        )
+        length = lengths[dp_rank]
+        metadata = None
+        tokens = torch.ones(length or 1, dtype=torch.int64)
+        normalized = (
+            torch.arange((length or 1) * 4).reshape(-1, 4).to(torch.bfloat16) / 8
+        )
+        auxiliary = [normalized + offset for offset in (10, 20, 30)]
+        if length:
+            request = _request(tokens=tokens.tolist(), logits_start=length // 2)
+            request.req_id = (
+                "cmpl-collision-0" if fault == "collision" else f"cmpl-dp{dp_rank}-0"
+            )
+            metadata = connector.build_connector_meta(_schedule(request))
+        elif fault == "empty_metadata":
+            metadata = connector.build_connector_meta(
+                SimpleNamespace(scheduled_new_reqs=[], num_scheduled_tokens={})
+            )
+        connector.bind_connector_metadata(metadata)
+        if fault == "validation" and (dp_rank, tp_rank) == (0, 1):
+            tokens[0] = 4
+        if fault == "ownership" and dp_rank == 0:
+            metadata.data_parallel_rank = 1
+        if fault == "write" and (dp_rank, tp_rank) == (0, 0):
+
+            def fail_write(*_args):
+                raise OSError("simulated DP0 full disk")
+
+            connector._write_output = fail_write
+        calls = []
+
+        def head(hidden):
+            calls.append(hidden.shape[0])
+            # Real CPU sharded projection plus a simulated TP collective. Unequal
+            # DP row counts must never enter the same head collective.
+            shard = slice(tp_rank * 2, tp_rank * 2 + 2)
+            partial = hidden[:, shard].float() @ weights[shard]
+            logits = tp_groups[dp_rank].all_reduce(partial)
+            return logits if tp_rank == 0 else None
+
+        error = None
+        try:
+            connector.capture(
+                SimpleNamespace(compute_logits=head),
+                tokens,
+                torch.arange(len(tokens)),
+                (normalized, auxiliary),
+            )
+        except RuntimeError as exc:
+            error = exc
+        return SimpleNamespace(
+            dp_rank=dp_rank,
+            tp_rank=tp_rank,
+            error=error,
+            calls=calls,
+            normalized=normalized,
+            auxiliary=auxiliary,
+            metadata=metadata,
+        )
+
+    with ThreadPoolExecutor(max_workers=4) as pool:
+        futures = [pool.submit(worker, dp, tp) for dp in range(2) for tp in range(2)]
+        return [future.result(timeout=30) for future in futures], weights
+
+
+@pytest.mark.parametrize(
+    ("lengths", "fault"),
+    [
+        ((4, 6), None),
+        ((4, 0), None),
+        ((0, 6), None),
+        ((0, 0), None),
+        ((4, 0), "empty_metadata"),
+    ],
+)
+def test_dp2_uneven_and_idle_engines_keep_packets_and_native_logits_local(
+    connector_module, monkeypatch, tmp_path, lengths, fault
+):
+    workers, weights = _run_dp2_round(
+        connector_module, monkeypatch, tmp_path, lengths, fault=fault
+    )
+    for worker in workers:
+        assert worker.error is None
+        length = lengths[worker.dp_rank]
+        assert worker.calls == ([length - length // 2] if length else [])
+        if not length or worker.tp_rank:
+            continue
+        request = worker.metadata.request
+        assert worker.metadata.data_parallel_rank == worker.dp_rank
+        packet = load_file(request.filename)
+        assert packet["token_ids"].tolist() == [1] * length
+        torch.testing.assert_close(
+            packet["logprobs"],
+            torch.log_softmax(
+                worker.normalized[request.logits_start :].float() @ weights, -1
+            ),
+        )
+        torch.testing.assert_close(
+            packet["hidden_states"],
+            torch.stack([value[1:] for value in worker.auxiliary], 1),
+        )
+    assert len(list(tmp_path.iterdir())) == sum(length > 0 for length in lengths)
+
+
+@pytest.mark.parametrize(
+    ("fault", "lengths"),
+    [
+        ("write", (4, 6)),
+        ("write", (4, 0)),
+        ("validation", (4, 6)),
+        ("ownership", (4, 6)),
+        ("collision", (4, 6)),
+    ],
+)
+def test_dp2_failure_reaches_both_engines_including_idle_peers(
+    connector_module, monkeypatch, tmp_path, fault, lengths
+):
+    workers, _ = _run_dp2_round(
+        connector_module, monkeypatch, tmp_path, lengths, fault=fault
+    )
+    assert all(isinstance(worker.error, RuntimeError) for worker in workers)
+    assert all("packet export failed" in str(worker.error) for worker in workers)
+    assert any(worker.error.__cause__ is not None for worker in workers)
+    if fault in {"validation", "ownership"}:
+        # A non-root TP validation error prevents BOTH peers entering the head.
+        assert all(not worker.calls for worker in workers if worker.dp_rank == 0)
+    if fault == "collision":
+        assert len(list(tmp_path.iterdir())) == 1
+        assert any(
+            isinstance(worker.error.__cause__, FileExistsError) for worker in workers
+        )
 
 
 class _TinyDraft(torch.nn.Module):

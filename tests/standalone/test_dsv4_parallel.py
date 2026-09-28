@@ -108,13 +108,34 @@ class ParallelTests(unittest.TestCase):
                     {"ASCEND_RT_VISIBLE_DEVICES": "0,1"},
                 )
 
-    def test_dp2_does_not_enable_block_evaluation(self):
-        with self.assertRaisesRegex(ValueError, "block verification"):
-            configure_parallel_args(
-                ["-dp", "2", "--enable-expert-parallel"],
-                {"ASCEND_RT_VISIBLE_DEVICES": "0,1"},
-                block_verify=True,
-            )
+    def test_dp2_block_evaluation_keeps_two_local_engines(self):
+        arguments = ["-tp", "8", "-dp", "2", "--enable-expert-parallel"]
+        topology = configure_parallel_args(
+            arguments,
+            {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16)))},
+            block_verify=True,
+        )
+        self.assertEqual(topology.data_parallel_size, 2)
+        self.assertEqual(topology.tensor_parallel_size, 8)
+        self.assertEqual(arguments[-2:], ["--data-parallel-size-local", "2"])
+
+    def test_dp2_block_keeps_topology_and_device_guards(self):
+        for extra, devices in (
+            (["--no-enable-expert-parallel"], "0,1"),
+            (["-dpl", "1"], "0,1"),
+            (["--data-parallel-external-lb"], "0,1"),
+            (["--data-parallel-backend", "ray"], "0,1"),
+            ([], "0"),
+        ):
+            with (
+                self.subTest(extra=extra, devices=devices),
+                self.assertRaises(ValueError),
+            ):
+                configure_parallel_args(
+                    ["-dp", "2", "-ep", *extra],
+                    {"ASCEND_RT_VISIBLE_DEVICES": devices},
+                    block_verify=True,
+                )
 
     def test_worker_runtime_rechecks_resolved_topology(self):
         good = {

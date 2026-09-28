@@ -180,8 +180,8 @@ DP=1 or 2, plus exactly two target hosts with global DP=4 and local DP=2 on each
 The underlying launcher still defaults to DP1; the server example defaults to
 TP8 x single-host DP2. DP2/DP4 require EP, the mp backend, and internal request
 dispatch. Other multi-host layouts, cross-host TP, Ray, and external load
-balancing are not enabled. Block
-verification and the automated offline evaluation launcher remain DP1-only.
+balancing are not enabled. Dedicated block verification supports single-host
+DP1/DP2; the automated single-host evaluation launcher still creates a DP1 target.
 Real A3 topology, HS export, and numerical agreement still require validation.
 The integration does not overwrite an existing vLLM/Ascend installation or
 change native V4 / Qwen registration.
@@ -197,13 +197,16 @@ pip install -e hs_connectors --no-deps
 If `VLLM_PLUGINS` is set as an allowlist, add `speculators_dsv4` while preserving
 other plugins required by Ascend. Otherwise vLLM discovers plugins automatically.
 
-Run all scripts from the repository root. Both launch scripts are preconfigured
-with the experiment's checkpoint, data/HS paths, 16 devices, and target master
-address `80.48.17.186:8001`; environment variables can override them.
-Both scripts default `TARGET_MASTER_IP` to `80.48.17.186`. The server derives its
-default `VLLM_HOST` from that value, and the trainer derives its default
-`VLLM_ENDPOINT` as `http://$TARGET_MASTER_IP:8001/v1`. Explicit `VLLM_HOST` and
-`VLLM_ENDPOINT` overrides still take precedence.
+Run all scripts from the repository root. The saved server/evaluator endpoint is
+`80.48.17.187:8001`; the server preserves the checkpoint directory
+`/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16`, HS directory
+`/mnt/nfs/dataset/tmp_hs`, TP8 x DP2 and devices 0-15. It defaults to
+`DSV4_EVAL=1` and `MAX_NUM_SEQS=64` for reference evaluation. Set `DSV4_EVAL=0`
+for the training-only HS options. Block mode is a separate opt-in below.
+Environment variables override these defaults. The trainer retains its earlier
+`TARGET_MASTER_IP=80.48.17.186` default: explicitly set it to `.187` (or set
+`VLLM_ENDPOINT`) when connecting to this saved single-host server. The server
+derives `VLLM_HOST` from its `TARGET_MASTER_IP`; explicit overrides take precedence.
 The server also defaults `TARGET_WORKER_IP` to `80.48.17.187` and
 `TARGET_IFNAME` to the confirmed interface `enp48s3u1u1` on both target hosts.
 The target and trainer must run on separate hosts with these defaults. Do not
@@ -308,7 +311,7 @@ export DSV4_EXECUTION_MODE=eager DSV4_ASYNC_SCHEDULING=0
 
 The server script's top-level configuration includes these variables. When
 `TARGET_LOCAL_IP` is unset, `DP_START_RANK=0` selects `TARGET_MASTER_IP`
-(`80.48.17.186`), and `DP_START_RANK=2` selects `TARGET_WORKER_IP`
+(`80.48.17.186` in the two-host example above), and `DP_START_RANK=2` selects `TARGET_WORKER_IP`
 (`80.48.17.187`). Do not export the same `TARGET_LOCAL_IP` on both hosts.
 The script uses the resolved local IP as the fallback for `HCCL_IF_IP`, and
 `TARGET_IFNAME` as the fallback for `GLOO_SOCKET_IFNAME`, `TP_SOCKET_IFNAME`, and
@@ -340,7 +343,7 @@ on a trusted network. Both targets use the same `DP_ADDRESS` and `DP_RPC_PORT`;
 those are separate from the HTTP bind address and port. Rank selection here is
 `DP_START_RANK`, not `node_rank` or `LOCAL_RANK`.
 
-With the configured paths and these deployment defaults, only `DP_SIZE=4` and
+After exporting the distinct master/worker addresses above, only `DP_SIZE=4` and
 the host's `DP_START_RANK` need to be selected at launch. On **target host 0
 (`80.48.17.186`)**, start the API and its two local engines:
 
@@ -361,8 +364,8 @@ start/poll a local HTTP API, and waits for its owned worker process. Its
 "process launched" message is **not cluster readiness**. Target host 0 creates
 the shared HS manifest; the headless host only waits for and validates it,
 without creating its own HS directory. Startup in either order is allowed within
-`DSV4_MANIFEST_TIMEOUT` (default 300 seconds). This timeout is separate from the
-API's `VLLM_STARTUP_TIMEOUT` (default 1800 seconds); increase both when needed.
+`DSV4_MANIFEST_TIMEOUT` (default 600 seconds). This timeout is separate from the
+API's `VLLM_STARTUP_TIMEOUT` (default 3600 seconds); increase both when needed.
 Both target launchers stay in the foreground and clean up only their own local
 process group. There is no automatic SSH launch or remote cleanup: stop both
 target scripts when ending the service, and inspect both logs after a failure.
@@ -416,9 +419,9 @@ draft architecture, loss, optimizer, learning rate, or `corrGate=0` recipe.
 validated by the local regressions.** Begin with eager/synchronous execution;
 compare graph and asynchronous scheduling separately only after that baseline
 passes. EP now communicates across hosts, so more devices do not guarantee lower
-HS latency or higher end-to-end training throughput. Existing request batch
-limits are unchanged. Block verification and automatic offline evaluation
-remain single-host DP1.
+HS latency or higher end-to-end training throughput. Block verification supports
+single-host DP1/DP2, not multi-host DP4. Automatic offline evaluation still
+launches a DP1 target; use the manual endpoint workflow for a DP2 target.
 
 ### Optional execution and scheduling modes
 
@@ -576,9 +579,10 @@ write failures. These checks do not replace teacher probability comparisons or
 DP1/DP2/DP4 numerical comparisons, and they are not throughput benchmarks.
 
 The ordinary HS/reference service can still enable full-logprob diagnostics
-with `DSV4_EVAL=1`. The automated offline launcher and dedicated
-`--dsv4-block-verify` service remain DP1-only; setting `DP_SIZE=2` or `4` does not
-enable these layouts for them.
+with `DSV4_EVAL=1`. The automated offline launcher remains DP1-only. The dedicated
+`--dsv4-block-verify` service supports single-host DP1/DP2, with eager execution,
+synchronous scheduling and one scheduled sequence per DP engine. It does not
+support DP4.
 
 On the trainer host:
 
@@ -620,7 +624,7 @@ script return only means the background process was launched: inspect the log
 to confirm initialization. `TRAINING_SMOKE=1` still runs in the foreground and
 propagates its exit code so fresh/resume stages execute sequentially.
 The API-host server script waits for readiness and stays in the foreground. Its default
-startup timeout is 1800 seconds, overridable with `VLLM_STARTUP_TIMEOUT`; early
+startup timeout is 3600 seconds, overridable with `VLLM_STARTUP_TIMEOUT`; early
 exit is an error. On Ctrl+C/exit, it cleans up only process groups it created.
 The server requires Linux `setsid`, and the API host also requires `curl`. A DP4
 headless host only supervises its local process, not cluster readiness.
@@ -1211,9 +1215,9 @@ export DSV4_EVAL=1
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
-`DSV4_EVAL=1` additionally sets `--max-logprobs 129280 --logprobs-mode raw_logprobs
---generation-config vllm`. Without this variable, the training HS service's launch
-arguments are unchanged. Completion requests use `logprobs=129280`, not
+`DSV4_EVAL=1` (the saved server default) sets `--max-logprobs 129280
+--logprobs-mode raw_logprobs --generation-config vllm`. Set `DSV4_EVAL=0` for
+training-only HS options. Completion requests use `logprobs=129280`, not
 `logprobs=-1`, and require token IDs as response keys so duplicate decoded strings
 cannot cause probabilities to be lost. This repository's `--dsv4` HS bridge is
 still required; an ordinary V4 serving instance cannot replace it.
@@ -1235,26 +1239,46 @@ export VERIFICATION_MODE=reference
 bash examples/evaluate/dspark_dsv4_offline_eval.sh
 ```
 
-To run block mode manually, start a separate dedicated service with both `--dsv4`
-and `--dsv4-block-verify` before `--`. An existing training/reference service cannot
-be used directly as a block service. For example:
+To run block mode with the saved TP8 x DP2 / 16-device server configuration:
 
 ```bash
-env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
-  ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" \
-  python scripts/launch_vllm.py "$MODEL" --dsv4 --dsv4-block-verify \
-  --hidden-states-path "$HS_PATH" --target-layer-ids 1 11 21 30 40 -- \
-  --tensor-parallel-size "$TP_SIZE" --data-parallel-size 1 \
-  --pipeline-parallel-size 1 --enable-expert-parallel \
-  --tokenizer-mode deepseek_v4 --max-model-len 4096 \
-  --max-num-batched-tokens 4096 --max-num-seqs 1 --block-size 128 \
-  --host "$VLLM_HOST" --port 8001 --max-logprobs 0 --generation-config vllm \
-  --additional-config '{"enable_flashcomm1": false, "enable_dsa_cp": false}'
+# Target host, on devices/port not owned by an active training/reference service:
+DSV4_BLOCK_VERIFY=1 bash examples/train/dspark_dsv4_flash_bf16_server.sh
+
+# Evaluation host, initially just one draft worker and a few samples:
+VERIFICATION_MODE=block EVAL_NPU=0 MAX_SAMPLES=4 MAX_NEW_TOKENS=64 \
+  bash examples/evaluate/dspark_dsv4_offline_eval.sh
 ```
 
-Add `--quantization` as required by the backend, keeping the quantization scheme
-consistent with validation and training, and use a fresh dedicated HS directory.
-Then set `VERIFICATION_MODE=block` and run the manual evaluation script. This
+`DSV4_BLOCK_VERIFY=1` adds `--dsv4-block-verify` before the launcher's `--`, takes
+precedence over `DSV4_EVAL`, and uses `--max-logprobs 0 --generation-config vllm`.
+It defaults `MAX_NUM_SEQS` to **1 per DP engine** (two simultaneous prefixes at
+DP2), preserving 64 for training/reference. An explicit incompatible value is
+rejected, as are DP4, graph mode and async scheduling. `TP_SIZE=8`, `DP_SIZE=2`,
+paths and the saved endpoint remain unchanged. The evaluator's `EVAL_NPU` worker
+count is independent of target DP. Sixteen draft workers queue against two target
+engines, not sixteen target replicas.
+
+Each request stays local to its DP engine and uses that engine's native TP head;
+only TP rank zero writes the request-UUID packet. Probability/HS file formats and
+acceptance logic are unchanged. Idle/dummy forwards do not export files but join
+error synchronization. Validation errors are synchronized within TP before the
+head; publication failures reach both DP engines before another MoE forward.
+Existing files are never overwritten on a request-ID collision.
+
+Local tests use real CPU tensors/files and simulated TP2 x DP2 rendezvous, not
+Ascend/HCCL. On A3, first test one active engine, concurrent unequal-length
+requests, repeated active/idle transitions, and export failures on an isolated
+test service. Check both engines' request logs and compare probabilities and
+acceptance statistics against reference; CPU tests do not establish hardware
+parity or throughput. Block mode still recomputes the full prefix and is not
+cached online speculative serving.
+
+An existing training/reference service cannot be used directly as a block
+service. Do not restart a service used by active training; use separately reserved
+devices/port or wait for the training job to finish. Set `TARGET_QUANTIZATION` as
+required by the backend, keeping it consistent with validation and training, and
+use a fresh dedicated HS directory when running separate services. This
 service does not return full-vocabulary HTTP logprobs and cannot serve a reference
 client. Likewise, an ordinary training HS service does not produce block
 probability files and cannot serve a block client. Both ends must explicitly

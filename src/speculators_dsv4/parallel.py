@@ -40,8 +40,10 @@ def validate_parallel_config(parallel, *, block_verify=False):
     dp = getattr(parallel, "data_parallel_size", 1)
     if dp not in (1, DP2_SIZE, DP4_SIZE):
         raise ValueError("DSV4 HS bridge supports data_parallel_size=1, 2 or 4 only.")
-    if block_verify and dp != 1:
-        raise ValueError("DSV4 block verification still requires data_parallel_size=1.")
+    if block_verify and dp not in (1, DP2_SIZE):
+        raise ValueError(
+            "DSV4 block verification supports single-host data_parallel_size=1 or 2."
+        )
     if getattr(parallel, "tensor_parallel_size", 1) < 1:
         raise ValueError("DSV4 tensor_parallel_size must be positive.")
     if dp == 1:
