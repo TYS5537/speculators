@@ -3,6 +3,7 @@
 # ruff: noqa: PT009 -- Also runnable without pytest/torch.
 
 import os
+import re
 import shlex
 import shutil
 import subprocess
@@ -260,8 +261,7 @@ class LaunchScriptTests(unittest.TestCase):
         ):
             script = ROOT / f"examples/evaluate/dspark_dsv4_{kind}_eval.sh"
             default_datasets = (
-                "gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,"
-                "alpaca,arena-hard-v2"
+                "gsm8k,math500,humaneval,mbpp,mt-bench"
                 if kind == "offline"
                 else "gsm8k,math500"
             )
@@ -410,15 +410,20 @@ class LaunchScriptTests(unittest.TestCase):
             "EVAL_NPU": ("--ascend-devices", ",".join(map(str, range(16))), "8,9"),
             "MAX_SAMPLES": ("--max-samples", None, "12"),
             "MAX_NEW_TOKENS": ("--max-new-tokens", "2048", "128"),
-            "DSV4_MAX_MODEL_LEN": ("--dsv4-max-model-len", "4096", "8192"),
-            "VERIFICATION_MODE": ("--dsv4-verification-mode", "reference", "block"),
-            "DSV4_BLOCK_OUTPUT": ("--dsv4-block-output", "auto", "full"),
+            "DSV4_MAX_MODEL_LEN": ("--dsv4-max-model-len", "8192", "4096"),
+            "TARGET_REQUEST_TIMEOUT": ("--target-request-timeout", "1200", "45"),
+            "VERIFICATION_MODE": ("--dsv4-verification-mode", "block", "reference"),
+            "DSV4_BLOCK_OUTPUT": ("--dsv4-block-output", "full", "auto"),
             "DSV4_REPLAY_CACHE": (
                 "--dsv4-replay-cache",
-                "dsv4_greedy_traces",
+                "./dsv4_greedy_traces",
                 "/fixture/cache traces",
             ),
-            "DSV4_REPLAY_CACHE_TAG": ("--dsv4-replay-cache-tag", "", "runtime-a"),
+            "DSV4_REPLAY_CACHE_TAG": (
+                "--dsv4-replay-cache-tag",
+                "stack-v1",
+                "runtime-a",
+            ),
             "DSV4_REPLAY_AUDIT_SAMPLES": ("--dsv4-replay-audit-samples", "0", "2"),
         }
         script = ROOT / "examples/evaluate/dspark_dsv4_offline_eval.sh"
@@ -435,7 +440,7 @@ class LaunchScriptTests(unittest.TestCase):
                         "SERVED_MODEL_NAME": "",
                         "DSV4_PROFILE": "1" if use_overrides else "0",
                         "DSV4_KV_REUSE": "1" if use_overrides else "0",
-                        "DRAFT_KV_REUSE": "1" if use_overrides else "0",
+                        "DRAFT_KV_REUSE": "0" if use_overrides else None,
                     }
                 )
                 source = r"""exec() { printf '%s\0' "$@"; }"""
@@ -455,7 +460,7 @@ class LaunchScriptTests(unittest.TestCase):
                 args = result.stdout.split("\0")[:-1]
                 self.assertEqual("--dsv4-profile" in args, use_overrides)
                 self.assertEqual("--dsv4-kv-reuse" in args, use_overrides)
-                self.assertEqual("--draft-kv-reuse" in args, use_overrides)
+                self.assertEqual("--draft-kv-reuse" in args, not use_overrides)
                 for flag, default, override in settings.values():
                     if not use_overrides and default is None:
                         self.assertNotIn(flag, args)
@@ -522,7 +527,12 @@ exec() {
                     )
 
     def test_http_eval_and_sidecar_wiring_without_shared_storage(self):
-        for sidecar in (False, True):
+        for sidecar, use_defaults in (
+            (False, False),
+            (True, False),
+            (False, True),
+            (True, True),
+        ):
             relative = (
                 "train/dspark_dsv4_hs_http_server.sh"
                 if sidecar
@@ -534,13 +544,22 @@ exec() {
                     "VERIFIER_MODEL": "/fixture/target",
                     "DRAFT_MODEL": "/fixture/draft",
                     "DATASETS_ROOT": "/fixture/eval",
-                    "HS_PATH": "/target/hs" if sidecar else "",
+                    "HS_PATH": None
+                    if use_defaults
+                    else "/target/hs"
+                    if sidecar
+                    else "",
                     "VLLM_ENDPOINT": "http://target.fixture:8001/v1",
                     "EVAL_NPU": "8,9",
-                    "HS_HTTP_ENDPOINT": "http://target.fixture:8002",
-                    "HS_HTTP_HOST": "10.0.0.10",
-                    "HS_HTTP_PORT": "8002",
-                    "DSV4_HS_HTTP_TOKEN": "fixture-secret-01234567890123456789",
+                    "HS_HTTP_ENDPOINT": None
+                    if use_defaults
+                    else "http://target.fixture:8002",
+                    "HS_HTTP_HOST": None if use_defaults else "10.0.0.10",
+                    "HS_HTTP_PORT": None if use_defaults else "8002",
+                    "HS_HTTP_MAX_FILE_BYTES": None,
+                    "DSV4_HS_HTTP_TOKEN": None
+                    if use_defaults
+                    else "fixture-secret-01234567890123456789",
                     "OUTPUT_DIR": "/eval/output",
                     "KEEP_TARGET_HS": "0",
                 }
@@ -559,21 +578,48 @@ exec() {
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             args = result.stdout.split("\0")[:-1]
-            self.assertNotIn(environment["DSV4_HS_HTTP_TOKEN"], args)
+            if not use_defaults:
+                self.assertNotIn(environment["DSV4_HS_HTTP_TOKEN"], args)
+            self.assertFalse(any(re.fullmatch(r"[0-9a-f]{64}", arg) for arg in args))
             if sidecar:
                 self.assertIn("speculators_dsv4.hs_http_server", args)
-                self.assertEqual(args[args.index("--host") + 1], "10.0.0.10")
+                self.assertEqual(
+                    args[args.index("--host") + 1],
+                    "80.48.17.187" if use_defaults else "10.0.0.10",
+                )
+                self.assertEqual(args[args.index("--port") + 1], "8002")
+                self.assertEqual(args[args.index("--max-file-bytes") + 1], "536870912")
+                self.assertEqual(
+                    args[args.index("--hidden-states-path") + 1],
+                    "/home/s00969542/DSV4F/tmp_hs" if use_defaults else "/target/hs",
+                )
                 self.assertNotIn("scripts/launch_vllm.py", args)
             else:
                 self.assertEqual(
                     args[args.index("--hs-http-endpoint") + 1],
-                    "http://target.fixture:8002",
+                    "http://80.48.17.187:8002"
+                    if use_defaults
+                    else "http://target.fixture:8002",
                 )
                 self.assertEqual(
                     args[args.index("--hidden-states-path") + 1],
                     "/eval/output/target-hs-downloads",
                 )
                 self.assertEqual(args[args.index("--ascend-devices") + 1], "8,9")
+
+    def test_saved_http_tokens_match_without_putting_credentials_in_argv(self):
+        tokens = []
+        for relative in (
+            "train/dspark_dsv4_hs_http_server.sh",
+            "evaluate/dspark_dsv4_offline_eval.sh",
+        ):
+            source = (ROOT / "examples" / relative).read_text(encoding="utf-8")
+            match = re.search(r"DSV4_HS_HTTP_TOKEN:=([0-9a-f]{64})\}", source)
+            self.assertIsNotNone(match)
+            tokens.append(match.group(1))
+            self.assertIn("export DSV4_HS_HTTP_TOKEN", source)
+        # Avoid printing credentials in assertion failures.
+        self.assertTrue(tokens[0] == tokens[1], "Saved client/server tokens differ")
 
     def test_inherited_shell_startup_is_not_executed(self):
         startup, marker = self.root / "startup.sh", self.root / "startup-ran"
@@ -684,7 +730,7 @@ exec() {
         self.assertIn("execution mode: eager; async scheduling: 0", result.stdout)
         self.assertRegex(self.signals.read_text(), r"^-TERM -- -[1-9][0-9]*\n$")
 
-    def test_server_preserves_user_paths_and_reference_defaults(self):
+    def test_server_preserves_user_paths_and_block_defaults(self):
         result = self.run_script(
             "server",
             MODEL=None,
@@ -694,20 +740,24 @@ exec() {
             TARGET_LOCAL_IP=None,
             TARGET_IFNAME=None,
             DSV4_EVAL=None,
+            DSV4_BLOCK_VERIFY=None,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.capture.read_text().splitlines()
         self.assertIn("/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16", args)
         for flag, expected in (
-            ("--hidden-states-path", "/mnt/nfs/dataset/tmp_hs"),
+            ("--hidden-states-path", "/home/s00969542/DSV4F/tmp_hs"),
             ("--host", "80.48.17.187"),
             ("--port", "8001"),
             ("--dsv4-manifest-timeout", "600"),
-            ("--max-num-seqs", "64"),
-            ("--max-logprobs", "129280"),
-            ("--logprobs-mode", "raw_logprobs"),
+            ("--max-num-seqs", "16"),
+            ("--max-logprobs", "0"),
+            ("--max-model-len", "8192"),
+            ("--max-num-batched-tokens", "8192"),
         ):
             self.assertEqual(args[args.index(flag) + 1], expected)
+        self.assertIn("--dsv4-block-verify", args)
+        self.assertNotIn("--logprobs-mode", args)
         self.assertEqual(self.proxy_environment()["HCCL_IF_IP"], "80.48.17.187")
         self.assertEqual(self.proxy_environment()["HCCL_SOCKET_IFNAME"], "enp48s3u1u1")
 
@@ -725,7 +775,7 @@ exec() {
                     ("--data-parallel-size", dp),
                     ("--data-parallel-size-local", dp),
                     ("--max-num-seqs", "16"),
-                    ("--max-num-batched-tokens", "4096"),
+                    ("--max-num-batched-tokens", "8192"),
                     ("--max-logprobs", "0"),
                     ("--generation-config", "vllm"),
                 ):
@@ -739,7 +789,7 @@ exec() {
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.capture.read_text().splitlines()
         self.assertEqual(args[args.index("--max-num-seqs") + 1], "1")
-        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "4096")
+        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "8192")
 
     def test_server_rejects_unsafe_block_options_before_launch(self):
         for overrides in (
@@ -764,12 +814,12 @@ exec() {
             "server",
             DSV4_BLOCK_VERIFY="1",
             MAX_NUM_SEQS="2",
-            MAX_NUM_BATCHED_TOKENS="8192",
+            MAX_NUM_BATCHED_TOKENS="16384",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.capture.read_text().splitlines()
         self.assertEqual(args[args.index("--max-num-seqs") + 1], "2")
-        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "8192")
+        self.assertEqual(args[args.index("--max-num-batched-tokens") + 1], "16384")
 
     def test_two_host_head_starts_local_engines_and_keeps_http_readiness(self):
         result = self.run_script("server", DP_SIZE="4", DP_ADDRESS="10.0.0.10")
@@ -1074,8 +1124,8 @@ exec() {
                         ("--tensor-parallel-size", "8"),
                         ("--data-parallel-size", "2"),
                         ("--data-parallel-size-local", "2"),
-                        ("--max-model-len", "4096"),
-                        ("--max-num-batched-tokens", "4096"),
+                        ("--max-model-len", "8192"),
+                        ("--max-num-batched-tokens", "8192"),
                         ("--max-num-seqs", "64"),
                     ):
                         self.assertEqual(args[args.index(flag) + 1], value)

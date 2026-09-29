@@ -13,6 +13,7 @@ import tempfile
 import time
 from contextlib import contextmanager
 from http import HTTPStatus
+from http.client import HTTPException
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from urllib.error import HTTPError
 from urllib.parse import urlsplit
@@ -90,6 +91,18 @@ class _NoRedirect(HTTPRedirectHandler):
     def redirect_request(self, request, response, *args, **kwargs):  # noqa: ARG002 -- urllib hook.
         response.close()
         raise ValueError("HS HTTP redirects are disabled to protect credentials")
+
+
+class _DownloadIntegrityError(ValueError):
+    def __init__(self, message, details):
+        self.details = details
+        # The evaluator also saves str(error), so these fields survive even if
+        # the separate failed-download evidence cannot be written.
+        super().__init__(
+            message
+            + ": "
+            + ", ".join(f"{key}={value}" for key, value in details.items())
+        )
 
 
 class HttpHiddenStates:
@@ -196,12 +209,53 @@ class HttpHiddenStates:
                         raise TimeoutError("HS HTTP download exceeded its time budget")
                     chunk = response.read(min(CHUNK_BYTES, length - received))
                     if not chunk:
-                        raise ValueError("Incomplete HS HTTP download")
+                        break
                     stream.write(chunk)
                     checksum.update(chunk)
                     received += len(chunk)
-            if checksum.hexdigest() != digest:
-                raise ValueError("HS HTTP checksum mismatch")
+            details = {
+                "artifact": name,
+                "expected_bytes": length,
+                "received_bytes": received,
+                "expected_sha256": digest,
+                "actual_sha256": checksum.hexdigest(),
+            }
+            if received != length:
+                raise _DownloadIntegrityError("Incomplete HS HTTP download", details)
+            if details["actual_sha256"] != digest:
+                raise _DownloadIntegrityError("HS HTTP checksum mismatch", details)
+
+    def _preserve_failed_download(self, path, error):
+        try:
+            if not path.is_file():
+                return
+            root = self.directory / "failed-downloads"
+            root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            directory = Path(tempfile.mkdtemp(prefix="hshttp-", dir=root))
+            details = {
+                "schema_version": 1,
+                "artifact": path.name,
+                "received_bytes": path.stat().st_size,
+                "error_type": type(error).__name__,
+                "error": str(error),
+            }
+            if isinstance(error, _DownloadIntegrityError):
+                details.update(error.details)
+            path.rename(directory / path.name)
+            (directory / "error.json").write_text(
+                json.dumps(details, indent=2, ensure_ascii=True), encoding="utf-8"
+            )
+            logger.warning(
+                "HS HTTP failed download saved to %s; remote artifact retained "
+                "(contains HS data; redact before sharing)",
+                directory,
+            )
+        except OSError as diagnostic_error:
+            logger.warning(
+                "Could not preserve HS HTTP failed download (%s); "
+                "remote artifact retained and original error preserved",
+                type(diagnostic_error).__name__,
+            )
 
     def _delete(self, name):
         with self._open("/v1/files/" + name, method="DELETE"):
@@ -217,7 +271,11 @@ class HttpHiddenStates:
             path = Path(temporary) / name
             if download:
                 # A failed/truncated transfer retains the remote file for diagnosis.
-                self._download(name, path)
+                try:
+                    self._download(name, path)
+                except (OSError, ValueError, HTTPException) as error:
+                    self._preserve_failed_download(path, error)
+                    raise
             try:
                 yield path if download else None
             finally:

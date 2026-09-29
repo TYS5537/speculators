@@ -10,12 +10,13 @@ import os
 import tempfile
 import threading
 import unittest
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import ProxyHandler, Request, build_opener
 
-from speculators_dsv4 import HS_FORMAT
+from speculators_dsv4 import HS_FORMAT, hs_http_server
 from speculators_dsv4.contract import MANIFEST
 from speculators_dsv4.hs_http import HttpHiddenStates, validate_endpoint, validate_token
 from speculators_dsv4.hs_http_server import HiddenStatesServer
@@ -88,6 +89,117 @@ class HttpTransportTests(unittest.TestCase):
             self.assertTrue(downloaded.exists())
         self.assertTrue(path.exists())
         self.assertEqual(list(self.local.iterdir()), [])
+
+    def test_checksum_and_body_use_one_snapshot_even_if_source_changes(self):
+        original = b"first-version-00"
+        changed = b"other-version-00"
+        request_id, path = self.artifact(original)
+        end_headers = hs_http_server._Handler.end_headers
+
+        def change_after_headers(handler):
+            if handler.path == "/v1/files/" + path.name:
+                path.write_bytes(changed)
+            end_headers(handler)
+
+        with patch.object(hs_http_server._Handler, "end_headers", change_after_headers):
+            with self.client.artifact(str(path), request_id, keep=True) as downloaded:
+                self.assertEqual(downloaded.read_bytes(), original)
+        self.assertEqual(path.read_bytes(), changed)
+
+    def changing_source(self, path, content):
+        regular_file = hs_http_server._regular_file
+        changed = False
+
+        @contextmanager
+        def open_file(candidate, limit):
+            nonlocal changed
+            with regular_file(candidate, limit) as stream:
+                read = stream.read
+
+                def read_and_change(size):
+                    nonlocal changed
+                    chunk = read(size)
+                    if not changed:
+                        changed = True
+                        path.write_bytes(content)
+                    return chunk
+
+                if candidate == path:
+                    with patch.object(stream, "read", side_effect=read_and_change):
+                        yield stream
+                else:
+                    yield stream
+
+        return patch.object(hs_http_server, "_regular_file", open_file)
+
+    def test_source_change_during_snapshot_returns_pending_before_headers(self):
+        _, path = self.artifact(b"original")
+        with self.changing_source(path, b"changed-longer"):
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/files/" + path.name)
+            self.assertEqual(caught.exception.code, 409)
+            caught.exception.close()
+        self.assertTrue(path.exists())
+
+    def test_client_retries_same_artifact_after_source_stabilizes(self):
+        request_id, path = self.artifact(b"original")
+        changed = b"changed-longer"
+        with self.changing_source(path, changed):
+            with self.client.artifact(str(path), request_id, keep=True) as downloaded:
+                self.assertEqual(downloaded.read_bytes(), changed)
+        self.assertTrue(path.exists())
+
+    def test_snapshot_growth_is_bounded_by_file_limit(self):
+        _, path = self.artifact(b"small")
+        self.server.max_file_bytes = 8
+        with self.changing_source(path, b"x" * 100):
+            with self.assertRaises(HTTPError) as caught:
+                self.request("/v1/files/" + path.name)
+            self.assertEqual(caught.exception.code, 400)
+            caught.exception.close()
+        self.assertTrue(path.exists())
+
+    def test_snapshot_spills_to_disk_and_closes_after_download(self):
+        request_id, path = self.artifact(b"snapshot-data" * 100)
+        snapshots = []
+        closed = threading.Event()
+        spool = tempfile.SpooledTemporaryFile
+
+        @contextmanager
+        def create_snapshot(*args, **kwargs):
+            with spool(*args, **kwargs) as snapshot:
+                snapshots.append(snapshot)
+                yield snapshot
+            closed.set()
+
+        with (
+            patch.object(hs_http_server, "SNAPSHOT_MEMORY_BYTES", 8),
+            patch.object(
+                hs_http_server.tempfile, "SpooledTemporaryFile", create_snapshot
+            ),
+        ):
+            with self.client.artifact(str(path), request_id, keep=True) as downloaded:
+                self.assertEqual(downloaded.read_bytes(), path.read_bytes())
+        self.assertEqual(len(snapshots), 1)
+        self.assertTrue(snapshots[0]._rolled)
+        # The client can finish reading just before the server closes its snapshot.
+        self.assertTrue(closed.wait(timeout=2))
+        self.assertTrue(snapshots[0].closed)
+
+    def test_send_failure_does_not_append_an_http_error_to_binary_body(self):
+        _, path = self.artifact()
+
+        def interrupted(handler, path, *, delete):
+            handler.send_response(200)
+            handler.send_header("Content-Length", "1024")
+            handler.end_headers()
+            handler.wfile.write(b"partial")
+            raise OSError("interrupted send")
+
+        with patch.object(hs_http_server._Handler, "_artifact", interrupted):
+            with self.request("/v1/files/" + path.name) as response:
+                self.assertEqual(response.read(1024), b"partial")
+        self.assertTrue(path.exists())
 
     def test_intermediate_reference_request_does_not_download(self):
         request_id, path = self.artifact()
@@ -221,13 +333,42 @@ class HttpTransportTests(unittest.TestCase):
             response = io.BytesIO(b"data")
             response.headers = {"Content-Length": str(length), "X-HS-SHA256": digest}
             with (
-                patch.object(self.client, "_open", return_value=response),
-                self.assertRaises(ValueError),
+                patch.object(self.client, "_open", return_value=response) as opened,
+                self.assertRaises(ValueError) as caught,
             ):
                 with self.client.artifact(str(path), request_id):
                     self.fail("Unexpected download")
+            opened.assert_called_once_with("/v1/files/" + path.name)
             self.assertTrue(path.exists())
-            self.assertEqual(list(self.local.iterdir()), [])
+            if length <= self.client.max_file_bytes:
+                self.assertIn(path.name, str(caught.exception))
+                self.assertIn(digest, str(caught.exception))
+                self.assertIn(
+                    hashlib.sha256(b"data").hexdigest(), str(caught.exception)
+                )
+                metadata = list(self.local.glob("failed-downloads/*/error.json"))
+                self.assertEqual(len(metadata), 1 if length == 4 else 2)
+                for item in metadata:
+                    saved = json.loads(item.read_text())
+                    self.assertEqual(saved["artifact"], path.name)
+                    self.assertEqual(saved["received_bytes"], 4)
+                    self.assertEqual((item.parent / path.name).read_bytes(), b"data")
+                    self.assertNotIn(TOKEN, item.read_text())
+            self.assertFalse(list(self.local.glob("hshttp-*")))
+
+    def test_failure_evidence_error_does_not_mask_checksum_error(self):
+        request_id, path = self.artifact()
+        response = io.BytesIO(b"data")
+        response.headers = {"Content-Length": "4", "X-HS-SHA256": "0" * 64}
+        with (
+            patch.object(self.client, "_open", return_value=response),
+            patch.object(Path, "rename", side_effect=OSError("cannot save evidence")),
+            self.assertLogs("speculators_dsv4.hs_http", level="WARNING"),
+            self.assertRaisesRegex(ValueError, "HS HTTP checksum mismatch"),
+        ):
+            with self.client.artifact(str(path), request_id):
+                self.fail("Unexpected download")
+        self.assertTrue(path.exists())
 
     def test_changed_manifest_or_mismatched_checkpoint_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "mismatch"):

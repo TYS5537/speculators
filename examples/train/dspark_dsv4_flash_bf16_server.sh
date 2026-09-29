@@ -5,7 +5,7 @@
 set -euo pipefail
 # Defaults use one target host and one separate trainer host.
 MODEL="${MODEL:-/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
-HS_PATH="${HS_PATH:-/mnt/nfs/dataset/tmp_hs}"
+HS_PATH="${HS_PATH:-/home/s00969542/DSV4F/tmp_hs}"
 VLLM_NPUS="${VLLM_NPUS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 TP_SIZE="${TP_SIZE:-8}"
 DP_SIZE="${DP_SIZE:-2}"  # Global DP. DP4 uses two target hosts; DP1/2 uses one.
@@ -37,8 +37,8 @@ fi
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-3600}"
 DSV4_MANIFEST_TIMEOUT="${DSV4_MANIFEST_TIMEOUT:-600}"
 export DSV4_EVAL="${DSV4_EVAL:-1}"  # 0: training HS; 1: reference evaluation.
-# Opt in to a dedicated block service; takes precedence over DSV4_EVAL.
-DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-0}"
+# Dedicated block service by default; set 0 for reference/training HS.
+DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-1}"
 # Optional target KV reuse. Budget is HOST RAM per target process, not NPU HBM.
 DSV4_KV_REUSE="${DSV4_KV_REUSE:-0}"
 DSV4_KV_CACHE_MB="${DSV4_KV_CACHE_MB:-1024}"
@@ -72,7 +72,7 @@ case "$DSV4_BLOCK_VERIFY" in
 esac
 # Keep the token budget separate from the concurrency limit. KV hits compute only
 # the new suffix; cold/missed full prefixes can still queue behind this budget.
-MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-4096}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 case "$DSV4_KV_REUSE" in
   0) ;;
   1)
@@ -252,7 +252,7 @@ setsid env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
     --enable-expert-parallel \
     --tokenizer-mode deepseek_v4 \
     "${target_http_args[@]}" \
-    --max-model-len 4096 \
+    --max-model-len 8192 \
     --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
     --max-num-seqs "$MAX_NUM_SEQS" \
     --block-size 128 \

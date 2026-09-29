@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Experimental DSV4 acceptance-length reference evaluation through an HS server.
-# Start the target with DSV4_EVAL=1 using the matching --dsv4 HS bridge first.
-# VERIFICATION_MODE=block requires a dedicated --dsv4-block-verify target instead.
+# Experimental DSV4 acceptance-length evaluation through an HS server.
+# Defaults to block verification using a dedicated --dsv4-block-verify target.
+# VERIFICATION_MODE=reference needs DSV4_BLOCK_VERIFY=0 and DSV4_EVAL=1 there.
 # VERIFICATION_MODE=replay requires DSV4_GREEDY_REPLAY=1 on that block target.
 # Only the dense draft and target IO weights are loaded on the evaluation device.
 # Full-prefix target recomputation and file/API transfers are NOT serving speed.
@@ -10,21 +10,21 @@ set -euo pipefail
 
 # Dataset selection: edit the comma-separated JSONL names/stems here.
 # Environment overrides are supported; DATASETS="" evaluates all discovered files.
-DATASETS="${DATASETS-gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,alpaca,arena-hard-v2}"
+DATASETS="${DATASETS-gsm8k,math500,humaneval,mbpp,mt-bench}"
 # Empty uses the Qwen evaluator's per-dataset caps; set a number to override.
 : "${MAX_SAMPLES:=}"
 # Auto compacts temperature=0 block results when the draft needs no target logits.
 # Requires the updated block server; full + DSV4_PROFILE=0 uses the old protocol.
-: "${DSV4_BLOCK_OUTPUT:=auto}"
+: "${DSV4_BLOCK_OUTPUT:=full}"
 # Diagnostic mode synchronizes devices and writes timing.json (not serving speed).
 : "${DSV4_PROFILE:=0}"
 # Requires DSV4_KV_REUSE=1 on the dedicated block target too.
 : "${DSV4_KV_REUSE:=0}"
 # Draft-only context/KV cache; independent of target reuse, no server changes.
-: "${DRAFT_KV_REUSE:=0}"
+: "${DRAFT_KV_REUSE:=1}"
 # VERIFICATION_MODE=replay needs a DSV4_GREEDY_REPLAY=1 target; reuse across drafts.
-: "${DSV4_REPLAY_CACHE:=dsv4_greedy_traces}"
-: "${DSV4_REPLAY_CACHE_TAG:=}"
+: "${DSV4_REPLAY_CACHE:=./dsv4_greedy_traces}"
+: "${DSV4_REPLAY_CACHE_TAG:=stack-v1}"
 : "${DSV4_REPLAY_AUDIT_SAMPLES:=0}"  # First N samples per worker also run live block.
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -38,10 +38,12 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTH
 : "${DRAFT_MODEL:=output/dspark_dsv4_flash_bestArch/checkpoints/9/}"
 : "${DATASETS_ROOT:=../DeepSpec/eval_datasets}"
 # HTTP mode needs no shared HS mount. HS_PATH then holds temporary local downloads.
-# Export the same DSV4_HS_HTTP_TOKEN on both machines; never put it in CLI arguments.
-HS_HTTP_ENDPOINT="${HS_HTTP_ENDPOINT:-}"
+# Set HS_HTTP_ENDPOINT="" explicitly to use shared-file transport instead.
+# Saved deployment token matches the sidecar; override it on both hosts to rotate.
+# Never put the token in CLI arguments.
+HS_HTTP_ENDPOINT="${HS_HTTP_ENDPOINT-http://80.48.17.187:8002}"
 if [[ -n "$HS_HTTP_ENDPOINT" ]]; then
-  : "${DSV4_HS_HTTP_TOKEN:?Export the HS sidecar bearer token}"
+  : "${DSV4_HS_HTTP_TOKEN:=8d4f1c7a9e2b6f30c5a1d8e74b9c2f61a7e5d3c8b0f2496e1c7a4d8b5f2e9031}"
   export DSV4_HS_HTTP_TOKEN
   HS_PATH="${HS_PATH:-${OUTPUT_DIR:-dspark_dsv4_reference_eval}/target-hs-downloads}"
 else
@@ -54,7 +56,7 @@ fi
 cmd=(
   python3 scripts/evaluate/dspark_offline_eval.py
   --target-backend dsv4-vllm
-  --dsv4-verification-mode "${VERIFICATION_MODE:-reference}"
+  --dsv4-verification-mode "${VERIFICATION_MODE:-block}"
   --dsv4-block-output "$DSV4_BLOCK_OUTPUT"
   --dsv4-replay-cache "$DSV4_REPLAY_CACHE"
   --dsv4-replay-cache-tag "$DSV4_REPLAY_CACHE_TAG"
@@ -64,8 +66,8 @@ cmd=(
   --datasets-root "$DATASETS_ROOT"
   --hidden-states-path "$HS_PATH"
   --vllm-endpoint "$VLLM_ENDPOINT"
-  --dsv4-max-model-len "${DSV4_MAX_MODEL_LEN:-4096}"
-  --target-request-timeout "${TARGET_REQUEST_TIMEOUT:-120}"
+  --dsv4-max-model-len "${DSV4_MAX_MODEL_LEN:-8192}"
+  --target-request-timeout "${TARGET_REQUEST_TIMEOUT:-1200}"
   --output-dir "${OUTPUT_DIR:-dspark_dsv4_reference_eval}"
   --max-new-tokens "${MAX_NEW_TOKENS:-2048}"
   --temperature "${TEMPERATURE:-0.0}"

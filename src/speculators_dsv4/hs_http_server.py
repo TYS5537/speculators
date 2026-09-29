@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import stat
+import tempfile
 from contextlib import contextmanager, suppress
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +26,7 @@ from speculators_dsv4.hs_http import (
 
 logger = logging.getLogger(__name__)
 MAX_PORT = 65535
+SNAPSHOT_MEMORY_BYTES = 8 * CHUNK_BYTES
 
 
 @contextmanager
@@ -70,6 +72,52 @@ def _writer_lock(path):
     with _regular_file(lock, MAX_MANIFEST_BYTES) as stream:
         fcntl.flock(stream.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         yield
+
+
+def _file_version(info):
+    return (
+        info.st_dev,
+        info.st_ino,
+        info.st_mode,
+        info.st_nlink,
+        info.st_size,
+        info.st_mtime_ns,
+        info.st_ctime_ns,
+    )
+
+
+@contextmanager
+def _snapshot_file(stream, path, limit):
+    """Hash and send the same bounded snapshot, never two reads of the producer."""
+    before = os.fstat(stream.fileno())
+    named_before = path.lstat()
+    if (before.st_dev, before.st_ino) != (named_before.st_dev, named_before.st_ino):
+        raise BlockingIOError("HS artifact was replaced before snapshot")
+    with tempfile.SpooledTemporaryFile(max_size=SNAPSHOT_MEMORY_BYTES) as snapshot:
+        digest = hashlib.sha256()
+        length = 0
+        while chunk := stream.read(min(CHUNK_BYTES, limit + 1 - length)):
+            length += len(chunk)
+            if length > limit:
+                raise ValueError("HS artifact grew beyond the file size limit")
+            snapshot.write(chunk)
+            digest.update(chunk)
+        version = _file_version(before)
+        if (
+            length != before.st_size
+            or _file_version(os.fstat(stream.fileno())) != version
+            # Compare each stat API to itself: Windows fstat/lstat ctime values
+            # can differ even for the same unchanged file.
+            or _file_version(path.lstat()) != _file_version(named_before)
+        ):
+            # The existing 409 retry waits for a stable artifact without another
+            # model request, accepting partial data, or removing the source.
+            logger.warning("HS artifact changed during snapshot: %s", path.name)
+            raise BlockingIOError("HS artifact changed during snapshot")
+        if not length:
+            raise BlockingIOError("HS artifact is still empty")
+        snapshot.seek(0)
+        yield snapshot, length, digest.hexdigest()
 
 
 class HiddenStatesServer(ThreadingHTTPServer):
@@ -119,12 +167,21 @@ class _Handler(BaseHTTPRequestHandler):
     def do_DELETE(self):
         self._dispatch(delete=True)
 
+    def end_headers(self):
+        self._response_started = True
+        super().end_headers()
+
     def _empty(self, status):
+        if self._response_started:
+            # Once a body has started, another HTTP response would corrupt it.
+            self.close_connection = True
+            return
         self.send_response(status)
         self.send_header("Content-Length", "0")
         self.end_headers()
 
     def _dispatch(self, *, delete):
+        self._response_started = False
         authorization = self.headers.get("Authorization", "")
         if not hmac.compare_digest(
             authorization.encode(), ("Bearer " + self.server.token).encode()
@@ -170,18 +227,18 @@ class _Handler(BaseHTTPRequestHandler):
             # deletion. Return 409 through _dispatch and let the client retry.
             with _regular_file(path, self.server.max_file_bytes) as stream:
                 if not delete:
-                    digest = hashlib.sha256()
-                    for chunk in iter(lambda: stream.read(CHUNK_BYTES), b""):
-                        digest.update(chunk)
-                    length = stream.tell()
-                    stream.seek(0)
-                    self.send_response(HTTPStatus.OK)
-                    self.send_header("Content-Type", "application/octet-stream")
-                    self.send_header("Content-Length", str(length))
-                    self.send_header("X-HS-SHA256", digest.hexdigest())
-                    self.end_headers()
-                    for chunk in iter(lambda: stream.read(CHUNK_BYTES), b""):
-                        self.wfile.write(chunk)
+                    with _snapshot_file(stream, path, self.server.max_file_bytes) as (
+                        snapshot,
+                        length,
+                        digest,
+                    ):
+                        self.send_response(HTTPStatus.OK)
+                        self.send_header("Content-Type", "application/octet-stream")
+                        self.send_header("Content-Length", str(length))
+                        self.send_header("X-HS-SHA256", digest)
+                        self.end_headers()
+                        for chunk in iter(lambda: snapshot.read(CHUNK_BYTES), b""):
+                            self.wfile.write(chunk)
             if delete:
                 path.unlink()
         if delete:

@@ -203,9 +203,10 @@ other plugins required by Ascend. Otherwise vLLM discovers plugins automatically
 Run all scripts from the repository root. The saved server/evaluator endpoint is
 `80.48.17.187:8001`; the server preserves the checkpoint directory
 `/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16`, HS directory
-`/mnt/nfs/dataset/tmp_hs`, TP8 x DP2 and devices 0-15. It defaults to
-`DSV4_EVAL=1` and `MAX_NUM_SEQS=64` for reference evaluation. Set `DSV4_EVAL=0`
-for the training-only HS options. Block mode is a separate opt-in below.
+`/home/s00969542/DSV4F/tmp_hs`, TP8 x DP2 and devices 0-15. It defaults to
+`DSV4_BLOCK_VERIFY=1`, `DSV4_EVAL=1`, `MAX_NUM_SEQS=16` per DP engine and an
+8192-token context/batch budget for block evaluation. For reference evaluation,
+set `DSV4_BLOCK_VERIFY=0 DSV4_EVAL=1`; for training HS, set both switches to `0`.
 Environment variables override these defaults. The trainer retains its earlier
 `TARGET_MASTER_IP=80.48.17.186` default: explicitly set it to `.187` (or set
 `VLLM_ENDPOINT`) when connecting to this saved single-host server. The server
@@ -220,6 +221,7 @@ now refers to the BF16 HS interface, not a requirement for all-BF16 weights.
 ```bash
 export MODEL=/shared/models/dsv4-flash-target
 export HS_PATH=/shared/hs/dsv4-flash-target-spread-v1
+export DSV4_BLOCK_VERIFY=0 DSV4_EVAL=0  # Training HS, not the saved block default.
 # Set these for the actual devices and memory; no device count per host is assumed.
 export VLLM_NPUS='<target device IDs>'
 export TP_SIZE='<target tensor parallel size>'
@@ -351,14 +353,14 @@ the host's `DP_START_RANK` need to be selected at launch. On **target host 0
 (`80.48.17.186`)**, start the API and its two local engines:
 
 ```bash
-DP_SIZE=4 DP_START_RANK=0 \
+DSV4_BLOCK_VERIFY=0 DP_SIZE=4 DP_START_RANK=0 \
   bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
 On **target host 1 (`80.48.17.187`)**, start the two headless engines:
 
 ```bash
-DP_SIZE=4 DP_START_RANK=2 \
+DSV4_BLOCK_VERIFY=0 DP_SIZE=4 DP_START_RANK=2 \
   bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
@@ -445,6 +447,7 @@ so cached files from another mode cannot satisfy the test:
 
 ```bash
 # Baseline (also the defaults when both variables are unset).
+export DSV4_BLOCK_VERIFY=0  # These are ordinary HS-service execution options.
 DSV4_EXECUTION_MODE=eager DSV4_ASYNC_SCHEDULING=0 \
   HS_PATH=/shared/hs/dsv4-eager-sync \
   bash examples/train/dspark_dsv4_flash_bf16_server.sh
@@ -972,10 +975,10 @@ does not create additional clients or guarantee that every batch fills it.
 Actual batches also depend on KV capacity and `MAX_NUM_BATCHED_TOKENS`, the sum
 of tokens computed in one step per DP engine. Without snapshot hits this counts
 full prefixes; a snapshot hit counts only the uncached suffix. The server script
-retains its 4096-token budget rather than multiplying it by the concurrency cap.
-Two uncached 3000-token prefixes therefore cannot share that step, while many
-short cached suffixes can. If memory allows, `MAX_NUM_BATCHED_TOKENS=8192` can
-accommodate two uncached prefixes up to the unchanged 4096-token context limit.
+defaults to an 8192-token budget, independently of the concurrency cap and with
+an 8192-token per-request context limit. Two uncached 3000-token prefixes fit
+within that token budget; two 6000-token prefixes do not. Cached suffixes can
+allow more requests in the same step without increasing the context limit.
 Raising either limit can increase memory use and cause OOM. Use `MAX_NUM_SEQS=1`
 to restore the earlier low-concurrency configuration; no 16-way A3 memory or
 throughput result is implied by these defaults.
@@ -1424,10 +1427,13 @@ bash examples/evaluate/dspark_dsv4_offline_eval.sh
 ```
 
 In HTTP mode, `HS_PATH` may be omitted; it defaults beneath `OUTPUT_DIR`.
-Unset `HS_HTTP_ENDPOINT` to keep the previous shared-file behavior unchanged.
-The Python equivalent is `--hs-http-endpoint URL`. The secret comes only from
-`DSV4_HS_HTTP_TOKEN`, never a CLI argument or saved metadata; multi-NPU workers
-inherit it. `OPENAI_API_KEY`, if needed by vLLM, remains a separate credential.
+The offline script defaults `HS_HTTP_ENDPOINT` to `http://80.48.17.187:8002`;
+set it explicitly to an empty string to select shared-file transport.
+The Python equivalent is `--hs-http-endpoint URL`. Both example scripts contain
+the same deployment-specific default token; override `DSV4_HS_HTTP_TOKEN` on both
+hosts to rotate it, especially before reusing these scripts in another deployment.
+The token is exported to workers, never passed in CLI arguments or runtime metadata.
+`OPENAI_API_KEY`, if needed by vLLM, remains a separate credential.
 
 Only HS storage becomes remote: the evaluator still needs local access to the
 draft checkpoint and the matching verifier checkpoint/IO weights. Set
@@ -1461,9 +1467,22 @@ HTTP proxies are disabled. The default file
 limit is 512 MiB; larger contexts may require a coordinated client/server limit
 change. This is a safety limit, not a per-request memory reservation.
 
+The sidecar hashes and sends the same private snapshot, rather than reading the
+producer file twice. Snapshots stay in memory up to 8 MiB, then spill to the
+sidecar's system temporary directory (which needs sufficient free disk space).
+If the source changes during snapshot creation, the client waits and retries
+the same artifact within the existing timeout; it does not rerun the target.
+This check does not replace the reference producer's synchronization lock.
+
 Successful consumption deletes only the corresponding HTTP evaluation artifact.
-`KEEP_TARGET_HS=1` retains it on the **target**; local temporary copies are always
-removed. Interrupted downloads or failed cleanup can leave HTTP evaluation
+`KEEP_TARGET_HS=1` retains it on the **target**; successful local temporary copies
+are removed. Failed downloads with received data are retained under the
+evaluation host's `HS_PATH/failed-downloads/hshttp-*/`, alongside `error.json`.
+Checksum/truncation errors include the artifact name, expected/received byte
+counts and expected/actual SHA-256 values. These private files contain HS data:
+redact before sharing and remove them when diagnosis is complete. Integrity
+errors still stop evaluation without skipping samples or bypassing verification.
+Interrupted downloads or failed cleanup can also leave HTTP evaluation
 artifacts on the target: inspect and remove only that dedicated namespace after
 the evaluation has stopped, never bulk-clear a live training HS directory.
 For reference steps that do not use HS, the evaluator avoids downloading the
@@ -1482,20 +1501,21 @@ not replace validation on the actual two-host network and Ascend deployment.
 If you already maintain a separate HS service or need two machines, use the
 existing entry point below. It does not manage the service lifecycle and does not
 need to run alongside the automatic single-host entry point. **The manual entry
-point defaults to `reference`** for compatibility with the original HS service;
-this differs from the single-host default.
+point defaults to `block` over HTTP**, full block output, target KV reuse off,
+draft KV reuse on, and datasets `gsm8k,math500,humaneval,mbpp,mt-bench`.
+The following example explicitly selects the original reference/shared-file path.
 
 Prepare the models, shared directory, and plugin as described above, then start
 or restart the target service with the evaluation options:
 
 ```bash
-export DSV4_EVAL=1
+export DSV4_BLOCK_VERIFY=0 DSV4_EVAL=1
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 
-`DSV4_EVAL=1` (the saved server default) sets `--max-logprobs 129280
---logprobs-mode raw_logprobs --generation-config vllm`. Set `DSV4_EVAL=0` for
-training-only HS options. Completion requests use `logprobs=129280`, not
+With block mode disabled, `DSV4_EVAL=1` sets `--max-logprobs 129280
+--logprobs-mode raw_logprobs --generation-config vllm`. Also set `DSV4_EVAL=0`
+for training-only HS options. Completion requests use `logprobs=129280`, not
 `logprobs=-1`, and require token IDs as response keys so duplicate decoded strings
 cannot cause probabilities to be lost. This repository's `--dsv4` HS bridge is
 still required; an ordinary V4 serving instance cannot replace it.
@@ -1514,6 +1534,7 @@ export OUTPUT_DIR=/shared/eval/dsv4-flash-target-reference
 export MAX_SAMPLES=4
 export MAX_NEW_TOKENS=64
 export VERIFICATION_MODE=reference
+export HS_HTTP_ENDPOINT=""  # Requires the same explicitly configured shared HS_PATH.
 bash examples/evaluate/dspark_dsv4_offline_eval.sh
 ```
 
@@ -1530,10 +1551,10 @@ VERIFICATION_MODE=block EVAL_NPU=0 MAX_SAMPLES=4 MAX_NEW_TOKENS=64 \
 
 `DSV4_BLOCK_VERIFY=1` adds `--dsv4-block-verify` before the launcher's `--`, takes
 precedence over `DSV4_EVAL`, and uses `--max-logprobs 0 --generation-config vllm`.
-It defaults `MAX_NUM_SEQS` to **1 per DP engine** (two simultaneous prefixes at
-DP2), preserving 64 for training/reference. Explicit positive values enable
+It defaults `MAX_NUM_SEQS` to **16 per DP engine** (up to 32 scheduled requests at
+DP2), preserving 64 for training/reference. Explicit positive values control
 batched verification; DP4, graph mode and async scheduling remain rejected.
-`MAX_NUM_BATCHED_TOKENS` defaults to 4096 per engine; increase only with sufficient
+`MAX_NUM_BATCHED_TOKENS` defaults to 8192 per engine; increase only with sufficient
 memory. `TP_SIZE=8`, `DP_SIZE=2`,
 paths and the saved endpoint remain unchanged. The evaluator's `EVAL_NPU` worker
 count is independent of target DP. Sixteen draft workers queue against two target
@@ -1566,13 +1587,13 @@ match; there is no automatic fallback.
 
 The example defaults to greedy decoding (`TEMPERATURE=0.0`). Set
 `TEMPERATURE=1.0` explicitly to test stochastic sampling.
-`DSV4_MAX_MODEL_LEN=4096` must match the service's actual `--max-model-len`.
+`DSV4_MAX_MODEL_LEN=8192` must match the service's actual `--max-model-len`.
 The tokenized prompt length plus `MAX_NEW_TOKENS` must not exceed this limit.
 The evaluator shortens the final speculative proposal to reserve one bonus token;
 the longest target request uses at most this total minus one input token, plus the
 one API output token used for HS export. No extra full draft block needs to be
 reserved, and server-side truncation must remain disabled.
-`TARGET_REQUEST_TIMEOUT` defaults to 120 seconds. Set
+`TARGET_REQUEST_TIMEOUT` defaults to 1200 seconds in this manual script. Set
 `SERVED_MODEL_NAME` when the service uses a custom alias. When omitted, evaluation
 uses the **server's model path from the verified HS manifest**, not the local
 `VERIFIER_MODEL`, for both completion and tokenizer requests. This example uses
