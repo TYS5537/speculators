@@ -1182,9 +1182,12 @@ still require an Ascend run.
 ### Failed samples and malformed HTTP responses
 
 Evaluation captures prompt-formatting and generation exceptions, then re-raises
-the original error: **no automatic retry, skipped sample, or replacement result**.
-Successful samples do not write diagnostic files. Failure capture is always on,
-independent of `DSV4_PROFILE`, `--skip-artifacts`, and the progress display.
+the original error: **no automatic sample/inference retry, skipped sample, or
+replacement result**. HS byte-transfer retries described below do not rerun
+generation. Successful samples do not write sample-failure diagnostic files;
+recovered HS downloads retain their transport-failure evidence. Failure capture
+is always on, independent of `DSV4_PROFILE`, `--skip-artifacts`, and the progress
+display.
 
 On the evaluation host, the error log prints an absolute diagnostic directory:
 
@@ -1474,14 +1477,29 @@ If the source changes during snapshot creation, the client waits and retries
 the same artifact within the existing timeout; it does not rerun the target.
 This check does not replace the reference producer's synchronization lock.
 
+Checksum or received-length mismatches trigger at most **three total download
+attempts** for the same request handle, with 0.1/0.2-second waits before retries.
+The first response's validated length and SHA-256 are pinned: a retry declaring
+a different length or digest fails immediately, even if its new body would pass
+its own checksum. Each attempt uses a fresh local file and must pass both checks
+before tensor loading. Existing per-attempt HTTP timeouts still apply. No target
+inference is repeated, and no failed sample is skipped or replaced. Invalid
+headers, authentication failures, and other non-integrity errors are not retried
+by this recovery path. No additional switch or sidecar restart is needed; update
+and restart the evaluation client to enable it.
+
 Successful consumption deletes only the corresponding HTTP evaluation artifact.
 `KEEP_TARGET_HS=1` retains it on the **target**; successful local temporary copies
 are removed. Failed downloads with received data are retained under the
 evaluation host's `HS_PATH/failed-downloads/hshttp-*/`, alongside `error.json`.
 Checksum/truncation errors include the artifact name, expected/received byte
-counts and expected/actual SHA-256 values. These private files contain HS data:
-redact before sharing and remove them when diagnosis is complete. Integrity
-errors still stop evaluation without skipping samples or bypassing verification.
+counts and expected/actual SHA-256 values. Each failure record includes the
+attempt number and limit; logs identify retries and successful recovery. Failed
+copies remain available even after recovery (unless saving evidence itself
+fails, which is logged without masking the download error). These private files
+contain HS data: redact before sharing and remove them when diagnosis is complete.
+Exhausted retries still stop evaluation and retain the remote artifact, without
+skipping samples or bypassing verification.
 Interrupted downloads or failed cleanup can also leave HTTP evaluation
 artifacts on the target: inspect and remove only that dedicated namespace after
 the evaluation has stopped, never bulk-clear a live training HS directory.

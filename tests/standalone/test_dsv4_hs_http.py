@@ -11,6 +11,7 @@ import tempfile
 import threading
 import unittest
 from contextlib import contextmanager
+from email.message import Message
 from pathlib import Path
 from unittest.mock import patch
 from urllib.error import HTTPError
@@ -22,6 +23,17 @@ from speculators_dsv4.hs_http import HttpHiddenStates, validate_endpoint, valida
 from speculators_dsv4.hs_http_server import HiddenStatesServer
 
 TOKEN = "test-only-token-0123456789abcdef0123456789"
+
+
+def _download_response(content, *, length=None, digest=None):
+    response = io.BytesIO(content)
+    response.headers = {
+        "Content-Length": str(len(content) if length is None else length),
+        "X-HS-SHA256": hashlib.sha256(content).hexdigest()
+        if digest is None
+        else digest,
+    }
+    return response
 
 
 class HttpTransportTests(unittest.TestCase):
@@ -60,6 +72,29 @@ class HttpTransportTests(unittest.TestCase):
         path = self.remote / f"cmpl-{request_id}-0-deadbeef.safetensors"
         path.write_bytes(content)
         return request_id, path
+
+    @contextmanager
+    def faulty_http_downloads(self, responses):
+        """Inject bad bodies/headers over real HTTP, then use the normal sidecar."""
+        pending = iter(responses)
+        requests = []
+        original = hs_http_server._Handler._artifact
+
+        def serve(handler, path, *, delete):
+            requests.append((handler.command, path.name))
+            response = None if delete else next(pending, None)
+            if response is None:
+                return original(handler, path, delete=delete)
+            body, length, digest = response
+            handler.send_response(200)
+            handler.send_header("Content-Length", str(length))
+            handler.send_header("X-HS-SHA256", digest)
+            handler.end_headers()
+            handler.wfile.write(body)
+            return None
+
+        with patch.object(hs_http_server._Handler, "_artifact", serve):
+            yield requests
 
     def request(self, route, *, method="GET", token=TOKEN):
         opener = build_opener(ProxyHandler({}))
@@ -330,15 +365,22 @@ class HttpTransportTests(unittest.TestCase):
             (100, hashlib.sha256(b"data").hexdigest()),
             (self.client.max_file_bytes + 1, "0" * 64),
         ):
-            response = io.BytesIO(b"data")
-            response.headers = {"Content-Length": str(length), "X-HS-SHA256": digest}
+            attempts = 3 if length <= self.client.max_file_bytes else 1
+            responses = [
+                _download_response(b"data", length=length, digest=digest)
+                for _ in range(attempts)
+            ]
             with (
-                patch.object(self.client, "_open", return_value=response) as opened,
+                patch.object(self.client, "_open", side_effect=responses) as opened,
+                patch("speculators_dsv4.hs_http.time.sleep"),
                 self.assertRaises(ValueError) as caught,
             ):
                 with self.client.artifact(str(path), request_id):
                     self.fail("Unexpected download")
-            opened.assert_called_once_with("/v1/files/" + path.name)
+            self.assertEqual(opened.call_count, attempts)
+            for call in opened.call_args_list:
+                self.assertEqual(call.args, ("/v1/files/" + path.name,))
+                self.assertEqual(call.kwargs, {})  # No DELETE after a failed download.
             self.assertTrue(path.exists())
             if length <= self.client.max_file_bytes:
                 self.assertIn(path.name, str(caught.exception))
@@ -347,28 +389,168 @@ class HttpTransportTests(unittest.TestCase):
                     hashlib.sha256(b"data").hexdigest(), str(caught.exception)
                 )
                 metadata = list(self.local.glob("failed-downloads/*/error.json"))
-                self.assertEqual(len(metadata), 1 if length == 4 else 2)
+                self.assertEqual(len(metadata), 3 if length == 4 else 6)
                 for item in metadata:
                     saved = json.loads(item.read_text())
                     self.assertEqual(saved["artifact"], path.name)
                     self.assertEqual(saved["received_bytes"], 4)
+                    self.assertIn(saved["attempt"], (1, 2, 3))
+                    self.assertEqual(saved["max_attempts"], 3)
                     self.assertEqual((item.parent / path.name).read_bytes(), b"data")
                     self.assertNotIn(TOKEN, item.read_text())
             self.assertFalse(list(self.local.glob("hshttp-*")))
 
     def test_failure_evidence_error_does_not_mask_checksum_error(self):
         request_id, path = self.artifact()
-        response = io.BytesIO(b"data")
-        response.headers = {"Content-Length": "4", "X-HS-SHA256": "0" * 64}
         with (
-            patch.object(self.client, "_open", return_value=response),
+            patch.object(
+                self.client,
+                "_open",
+                side_effect=[
+                    _download_response(b"data", digest="0" * 64) for _ in range(3)
+                ],
+            ) as opened,
             patch.object(Path, "rename", side_effect=OSError("cannot save evidence")),
+            patch("speculators_dsv4.hs_http.time.sleep"),
             self.assertLogs("speculators_dsv4.hs_http", level="WARNING"),
             self.assertRaisesRegex(ValueError, "HS HTTP checksum mismatch"),
         ):
             with self.client.artifact(str(path), request_id):
                 self.fail("Unexpected download")
+        self.assertEqual(opened.call_count, 3)
         self.assertTrue(path.exists())
+
+    def test_corrupt_or_truncated_http_download_recovers_without_new_artifact(self):
+        content = b"correct-packet"
+        digest = hashlib.sha256(content).hexdigest()
+        for failed_attempts in (1, 2):
+            for truncated in (False, True):
+                with self.subTest(failed_attempts=failed_attempts, truncated=truncated):
+                    request_id, path = self.artifact(content)
+                    bad = content[:-1] if truncated else b"X" * len(content)
+                    with (
+                        self.faulty_http_downloads(
+                            [(bad, len(content), digest)] * failed_attempts
+                        ) as requests,
+                        patch("speculators_dsv4.hs_http.time.sleep") as sleep,
+                        self.assertLogs(
+                            "speculators_dsv4.hs_http", level="INFO"
+                        ) as logs,
+                    ):
+                        with self.client.artifact(str(path), request_id) as downloaded:
+                            self.assertEqual(downloaded.read_bytes(), content)
+                            self.assertTrue(path.exists())
+                            self.assertEqual(
+                                requests,
+                                [("GET", path.name)] * (failed_attempts + 1),
+                            )
+                    self.assertFalse(path.exists())
+                    self.assertEqual(requests[-1], ("DELETE", path.name))
+                    self.assertEqual(sleep.call_count, failed_attempts)
+                    self.assertIn("download recovered", "\n".join(logs.output))
+                    self.assertNotIn(TOKEN, "\n".join(logs.output))
+                    saved = [
+                        json.loads(item.read_text())
+                        for item in self.local.glob("failed-downloads/*/error.json")
+                        if (item.parent / path.name).exists()
+                    ]
+                    self.assertEqual(len(saved), failed_attempts)
+                    self.assertEqual(
+                        sorted(item["attempt"] for item in saved),
+                        list(range(1, failed_attempts + 1)),
+                    )
+                    for item in saved:
+                        self.assertEqual(item["expected_sha256"], digest)
+                        self.assertEqual(
+                            item["actual_sha256"], hashlib.sha256(bad).hexdigest()
+                        )
+                    self.assertFalse(list(self.local.glob("hshttp-*")))
+
+    def test_retry_rejects_changed_digest_or_length_even_if_new_body_is_valid(self):
+        original = b"original"
+        original_digest = hashlib.sha256(original).hexdigest()
+        for replacement, length, digest in (
+            (b"replaced", len(original), hashlib.sha256(b"replaced").hexdigest()),
+            (original, len(original) + 1, original_digest),
+        ):
+            with self.subTest(replacement=replacement, length=length):
+                request_id, path = self.artifact(original)
+                bad = _download_response(b"X" * len(original), digest=original_digest)
+                changed = _download_response(replacement, length=length, digest=digest)
+                with (
+                    patch.object(
+                        self.client, "_open", side_effect=[bad, changed]
+                    ) as opened,
+                    patch.object(changed, "read", wraps=changed.read) as read,
+                    patch("speculators_dsv4.hs_http.time.sleep"),
+                    self.assertRaisesRegex(ValueError, "identity changed during retry"),
+                ):
+                    with self.client.artifact(str(path), request_id):
+                        self.fail("A new artifact must not satisfy an old download")
+                self.assertEqual(opened.call_count, 2)
+                read.assert_not_called()  # Reject the changed identity before its body.
+                self.assertTrue(path.exists())
+
+    def test_failed_evidence_save_does_not_prevent_valid_retry(self):
+        content = b"correct-packet"
+        request_id, path = self.artifact(content)
+        with (
+            self.faulty_http_downloads(
+                [
+                    (
+                        b"X" * len(content),
+                        len(content),
+                        hashlib.sha256(content).hexdigest(),
+                    )
+                ]
+            ) as requests,
+            patch.object(Path, "rename", side_effect=OSError("cannot save evidence")),
+            patch("speculators_dsv4.hs_http.time.sleep"),
+            self.assertLogs("speculators_dsv4.hs_http", level="WARNING") as logs,
+        ):
+            with self.client.artifact(str(path), request_id, keep=True) as downloaded:
+                self.assertEqual(downloaded.read_bytes(), content)
+        self.assertIn("Could not preserve", "\n".join(logs.output))
+        self.assertEqual(requests, [("GET", path.name)] * 2)
+        self.assertTrue(path.exists())
+        self.assertFalse(list(self.local.glob("hshttp-*")))
+
+    def test_invalid_headers_are_not_retried(self):
+        request_id, path = self.artifact()
+        for headers in (
+            {},
+            {"Content-Length": "bad", "X-HS-SHA256": "0" * 64},
+            {"Content-Length": "4", "X-HS-SHA256": "invalid"},
+            {"Content-Length": "0", "X-HS-SHA256": "0" * 64},
+        ):
+            with self.subTest(headers=headers):
+                response = io.BytesIO(b"data")
+                response.headers = Message()
+                for name, value in headers.items():
+                    response.headers[name] = value
+                with (
+                    patch.object(self.client, "_open", return_value=response) as opened,
+                    patch("speculators_dsv4.hs_http.time.sleep") as sleep,
+                    self.assertRaises(ValueError),
+                ):
+                    with self.client.artifact(str(path), request_id):
+                        self.fail("Invalid HTTP metadata must not be retried")
+                opened.assert_called_once_with("/v1/files/" + path.name)
+                sleep.assert_not_called()
+                self.assertTrue(path.exists())
+
+    def test_consumer_errors_are_not_download_retries(self):
+        request_id, path = self.artifact()
+        with (
+            patch.object(
+                self.client, "_download", wraps=self.client._download
+            ) as download,
+            self.assertRaisesRegex(ValueError, "consumer failed"),
+        ):
+            with self.client.artifact(str(path), request_id):
+                raise ValueError("consumer failed")
+        download.assert_called_once()
+        self.assertFalse(path.exists())
 
     def test_changed_manifest_or_mismatched_checkpoint_fails_closed(self):
         with self.assertRaisesRegex(ValueError, "mismatch"):

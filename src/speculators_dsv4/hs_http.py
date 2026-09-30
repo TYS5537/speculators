@@ -28,6 +28,8 @@ FILE_PATTERN = re.compile(r"cmpl-hshttp-[0-9a-f]{32}-0(?:-[0-9a-f]{8})?\.safeten
 MAX_MANIFEST_BYTES = 1024 * 1024
 DEFAULT_MAX_FILE_BYTES = 512 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
+MAX_DOWNLOAD_ATTEMPTS = 3
+DOWNLOAD_RETRY_DELAY = 0.1
 MIN_TOKEN_CHARS = 32
 PRINTABLE_ASCII_MIN = 33
 PRINTABLE_ASCII_MAX = 126
@@ -185,7 +187,7 @@ class HttpHiddenStates:
             )
         return name
 
-    def _download(self, name, destination):
+    def _download(self, name, destination, *, expected=None):
         with self._open("/v1/files/" + name) as response:
             try:
                 length = int(response.headers["Content-Length"])
@@ -199,6 +201,15 @@ class HttpHiddenStates:
             ):
                 raise ValueError(
                     "HS HTTP response exceeds size limit or has no checksum"
+                )
+            if expected is not None and (length, digest) != expected:
+                # A new, internally consistent response must not replace the
+                # immutable artifact whose first download failed verification.
+                raise ValueError(
+                    "HS HTTP artifact identity changed during retry: "
+                    f"artifact={name}, expected_bytes={expected[0]}, "
+                    f"response_bytes={length}, expected_sha256={expected[1]}, "
+                    f"response_sha256={digest}"
                 )
             checksum = hashlib.sha256()
             received = 0
@@ -225,7 +236,53 @@ class HttpHiddenStates:
             if details["actual_sha256"] != digest:
                 raise _DownloadIntegrityError("HS HTTP checksum mismatch", details)
 
-    def _preserve_failed_download(self, path, error):
+    def _download_with_retries(self, name, directory):
+        """Retry only corrupt/truncated bytes, never inference or a new artifact."""
+        expected = None
+        for attempt in range(1, MAX_DOWNLOAD_ATTEMPTS + 1):
+            # Use a fresh path even if preserving a failed download raised an
+            # error. Never overwrite evidence or append to a partial file.
+            attempt_directory = directory
+            if attempt > 1:
+                attempt_directory = directory / f"attempt-{attempt}"
+                attempt_directory.mkdir(mode=0o700)
+            path = attempt_directory / name
+            try:
+                self._download(name, path, expected=expected)
+            except _DownloadIntegrityError as error:
+                if expected is None:
+                    expected = (
+                        error.details["expected_bytes"],
+                        error.details["expected_sha256"],
+                    )
+                self._preserve_failed_download(path, error, attempt=attempt)
+                if attempt == MAX_DOWNLOAD_ATTEMPTS:
+                    raise
+                logger.warning(
+                    "HS HTTP integrity check failed for %s (attempt %d/%d); "
+                    "retrying the same artifact with pinned length/SHA256, "
+                    "without another target request",
+                    name,
+                    attempt,
+                    MAX_DOWNLOAD_ATTEMPTS,
+                )
+                time.sleep(DOWNLOAD_RETRY_DELAY * attempt)
+            except (OSError, ValueError, HTTPException) as error:
+                self._preserve_failed_download(path, error, attempt=attempt)
+                raise
+            else:
+                if attempt > 1:
+                    logger.info(
+                        "HS HTTP download recovered for %s on attempt %d/%d; "
+                        "length and SHA256 match the original response",
+                        name,
+                        attempt,
+                        MAX_DOWNLOAD_ATTEMPTS,
+                    )
+                return path
+        raise AssertionError("HS HTTP download attempt limit must be positive")
+
+    def _preserve_failed_download(self, path, error, *, attempt):
         try:
             if not path.is_file():
                 return
@@ -236,6 +293,8 @@ class HttpHiddenStates:
                 "schema_version": 1,
                 "artifact": path.name,
                 "received_bytes": path.stat().st_size,
+                "attempt": attempt,
+                "max_attempts": MAX_DOWNLOAD_ATTEMPTS,
                 "error_type": type(error).__name__,
                 "error": str(error),
             }
@@ -268,16 +327,12 @@ class HttpHiddenStates:
         with tempfile.TemporaryDirectory(
             prefix="hshttp-", dir=self.directory
         ) as temporary:
-            path = Path(temporary) / name
-            if download:
-                # A failed/truncated transfer retains the remote file for diagnosis.
-                try:
-                    self._download(name, path)
-                except (OSError, ValueError, HTTPException) as error:
-                    self._preserve_failed_download(path, error)
-                    raise
+            # Exhausted retries and protocol errors retain the remote artifact.
+            path = (
+                self._download_with_retries(name, Path(temporary)) if download else None
+            )
             try:
-                yield path if download else None
+                yield path
             finally:
                 if not keep:
                     try:
