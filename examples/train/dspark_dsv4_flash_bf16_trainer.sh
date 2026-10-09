@@ -17,8 +17,12 @@ if [[ "$HS_BACKEND" == file ]]; then
   NUM_WORKERS="${NUM_WORKERS:-12}"
   PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
 else
-  if [[ "$HS_BACKEND" == http ]]; then TRAIN_HS_PATH="$HS_HTTP_LOCAL_PATH"; fi
-  NUM_WORKERS="${NUM_WORKERS:-1}"
+  if [[ "$HS_BACKEND" == http ]]; then
+    TRAIN_HS_PATH="$HS_HTTP_LOCAL_PATH"
+    NUM_WORKERS="${NUM_WORKERS:-2}"
+  else
+    NUM_WORKERS="${NUM_WORKERS:-1}"
+  fi
   PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
 fi
 TRAIN_NPUS="${TRAIN_NPUS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"

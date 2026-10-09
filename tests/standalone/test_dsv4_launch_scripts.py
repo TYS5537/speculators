@@ -229,7 +229,7 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertEqual(
             args[index + 1 : index + 3], ["http://first:8002", "http://second:8002"]
         )
-        self.assertEqual(args[args.index("--num-workers") + 1], "1")
+        self.assertEqual(args[args.index("--num-workers") + 1], "2")
         self.assertNotIn("fixture-token-0123456789abcdef0123456789", args)
 
     def test_mooncake_server_carries_run_identity_and_provenance(self):

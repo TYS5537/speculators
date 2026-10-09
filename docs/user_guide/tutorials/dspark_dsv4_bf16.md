@@ -213,10 +213,13 @@ TCP/RDMA**, not NPU-direct/HCCS transfer; HCCL settings are independent.
 
 ### Capacity, failure handling, and validation
 
-The wrappers use `NUM_WORKERS=1 PREFETCH_FACTOR=2` per trainer rank for remote
-backends; file defaults remain 12/4. At 16 DDP ranks this is 16 clients per
-loader; persistent training and validation workers can retain 32 clients once
-both loaders have started. Preflight also uses transient clients. Mooncake
+The HTTP wrapper defaults to `NUM_WORKERS=2 PREFETCH_FACTOR=2` per trainer rank;
+Mooncake defaults remain 1/2 and file defaults remain 12/4. At 16 DDP ranks,
+HTTP has up to 32 synchronous HS tasks and 64 prefetched batch tasks per active
+loader. Prefetching increases queue depth, not simultaneous requests per worker.
+Persistent training and validation workers can retain 64 HTTP clients (32 for
+Mooncake) once both loaders have started; idle workers do not keep issuing
+requests. Preflight also uses transient clients. Mooncake
 defaults are 4 GiB global + 0.5 GiB staging **per
 target TP0 client**, and 0.25 + 0.25 GiB **per trainer worker**. They are host RAM
 budgets. Override `MOONCAKE_GLOBAL_SEGMENT_GIB` / `MOONCAKE_LOCAL_BUFFER_GIB`
