@@ -28,7 +28,7 @@ testing, not validated end-to-end support.
   resume both validate the checkpoint's target identity.
 - Short training, validation, save, and resume checks in isolated output
   directories. These do not replace A3 hardware testing.
-- The existing `corrGate=0`, Muon + linear schedule, base LR `6e-5`, and feature
+- The supplied `corrGate=0`, Muon + linear schedule, base LR `4.5e-5`, and feature
   flags are preserved.
 - Quantized target backbones are allowed and loaded by the inference backend;
   exported HS remain BF16.
@@ -57,6 +57,187 @@ this fix. The budget includes HS cache data; tensor alignment overhead retains
 the backend's native handling. Explicit `--num-gpu-blocks-override` still uses
 vLLM's forced-capacity semantics and may exceed physical device memory. Normally,
 omit this debugging option and let memory profiling determine cache capacity.
+
+## Training without a shared HS filesystem
+
+Select `HS_BACKEND=file|http|mooncake` on the target and trainer wrappers.
+The supplied wrappers now default to `http`; use `HS_BACKEND=file` for the
+existing shared-filesystem path. The two remote backends change HS transport only:
+the BF16 tensors, auxiliary layers, teacher slot, drafter, loss and optimizer
+recipe are unchanged. They support single-host target DP1/DP2 and two-host target
+DP4. They are training transports, not replacements for the block-eval connector.
+The server defaults to `DSV4_EVAL=0 DSV4_BLOCK_VERIFY=0` for training.
+
+Install both editable packages in **every target and trainer environment**:
+
+```bash
+pip install -e . --no-deps
+pip install -e hs_connectors --no-deps
+```
+
+The trainer still needs its own accessible checkpoint/Arrow data. Only HS no
+longer needs a shared mount. Checkpoint copies may use different host-local paths
+but must preserve shard timestamps for the existing header/metadata fingerprint;
+this is not a full tensor-content hash. Remote producer identities include actual
+runtime quantization and are checked against the trainer's checkpoint, on every
+DP producer for Mooncake, and per downloaded sample. Saved trainer identity and
+resume checks remain strict; moving an existing trainer checkpoint is separate.
+
+### HTTP: target-local files, trainer-local downloads
+
+The saved recipe preserves target/sidecar `HS_PATH=/home/s00969542/DSV4F/tmp_hs`,
+`.187:8001` for vLLM, and `.187:8002` for the sidecar. The trainer preserves its
+legacy `HS_PATH=/mnt/nfs/dataset/tmp_hs` for file mode, but HTTP uses a separate
+`HS_HTTP_LOCAL_PATH=/home/s00969542/DSV4F/tmp_hs_downloads` on the trainer host.
+Both default directories must actually be local filesystems to remove shared HS IO.
+Model and Arrow paths, external Arrow opt-in, recomputation, LR `4.5e-5`, and
+the remaining experiment flags are retained. The output directory is
+`./output/dspark_dsv4_flash_bestArch_lr4.5e-5`.
+
+Once the current checkout is installed on both hosts, the preserved defaults allow:
+
+```bash
+# Target .187, terminal 1; wait for readiness.
+bash examples/train/dspark_dsv4_flash_bf16_server.sh
+# Target .187, terminal 2; CPU-only sidecar in training mode.
+bash examples/train/dspark_dsv4_hs_http_server.sh
+# Separate trainer host.
+bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
+```
+
+The sidecar and trainer share the supplied token default through the common
+helper. Set `DSV4_HS_HTTP_TOKEN` on both to override it; it never appears in argv.
+Set `HS_HTTP_TRAINING=0` explicitly when running an evaluation sidecar.
+
+Use local SSD directories on both machines. Serving files that remain on NFS
+does **not** remove the target's NFS bottleneck. Sidecar snapshots above 8 MiB
+spill into `TMPDIR`, so it must also be local. No NPU is needed by the sidecar.
+
+On target `.187`, start the ordinary training HS service:
+
+```bash
+export HS_BACKEND=http DSV4_EVAL=0 TARGET_MASTER_IP=80.48.17.187
+export HS_PATH=/local-ssd/dsv4-hs/run-001
+export PROVENANCE_DIR=./output/dsv4-http-run-001/target
+bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+In a second target shell, after the target has created its HS manifest:
+
+```bash
+read -rsp 'Private HS token (32+ random characters): ' DSV4_HS_HTTP_TOKEN; echo
+export DSV4_HS_HTTP_TOKEN
+export HS_HTTP_TRAINING=1 HS_HTTP_HOST=80.48.17.187
+export HS_PATH=/local-ssd/dsv4-hs/run-001
+export TMPDIR=/local-ssd/tmp  # Create this local directory beforehand.
+bash examples/train/dspark_dsv4_hs_http_server.sh
+```
+
+On the separate trainer:
+
+```bash
+read -rsp 'Same private HS token: ' DSV4_HS_HTTP_TOKEN; echo
+export DSV4_HS_HTTP_TOKEN
+export HS_BACKEND=http TARGET_MASTER_IP=80.48.17.187
+export HS_HTTP_ENDPOINTS='http://80.48.17.187:8002'
+export HS_HTTP_LOCAL_PATH=/local-ssd/dsv4-hs-downloads/run-001
+export OUTPUT_DIR=./output/dsv4-http-run-001
+# Keep MODEL, DATA_PATH and DSV4_EXTERNAL_ARROW appropriate for your existing data.
+bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
+```
+
+For DP4, retain the existing two-target setup (`TARGET_MASTER_IP=.186`,
+`TARGET_WORKER_IP=.187`, `DP_SIZE=4`, start ranks `0` and `2`). Set
+`HS_BACKEND=http DSV4_EVAL=0` on **both**, and start a training sidecar on each
+host with its own local HS directory. The headless host no longer waits for a
+shared manifest in HTTP mode. On the trainer set:
+
+```bash
+export TARGET_MASTER_IP=80.48.17.186
+export HS_HTTP_ENDPOINTS='http://80.48.17.186:8002 http://80.48.17.187:8002'
+```
+
+Authenticated ownership probes locate the returned artifact without downloading
+from the wrong host. Every endpoint must be reachable and have the same target
+identity. Only `hstrain-` nonces created by the trainer are readable/deletable;
+ordinary training caches and evaluation files are not exposed. Proxy forwarding
+and redirects are disabled, but plain HTTP still needs a trusted LAN/VPN or TLS
+proxy. Do not expose the sidecar to the public Internet or put tokens in argv.
+
+### Mooncake HS connector: memory-store TCP or host RDMA
+
+Install a compatible **non-CUDA or Ascend** Mooncake build on all participating
+hosts. Do not install a CUDA wheel on A3. The current connector uses the Store
+Python APIs `setup`, `put_tensor`, `get_tensor`, `put`, `get`, `batch_remove`, and
+`close`. See the [official installation guide](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/getting_started/quick-start.md)
+and [Store API](https://github.com/kvcache-ai/Mooncake/blob/main/docs/source/api-reference/python/mooncake-store.md).
+Package/CANN compatibility and RDMA connectivity require validation in your image.
+
+First start a reachable `mooncake_master` (default RPC port 50051) on `.187`.
+Keep it running. No HTTP HS sidecar is used in this mode. On the target:
+
+```bash
+export HS_BACKEND=mooncake DSV4_EVAL=0 TARGET_MASTER_IP=80.48.17.187
+export MOONCAKE_MASTER=80.48.17.187:50051
+export MOONCAKE_NAMESPACE=dsv4-run-20261009-001  # Fresh for each target launch.
+export MOONCAKE_PROTOCOL=tcp
+export PROVENANCE_DIR=./output/dsv4-mooncake-run-001/target
+bash examples/train/dspark_dsv4_flash_bf16_server.sh
+```
+
+On the trainer:
+
+```bash
+export HS_BACKEND=mooncake TARGET_MASTER_IP=80.48.17.187 TARGET_DP_SIZE=2
+export MOONCAKE_MASTER=80.48.17.187:50051
+export MOONCAKE_NAMESPACE=dsv4-run-20261009-001
+export MOONCAKE_LOCAL_HOSTNAME='<trainer-private-IP>'
+export MOONCAKE_PROTOCOL=tcp
+export OUTPUT_DIR=./output/dsv4-mooncake-run-001
+bash examples/train/dspark_dsv4_flash_bf16_trainer.sh
+```
+
+For two-host DP4, use the existing start-rank `0`/`2` target commands with
+`HS_BACKEND=mooncake`, the **same** master and namespace on both hosts, and
+`TARGET_DP_SIZE=4` on the trainer. Each TP0 producer publishes its own contract
+into the store; there is no shared manifest file or HS file. `HS_PATH` is unused
+by this transport. Local model files and provenance artifacts are still used.
+
+Once TCP works, set `MOONCAKE_PROTOCOL=rdma` on every host. Set
+`MOONCAKE_DEVICE_NAME` to the host's verbs/RDMA device name(s) if required; an
+empty value delegates NIC selection to Mooncake. `enp48s3u1u1` is the socket NIC,
+not proof of an RDMA device. Allow traffic between the master and every store
+client, including dynamic transfer ports. Use a trusted isolated network: this
+adapter does not add store authentication. This is **NPU-to-host copy plus host
+TCP/RDMA**, not NPU-direct/HCCS transfer; HCCL settings are independent.
+
+### Capacity, failure handling, and validation
+
+The wrappers use `NUM_WORKERS=1 PREFETCH_FACTOR=2` per trainer rank for remote
+backends; file defaults remain 12/4. At 16 DDP ranks this is 16 clients per
+loader; persistent training and validation workers can retain 32 clients once
+both loaders have started. Preflight also uses transient clients. Mooncake
+defaults are 4 GiB global + 0.5 GiB staging **per
+target TP0 client**, and 0.25 + 0.25 GiB **per trainer worker**. They are host RAM
+budgets. Override `MOONCAKE_GLOBAL_SEGMENT_GIB` / `MOONCAKE_LOCAL_BUFFER_GIB`
+per host as needed; 3072 tokens x 6 slots x 4096 BF16 values is about 144 MiB
+per HS sample before token metadata. Begin with low concurrency, then measure
+`fetch_ms`, RAM/store pressure and target throughput before increasing workers.
+Increase both timeouts and capacity only with evidence, not to hide a stopped server.
+
+Remote training requires `--on-missing generate --on-generate delete`; persistent
+index caches are deliberately unsupported. Completed aligned samples are removed
+after consumption. Failed transfers/validation stop the run and retain the
+source for diagnosis instead of silently dropping a row. HTTP integrity retries
+download the same artifact with pinned checksum; inference itself is not retried
+under the same nonce. Timeouts or crashes can leave orphan files/store objects;
+use a fresh run directory/namespace, diagnose first, and clean only that run's
+artifacts after all its processes stop. Never wipe a shared store indiscriminately.
+
+These paths have local protocol/wiring tests, not an A3 end-to-end or throughput
+certification. Start with an isolated short training smoke test and compare HS
+alignment/shape before launching a long job. Keep target/training provenance
+artifacts together when moving results between hosts.
 
 ## Weights: `torch_dtype=bf16` Does Not Mean All Weights Are BF16
 
@@ -165,8 +346,8 @@ into the dense draft.
 
 The training script pins `epochs=10`, `seq_len=3072`, `block_size=7`,
 `max_anchors=512`, `correction_gate_bias=0`, and `correction_markov_gate_bias=-2`.
-It retains Muon + linear scheduling. `--lr 6e-5` is the base LR for the AdamW
-portion; without a separate override, Muon's base LR is `6e-4`. This preserves
+It retains Muon + linear scheduling. `--lr 4.5e-5` is the base LR for the AdamW
+portion; without a separate override, Muon's base LR is `4.5e-4`. This preserves
 the current experiment, not the official DeepSpec AdamW + cosine recipe.
 
 ## A3 Startup and Hardware Checks
@@ -204,12 +385,12 @@ Run all scripts from the repository root. The saved server/evaluator endpoint is
 `80.48.17.187:8001`; the server preserves the checkpoint directory
 `/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16`, HS directory
 `/home/s00969542/DSV4F/tmp_hs`, TP8 x DP2 and devices 0-15. It defaults to
-`DSV4_BLOCK_VERIFY=1`, `DSV4_EVAL=1`, `MAX_NUM_SEQS=16` per DP engine and an
-8192-token context/batch budget for block evaluation. For reference evaluation,
-set `DSV4_BLOCK_VERIFY=0 DSV4_EVAL=1`; for training HS, set both switches to `0`.
-Environment variables override these defaults. The trainer retains its earlier
-`TARGET_MASTER_IP=80.48.17.186` default: explicitly set it to `.187` (or set
-`VLLM_ENDPOINT`) when connecting to this saved single-host server. The server
+`HS_BACKEND=http`, `DSV4_BLOCK_VERIFY=0`, `DSV4_EVAL=0`, `MAX_NUM_SEQS=64`
+per DP engine and an 8192-token context/batch budget for training. For reference
+evaluation, set `HS_BACKEND=file DSV4_BLOCK_VERIFY=0 DSV4_EVAL=1`; for block
+evaluation, set `HS_BACKEND=file DSV4_BLOCK_VERIFY=1 DSV4_EVAL=1`.
+Environment variables override these defaults. The trainer also defaults to
+`TARGET_MASTER_IP=80.48.17.187`; override it or `VLLM_ENDPOINT` for DP4. The server
 derives `VLLM_HOST` from its `TARGET_MASTER_IP`; explicit overrides take precedence.
 The server also defaults `TARGET_WORKER_IP` to `80.48.17.187` and
 `TARGET_IFNAME` to the confirmed interface `enp48s3u1u1` on both target hosts.
@@ -221,6 +402,7 @@ now refers to the BF16 HS interface, not a requirement for all-BF16 weights.
 ```bash
 export MODEL=/shared/models/dsv4-flash-target
 export HS_PATH=/shared/hs/dsv4-flash-target-spread-v1
+export HS_BACKEND=file  # This example explicitly uses shared HS storage.
 export DSV4_BLOCK_VERIFY=0 DSV4_EVAL=0  # Training HS, not the saved block default.
 # Set these for the actual devices and memory; no device count per host is assumed.
 export VLLM_NPUS='<target device IDs>'
@@ -300,6 +482,7 @@ actual deployment differs:
 ```bash
 export MODEL=/shared/models/dsv4-flash-target
 export HS_PATH=/shared/hs/dsv4-flash-target-spread-dp4-v1
+export HS_BACKEND=file  # Shared-directory topology; see HTTP above for local directories.
 export VLLM_NPUS=0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15
 export TP_SIZE=8 DP_SIZE=4 DP_SIZE_LOCAL=2
 export TARGET_MASTER_IP=80.48.17.186
@@ -595,6 +778,7 @@ On the trainer host:
 ```bash
 export DATA_PATH=/shared/data/dsv4-flash-target-arrow
 export OUTPUT_DIR=/shared/output/dsv4-flash-target-corrGate0
+export HS_BACKEND=file  # Matches this section's shared-directory target.
 export TRAIN_NPUS='<training device IDs>'
 export NUM_TRAIN_NPUS='<number of visible training devices>'
 export VLLM_ENDPOINT=http://TARGET_INTERNAL_IP:8001/v1
@@ -637,7 +821,8 @@ headless host only supervises its local process, not cluster readiness.
 Restrict its port to a trusted
 network and keep shared paths consistent.
 
-If `OUTPUT_DIR` is unset, the default is `./output/dspark_dsv4_flash_bestArch`.
+If `OUTPUT_DIR` is unset, the default is
+`./output/dspark_dsv4_flash_bestArch_lr4.5e-5`.
 Use a separate output directory when changing checkpoints or quantization
 schemes; do not resume an experiment from another version directly.
 
@@ -1405,10 +1590,12 @@ export DSV4_HS_HTTP_TOKEN
 export HS_PATH=/target/local/hidden_states  # Existing target HS directory.
 export HS_HTTP_HOST=10.0.0.10              # Target's reachable private interface.
 export HS_HTTP_PORT=8002                  # Separate from the vLLM port.
+export HS_HTTP_TRAINING=0                # Evaluation namespace, not training.
 bash examples/train/dspark_dsv4_hs_http_server.sh
 ```
 
-The default bind address is loopback. Plain HTTP carries the token and tensors
+The wrapper's default bind address is `.187` (the Python module defaults to
+loopback). Plain HTTP carries the token and tensors
 without encryption: use only a trusted LAN/VPN, or put a TLS reverse proxy in
 front and use an `https://` endpoint. Do not expose this small sidecar directly
 to the public Internet. It performs no NPU allocation. On a multi-host target,
@@ -1528,6 +1715,7 @@ or restart the target service with the evaluation options:
 
 ```bash
 export DSV4_BLOCK_VERIFY=0 DSV4_EVAL=1
+export HS_BACKEND=file
 bash examples/train/dspark_dsv4_flash_bf16_server.sh
 ```
 

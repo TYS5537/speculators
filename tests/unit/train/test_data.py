@@ -3,6 +3,7 @@
 import logging
 from pathlib import Path
 
+import pytest
 import torch
 from datasets import Dataset
 from safetensors.torch import save_file
@@ -328,6 +329,50 @@ def _valid_generated_sample() -> dict[str, torch.Tensor]:
         "hidden_states": torch.ones(3, 2, 4, dtype=torch.bfloat16),
         "token_ids": torch.tensor([1, 2, 3], dtype=torch.long),
     }
+
+
+def test_remote_generation_failure_is_fatal_without_inference_retry_or_delete(
+    tmp_path, monkeypatch
+):
+    transfer = _SequenceTransfer([TimeoutError("remote unavailable")])
+    transfer.strict_errors = True
+    transfer.preserve_failed_artifacts = True
+    transfer.request_kwargs = lambda: {
+        "request_id": "hstrain-fixture",
+        "max_retries": 0,
+    }
+    dataset = _make_generation_dataset(
+        tmp_path, transfer, generation_validation_retries=3
+    )
+    requests = []
+
+    def generate(*args, **kwargs):
+        requests.append(kwargs)
+        return "remote-handle"
+
+    monkeypatch.setattr(data_module, "generate_hidden_states", generate)
+    with pytest.raises(TimeoutError, match="remote unavailable"):
+        dataset[0]
+    assert len(requests) == 1
+    assert requests[0]["request_id"] == "hstrain-fixture"
+    assert requests[0]["max_retries"] == 0
+    assert transfer.deleted == []
+
+
+def test_remote_success_uses_same_training_tensor_layout_and_deletes(
+    tmp_path, monkeypatch
+):
+    transfer = _SequenceTransfer([_valid_generated_sample()])
+    transfer.strict_errors = True
+    transfer.preserve_failed_artifacts = True
+    dataset = _make_generation_dataset(tmp_path, transfer)
+    monkeypatch.setattr(
+        data_module, "generate_hidden_states", lambda *args, **kwargs: "remote-handle"
+    )
+    row = dataset[0]
+    assert row["hidden_states"].shape == (3, 4)
+    assert row["verifier_last_hidden_states"].shape == (3, 4)
+    assert transfer.deleted == ["remote-handle"]
 
 
 def test_arrow_dataset_retries_nonfinite_read_then_recovers(

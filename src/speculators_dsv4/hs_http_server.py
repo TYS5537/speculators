@@ -20,6 +20,9 @@ from speculators_dsv4.hs_http import (
     DEFAULT_MAX_FILE_BYTES,
     MAX_MANIFEST_BYTES,
     PROTOCOL_VERSION,
+    REQUEST_PREFIX,
+    TRAINING_REQUEST_PREFIX,
+    manifest_digest,
     validate_filename,
     validate_token,
 )
@@ -125,10 +128,17 @@ class HiddenStatesServer(ThreadingHTTPServer):
     allow_reuse_address = True
 
     def __init__(
-        self, address, directory, token, *, max_file_bytes=DEFAULT_MAX_FILE_BYTES
+        self,
+        address,
+        directory,
+        token,
+        *,
+        max_file_bytes=DEFAULT_MAX_FILE_BYTES,
+        training=False,
     ):
         self.directory = Path(directory).resolve(strict=True)
         self.token = validate_token(token)
+        self.training = training
         if type(max_file_bytes) is not int or max_file_bytes <= 0:
             raise ValueError("HS HTTP file limit must be positive")
         self.max_file_bytes = max_file_bytes
@@ -193,8 +203,19 @@ class _Handler(BaseHTTPRequestHandler):
             if self.path == "/v1/manifest" and not delete:
                 self._manifest()
             elif self.path.startswith("/v1/files/"):
-                name = validate_filename(self.path.removeprefix("/v1/files/"))
+                if self.server.training and self.headers.get(
+                    "X-HS-Expected-Contract-SHA256"
+                ) != manifest_digest(self.server.manifest):
+                    raise ValueError("Training consumer contract differs from producer")
+                name = validate_filename(
+                    self.path.removeprefix("/v1/files/"), training=self.server.training
+                )
                 self._artifact(self.server.directory / name, delete=delete)
+            elif self.path.startswith("/v1/probe/") and not delete:
+                name = validate_filename(
+                    self.path.removeprefix("/v1/probe/"), training=self.server.training
+                )
+                self._probe(self.server.directory / name)
             else:
                 self._empty(HTTPStatus.NOT_FOUND)
         except (BlockingIOError, FileNotFoundError):
@@ -213,6 +234,9 @@ class _Handler(BaseHTTPRequestHandler):
                 "protocol_version": PROTOCOL_VERSION,
                 "hidden_states_path": str(self.server.directory),
                 "manifest": self.server.manifest,
+                "request_namespace": (
+                    TRAINING_REQUEST_PREFIX if self.server.training else REQUEST_PREFIX
+                ),
             }
         ).encode()
         self.send_response(HTTPStatus.OK)
@@ -220,6 +244,26 @@ class _Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(payload)))
         self.end_headers()
         self.wfile.write(payload)
+
+    def _probe(self, path):
+        """Distinguish the owning host's pending writer from another host's 404."""
+        try:
+            with (
+                _writer_lock(path),
+                _regular_file(path, self.server.max_file_bytes) as stream,
+            ):
+                status = (
+                    HTTPStatus.OK
+                    if os.fstat(stream.fileno()).st_size
+                    else HTTPStatus.CONFLICT
+                )
+        except FileNotFoundError:
+            status = (
+                HTTPStatus.CONFLICT
+                if Path(str(path) + ".lock").exists()
+                else HTTPStatus.NOT_FOUND
+            )
+        self._empty(status)
 
     def _artifact(self, path, *, delete):
         with _writer_lock(path):
@@ -236,6 +280,11 @@ class _Handler(BaseHTTPRequestHandler):
                         self.send_header("Content-Type", "application/octet-stream")
                         self.send_header("Content-Length", str(length))
                         self.send_header("X-HS-SHA256", digest)
+                        if self.server.training:
+                            self.send_header(
+                                "X-HS-Contract-SHA256",
+                                manifest_digest(self.server.manifest),
+                            )
                         self.end_headers()
                         for chunk in iter(lambda: snapshot.read(CHUNK_BYTES), b""):
                             self.wfile.write(chunk)
@@ -253,6 +302,11 @@ def main():
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
+    parser.add_argument(
+        "--training",
+        action="store_true",
+        help="Serve only dedicated hstrain- training requests (default: hshttp- eval).",
+    )
     args = parser.parse_args()
     if not 1 <= args.port <= MAX_PORT:
         parser.error("Port must be between 1 and 65535")
@@ -263,6 +317,7 @@ def main():
         args.hidden_states_path,
         token,
         max_file_bytes=args.max_file_bytes,
+        training=args.training,
     ) as server:
         logger.info(
             "HS HTTP sidecar listening on %s:%s; "

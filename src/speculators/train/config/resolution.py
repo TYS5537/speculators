@@ -267,6 +267,8 @@ def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:
                 kwargs["help"] = action.help
             if action.type is not None:
                 kwargs["type"] = action.type
+            if action.nargs is not None:
+                kwargs["nargs"] = action.nargs
             if action.choices is not None:
                 kwargs["choices"] = action.choices
             backend_group.add_argument(flag, **kwargs)

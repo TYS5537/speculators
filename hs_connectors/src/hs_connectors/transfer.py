@@ -47,8 +47,18 @@ def wait_for_lock(lock_path: str, timeout: float = 10.0, poll_interval: float = 
 class HiddenStatesTransfer(ABC):
     """Interface for reading hidden states produced by vLLM."""
 
+    strict_errors = False
+    preserve_failed_artifacts = False
+
     def setup(self) -> None:  # noqa: B027
         """Lazy initialization (safe to call from dataloader worker)."""
+
+    def request_kwargs(self) -> dict[str, Any]:
+        """Optional request identity/retry policy; file consumers are unchanged."""
+        return {}
+
+    def close(self) -> None:  # noqa: B027
+        """Release a preflight client before constructing dataloader workers."""
 
     @abstractmethod
     def get_cached(self, file_idx: int) -> dict[str, torch.Tensor] | None:
@@ -312,6 +322,74 @@ class FP8Backend(HiddenStatesBackend):
         }
 
 
+@HiddenStatesBackend.register("http")
+class HttpBackend(HiddenStatesBackend):
+    """DSV4 local target files served by the authenticated training sidecar."""
+
+    @staticmethod
+    def add_train_args(parser: argparse.ArgumentParser) -> None:
+        FileBackend.add_train_args(parser)
+        _add_argument_if_absent(
+            parser,
+            "--hs-http-endpoints",
+            nargs="+",
+            default=None,
+            help="Authenticated HS sidecar URL(s), one per target host (not /v1).",
+        )
+        _add_argument_if_absent(
+            parser,
+            "--hs-http-timeout",
+            type=float,
+            default=120.0,
+            help="HTTP HS readiness/download timeout, in seconds.",
+        )
+        _add_argument_if_absent(
+            parser,
+            "--hs-http-max-file-bytes",
+            type=int,
+            default=512 * 1024**2,
+            help="Maximum bytes per downloaded HS artifact.",
+        )
+
+    @staticmethod
+    def add_launch_args(parser: argparse.ArgumentParser) -> None:
+        FileBackend.add_launch_args(parser)
+
+    @staticmethod
+    def from_train_args(
+        args: argparse.Namespace,
+        data_path: str,  # noqa: ARG004
+    ) -> HiddenStatesTransfer:
+        from speculators_dsv4 import HS_FORMAT  # noqa: PLC0415
+        from speculators_dsv4.hs_training_http import (  # noqa: PLC0415
+            HttpTrainingTransfer,
+        )
+
+        if getattr(args, "target_hidden_state_format", None) != HS_FORMAT:
+            raise ValueError("The HTTP training backend currently requires DSV4.")
+        if not args.hs_http_endpoints or not args.hidden_states_path:
+            raise ValueError(
+                "HTTP HS requires --hs-http-endpoints and a trainer-local "
+                "--hidden-states-path download directory."
+            )
+        return HttpTrainingTransfer(
+            args.hs_http_endpoints,
+            os.environ.get("DSV4_HS_HTTP_TOKEN"),
+            args.hidden_states_path,
+            timeout=args.hs_http_timeout,
+            max_file_bytes=args.hs_http_max_file_bytes,
+            expected_contract=getattr(args, "target_training_contract", None),
+        )
+
+    @staticmethod
+    def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
+        if not getattr(args, "dsv4", False):
+            raise ValueError("The HTTP training backend currently requires --dsv4.")
+        # Here the directory is target-local, never mounted by the trainer.
+        args.hidden_states_path = str(Path(args.hidden_states_path).resolve())
+        return FileBackend.build_kv_transfer_config(args)
+
+
 # ---------------------------------------------------------------------------
 # Mooncake-based backend (distributed store)
 # ---------------------------------------------------------------------------
@@ -343,6 +421,25 @@ class MooncakeBackend(HiddenStatesBackend):
 
     @staticmethod
     def _add_mooncake_args(parser: argparse.ArgumentParser) -> None:
+        _add_argument_if_absent(
+            parser,
+            "--mooncake-device-name",
+            default="",
+            help="Mooncake RDMA verbs device name(s); not the GLOO socket NIC.",
+        )
+        _add_argument_if_absent(
+            parser,
+            "--mooncake-namespace",
+            default=None,
+            help="Fresh, shared run ID for DSV4 remote contracts and HS handles.",
+        )
+        _add_argument_if_absent(
+            parser,
+            "--hs-transfer-timeout",
+            type=float,
+            default=120.0,
+            help="Mooncake contract/sample readiness timeout, in seconds.",
+        )
         _add_argument_if_absent(
             parser,
             "--mooncake-master",
@@ -388,6 +485,13 @@ class MooncakeBackend(HiddenStatesBackend):
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
         MooncakeBackend._add_mooncake_args(parser)
+        _add_argument_if_absent(
+            parser,
+            "--mooncake-target-dp-size",
+            type=int,
+            default=1,
+            help="Global DSV4 target DP size; preflight checks every producer.",
+        )
 
     @staticmethod
     def add_launch_args(parser: argparse.ArgumentParser) -> None:
@@ -417,8 +521,26 @@ class MooncakeBackend(HiddenStatesBackend):
                 global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
                 local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
                 protocol=args.mooncake_protocol,
+                device_name=getattr(args, "mooncake_device_name", ""),
+                initialize_accelerator=getattr(args, "target_hidden_state_format", None)
+                != "deepseek_v4_mean_hc_head",
             )
         )
+        if (
+            getattr(args, "target_hidden_state_format", None)
+            == "deepseek_v4_mean_hc_head"
+        ):
+            from speculators_dsv4.mooncake_training import (  # noqa: PLC0415
+                Dsv4MooncakeTransfer,
+            )
+
+            return Dsv4MooncakeTransfer(
+                store,
+                namespace=args.mooncake_namespace,
+                target_dp_size=args.mooncake_target_dp_size,
+                expected_contract=getattr(args, "target_training_contract", None),
+                timeout=args.hs_transfer_timeout,
+            )
         return MooncakeTransfer(store)
 
     @staticmethod
@@ -434,6 +556,8 @@ class MooncakeBackend(HiddenStatesBackend):
             global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
             local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
             protocol=args.mooncake_protocol,
+            device_name=getattr(args, "mooncake_device_name", ""),
+            initialize_accelerator=not getattr(args, "dsv4", False),
             num_writer_threads=args.mooncake_writer_threads,
         )
 

@@ -201,6 +201,7 @@ async def generate_hidden_states_async(
     client_item: ClientItem,
     *,
     timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+    request_id: str | None = None,
 ) -> str:
     """
     Runs decode w/ max_tokens 1 to generate hidden states and returns path to
@@ -214,6 +215,7 @@ async def generate_hidden_states_async(
     """
     token_ids = client_item["input_ids"]
     messages = client_item.get("messages")
+    identity = {"request_id": request_id} if request_id is not None else {}
 
     coro: Coroutine[Any, Any, Completion | ChatCompletion]
     if messages is None:
@@ -221,7 +223,7 @@ async def generate_hidden_states_async(
             model=model,
             prompt=token_ids,
             max_tokens=1,
-            extra_body={"return_token_ids": True},
+            extra_body={"return_token_ids": True, **identity},
             timeout=timeout,
         )
     else:
@@ -236,6 +238,7 @@ async def generate_hidden_states_async(
                     "continue_final_message", _continue_final_message_for(model)
                 ),
                 "return_token_ids": True,
+                **identity,
             },
             timeout=timeout,
         )
@@ -256,6 +259,7 @@ def generate_hidden_states(
     client_item: ClientItem,
     *,
     timeout: float | None = DEFAULT_REQUEST_TIMEOUT,
+    request_id: str | None = None,
 ) -> str:
     """
     Runs decode w/ max_tokens 1 to generate hidden states and returns path to
@@ -263,6 +267,7 @@ def generate_hidden_states(
     """
     token_ids = client_item["input_ids"]
     messages = client_item.get("messages")
+    identity = {"request_id": request_id} if request_id is not None else {}
 
     res: Completion | ChatCompletion
     if messages is None:
@@ -270,7 +275,7 @@ def generate_hidden_states(
             model=model,
             prompt=token_ids,
             max_tokens=1,
-            extra_body={"return_token_ids": True},
+            extra_body={"return_token_ids": True, **identity},
             timeout=timeout,
         )
     else:
@@ -285,6 +290,7 @@ def generate_hidden_states(
                     "continue_final_message", _continue_final_message_for(model)
                 ),
                 "return_token_ids": True,
+                **identity,
             },
             timeout=timeout,
         )

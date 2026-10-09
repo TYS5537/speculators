@@ -535,6 +535,7 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
         )
         if (
             dsv4_parallel.data_parallel_size == DP4_SIZE
+            and args.hidden_states_backend == "file"
             and not Path(args.hidden_states_path).is_absolute()
         ):
             raise ValueError(
@@ -542,8 +543,17 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
             )
         report = inspect_checkpoint(args.model)
         num_hidden_layers = report["config"]["num_hidden_layers"]
-        if args.hidden_states_backend != "file" or not args.include_last_layer:
-            raise ValueError("DSV4 requires the file backend and --include-last-layer.")
+        if (
+            args.hidden_states_backend not in {"file", "http", "mooncake"}
+            or not args.include_last_layer
+        ):
+            raise ValueError(
+                "DSV4 requires file/http/mooncake and --include-last-layer."
+            )
+        if args.dsv4_block_verify and args.hidden_states_backend != "file":
+            raise ValueError(
+                "DSV4 remote training backends cannot use block verification."
+            )
         args.target_layer_ids = args.target_layer_ids or list(DEFAULT_LAYERS)
         validate_layers(args.target_layer_ids)
         dsv4_manifest = make_manifest(report, args.target_layer_ids)
@@ -646,6 +656,21 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
     }
     backend_cls = _backend_registry[args.hidden_states_backend]
     kv_transfer_config = backend_cls.build_kv_transfer_config(args)
+    if dsv4_manifest is not None and args.hidden_states_backend == "mooncake":
+        from speculators_dsv4.mooncake_training import (  # noqa: PLC0415
+            validate_namespace,
+        )
+
+        kv_transfer_config["kv_connector_extra_config"].update(
+            {
+                "dsv4_namespace": validate_namespace(args.mooncake_namespace),
+                "dsv4_dp_size": dsv4_parallel.data_parallel_size,
+                "dsv4_training_contract": {
+                    **dsv4_manifest,
+                    "runtime_quantization": dsv4_runtime_quantization,
+                },
+            }
+        )
     if args.dsv4_block_verify:
         from speculators_dsv4.block_protocol import (  # noqa: PLC0415
             BLOCK_CONNECTOR,
@@ -694,7 +719,15 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
 
     def before_launch():
         if dsv4_manifest is not None:
-            if dsv4_parallel.data_parallel_size == DP4_SIZE and dsv4_parallel.headless:
+            if args.hidden_states_backend == "mooncake":
+                # TP0 workers publish contracts into their live store after
+                # cache registration; neither host touches a shared HS path.
+                pass
+            elif (
+                args.hidden_states_backend == "file"
+                and dsv4_parallel.data_parallel_size == DP4_SIZE
+                and dsv4_parallel.headless
+            ):
                 print(
                     "Waiting for the target head node's shared DSV4 HS manifest...",
                     flush=True,

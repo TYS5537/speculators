@@ -482,6 +482,78 @@ class LauncherTests(unittest.TestCase):
     def test_dsv4_primary_flag_and_legacy_alias_are_equivalent(self):
         self.assertEqual(self.launch_dsv4(), self.launch_dsv4("--dsv4-bf16"))
 
+    def test_http_headless_dp4_publishes_its_own_local_manifest(self):
+        backend = self.launcher._backend_registry["file"]
+
+        class HttpBackend:
+            add_launch_args = staticmethod(lambda parser: None)
+            build_kv_transfer_config = backend.build_kv_transfer_config
+
+        with (
+            patch.dict(self.launcher._backend_registry, {"http": HttpBackend}),
+            patch.dict(
+                os.environ, {"ASCEND_RT_VISIBLE_DEVICES": ",".join(map(str, range(16)))}
+            ),
+        ):
+            self.launch_dsv4(
+                launcher_extra=["--hidden-states-backend", "http"],
+                hs_path="host-local-fixture",
+                extra=[
+                    "-tp",
+                    "8",
+                    "-dp",
+                    "4",
+                    "-dpl",
+                    "2",
+                    "-ep",
+                    "-dpa",
+                    "192.0.2.10",
+                    "-dpp",
+                    "13345",
+                    "--headless",
+                    "-dpr",
+                    "2",
+                ],
+            )
+        self.assertIsNone(self.wait_manifest_call)
+        self.assertTrue(self.manifest_call.kwargs["create"])
+
+    def test_mooncake_contract_is_in_connector_config_without_manifest_files(self):
+        class StoreBackend:
+            @staticmethod
+            def add_launch_args(parser):
+                parser.add_argument("--mooncake-namespace")
+
+            @staticmethod
+            def build_kv_transfer_config(args):
+                return {
+                    "kv_connector": "MooncakeHiddenStatesConnector",
+                    "kv_connector_extra_config": {},
+                }
+
+        with patch.dict(self.launcher._backend_registry, {"mooncake": StoreBackend}):
+            cmd = self.launch_dsv4(
+                launcher_extra=[
+                    "--hidden-states-backend",
+                    "mooncake",
+                    "--mooncake-namespace",
+                    "fixture-run-001",
+                ]
+            )
+        config = json.loads(cmd[cmd.index("--kv_transfer_config") + 1])[
+            "kv_connector_extra_config"
+        ]
+        self.assertEqual(config["dsv4_namespace"], "fixture-run-001")
+        self.assertEqual(config["dsv4_dp_size"], 1)
+        self.assertEqual(
+            config["dsv4_training_contract"]["auxiliary_hs_ids"], [1, 11, 21, 30, 40]
+        )
+        self.assertEqual(
+            config["dsv4_training_contract"]["runtime_quantization"], {"method": None}
+        )
+        self.assertIsNone(self.manifest_call)
+        self.assertIsNone(self.wait_manifest_call)
+
     def test_snapshot_connector_is_explicit_and_keeps_block_parallel_settings(self):
         devices = patch.dict(
             self.launcher.os.environ,
@@ -1076,7 +1148,7 @@ class RecipeTests(unittest.TestCase):
         for name, value in {
             "--scheduler-type": "linear",
             "--optimizer": "muon",
-            "--lr": "6e-5",
+            "--lr": "4.5e-5",
             "--correction-gate-bias": "0",
             "--correction-markov-gate-bias": "-2.0",
             "--epochs": "10",

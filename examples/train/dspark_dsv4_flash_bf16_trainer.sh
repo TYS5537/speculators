@@ -6,15 +6,29 @@ set -euo pipefail
 # This script runs on a DIFFERENT host from the 16-device target server.
 MODEL="${MODEL:-/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
 DATA_PATH="${DATA_PATH:-/mnt/nfs/dataset/arrow_0730_77w_dedup}"
-DSV4_EXTERNAL_ARROW="${DSV4_EXTERNAL_ARROW:-0}"
+DSV4_EXTERNAL_ARROW="${DSV4_EXTERNAL_ARROW:-1}"
 RECOMPUTE="${RECOMPUTE:-1}"
+HS_BACKEND="${HS_BACKEND:-http}"
 HS_PATH="${HS_PATH:-/mnt/nfs/dataset/tmp_hs}"
+# The legacy shared path is preserved for file mode. HTTP downloads are local.
+HS_HTTP_LOCAL_PATH="${HS_HTTP_LOCAL_PATH:-/home/s00969542/DSV4F/tmp_hs_downloads}"
+TRAIN_HS_PATH="$HS_PATH"
+if [[ "$HS_BACKEND" == file ]]; then
+  NUM_WORKERS="${NUM_WORKERS:-12}"
+  PREFETCH_FACTOR="${PREFETCH_FACTOR:-4}"
+else
+  if [[ "$HS_BACKEND" == http ]]; then TRAIN_HS_PATH="$HS_HTTP_LOCAL_PATH"; fi
+  NUM_WORKERS="${NUM_WORKERS:-1}"
+  PREFETCH_FACTOR="${PREFETCH_FACTOR:-2}"
+fi
 TRAIN_NPUS="${TRAIN_NPUS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 NUM_TRAIN_NPUS="${NUM_TRAIN_NPUS:-16}"
-TARGET_MASTER_IP="${TARGET_MASTER_IP:-80.48.17.186}"
+TARGET_MASTER_IP="${TARGET_MASTER_IP:-80.48.17.187}"
 VLLM_ENDPOINT="${VLLM_ENDPOINT:-http://${TARGET_MASTER_IP}:8001/v1}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_dsv4_flash_bestArch}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/dspark_dsv4_flash_bestArch_lr4.5e-5}"
 LOG_DIR="$OUTPUT_DIR/logs"
+source "$(dirname "${BASH_SOURCE[0]}")/common/dsv4_hs_transport.sh"
+configure_dsv4_hs_transport trainer
 case "$DSV4_EXTERNAL_ARROW" in
   0|1) ;;
   *) echo "DSV4_EXTERNAL_ARROW must be 0 or 1" >&2; exit 2 ;;
@@ -61,7 +75,9 @@ TRAIN_CMD=(env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   "${TRAIN_ENTRY[@]}" \
   --verifier-name-or-path "$MODEL" \
   --data-path "$DATA_PATH" \
-  --hidden-states-path "$HS_PATH" \
+  --hidden-states-path "$TRAIN_HS_PATH" \
+  "${hs_transport_args[@]}" \
+  --num-workers "$NUM_WORKERS" --prefetch-factor "$PREFETCH_FACTOR" \
   --vllm-endpoint "$VLLM_ENDPOINT" \
   --save-path "$OUTPUT_DIR/checkpoints" \
   --target-hidden-state-format deepseek_v4_mean_hc_head \
@@ -69,7 +85,7 @@ TRAIN_CMD=(env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   --target-layer-ids 1 11 21 30 40 \
   --mask-token-id 128799 \
   --speculator-type mmuse \
-  --epochs 10 --lr 6e-5 --optimizer muon --scheduler-type linear \
+  --epochs 10 --lr 4.5e-5 --optimizer muon --scheduler-type linear \
   --logger tensorboard --log-dir "$LOG_DIR/tensorboard" --total-seq-len 3072 \
   --block-size 7 --max-anchors 512 --draft-attn-impl sdpa \
   --markov-rank 256 --markov-head-type vanilla \

@@ -1,7 +1,8 @@
-"""Opt-in, authenticated HS downloads for DSV4 evaluation without shared storage.
+"""Opt-in, authenticated HS downloads for DSV4 without shared storage.
 
-The target still writes ordinary safetensors. Only the hshttp- request namespace
-is exposed by the sidecar; training caches and ordinary requests are off limits.
+The target writes local safetensors. The sidecar exposes hshttp- evaluation
+requests by default, or hstrain- requests with explicit training mode. Ordinary
+requests and persistent index caches are off limits in both modes.
 """
 
 import hashlib
@@ -25,6 +26,10 @@ from speculators_dsv4.eval_contract import validate_eval_manifest
 PROTOCOL_VERSION = 1
 REQUEST_PREFIX = "hshttp-"
 FILE_PATTERN = re.compile(r"cmpl-hshttp-[0-9a-f]{32}-0(?:-[0-9a-f]{8})?\.safetensors")
+TRAINING_REQUEST_PREFIX = "hstrain-"
+TRAINING_FILE_PATTERN = re.compile(
+    r"cmpl-hstrain-[0-9a-f]{32}-0(?:-[0-9a-f]{8})?\.safetensors"
+)
 MAX_MANIFEST_BYTES = 1024 * 1024
 DEFAULT_MAX_FILE_BYTES = 512 * 1024 * 1024
 CHUNK_BYTES = 1024 * 1024
@@ -71,10 +76,16 @@ def validate_endpoint(endpoint):
     return endpoint.rstrip("/")
 
 
-def validate_filename(name):
-    if not isinstance(name, str) or FILE_PATTERN.fullmatch(name) is None:
-        raise ValueError("Only HTTP evaluation request artifacts may be transferred")
+def validate_filename(name, *, training=False):
+    pattern = TRAINING_FILE_PATTERN if training else FILE_PATTERN
+    if not isinstance(name, str) or pattern.fullmatch(name) is None:
+        scope = "training" if training else "evaluation"
+        raise ValueError(f"Only HTTP {scope} request artifacts may be transferred")
     return name
+
+
+def manifest_digest(manifest):
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
 
 
 def _remote_path(value):
@@ -116,6 +127,7 @@ class HttpHiddenStates:
         *,
         timeout=120.0,
         max_file_bytes=DEFAULT_MAX_FILE_BYTES,
+        training=False,
     ):
         self.endpoint = validate_endpoint(endpoint)
         self.token = validate_token(token)
@@ -127,6 +139,8 @@ class HttpHiddenStates:
         self.max_file_bytes = max_file_bytes
         self.directory = Path(directory)
         self.remote_directory = None
+        self.training = training
+        self.manifest_checksum = None
         # Never forward the bearer token to environment-configured proxies.
         self.opener = build_opener(ProxyHandler({}), _NoRedirect())
 
@@ -136,10 +150,13 @@ class HttpHiddenStates:
 
     def _open(self, route, *, method="GET"):
         deadline = time.monotonic() + self.timeout
+        headers = {"Authorization": "Bearer " + self.token}
+        if self.training and self.manifest_checksum is not None:
+            headers["X-HS-Expected-Contract-SHA256"] = self.manifest_checksum
         request = Request(  # noqa: S310 -- Explicit http(s), fixed routes, no redirects.
             self.endpoint + route,
             method=method,
-            headers={"Authorization": "Bearer " + self.token},
+            headers=headers,
         )
         while True:
             remaining = deadline - time.monotonic()
@@ -158,7 +175,8 @@ class HttpHiddenStates:
                     ) from None
                 time.sleep(min(0.1, remaining))
 
-    def validate_manifest(self, expected):
+    def read_manifest(self):
+        """Read protocol metadata without weakening the caller's identity checks."""
         with self._open("/v1/manifest") as response:
             data = response.read(MAX_MANIFEST_BYTES + 1)
         if len(data) > MAX_MANIFEST_BYTES:
@@ -173,13 +191,22 @@ class HttpHiddenStates:
         actual = info.get("manifest")
         if not isinstance(actual, dict):
             raise ValueError("Missing HS HTTP manifest")
-        validate_eval_manifest(actual, expected)
+        if self.training and info.get("request_namespace") != TRAINING_REQUEST_PREFIX:
+            raise ValueError(
+                "HS HTTP training requires a sidecar started with --training"
+            )
         self.remote_directory = _remote_path(info.get("hidden_states_path"))
+        self.manifest_checksum = manifest_digest(actual)
+        return actual
+
+    def validate_manifest(self, expected):
+        actual = self.read_manifest()
+        validate_eval_manifest(actual, expected)
         return actual
 
     def _filename(self, handle, request_id):
         path = _remote_path(handle)
-        name = validate_filename(path.name)
+        name = validate_filename(path.name, training=self.training)
         pattern = rf"cmpl-{re.escape(request_id)}-0(?:-[0-9a-f]{{8}})?\.safetensors"
         if path.parent != self.remote_directory or re.fullmatch(pattern, name) is None:
             raise ValueError(
@@ -189,6 +216,12 @@ class HttpHiddenStates:
 
     def _download(self, name, destination, *, expected=None):
         with self._open("/v1/files/" + name) as response:
+            if (
+                self.training
+                and response.headers.get("X-HS-Contract-SHA256")
+                != self.manifest_checksum
+            ):
+                raise ValueError("HS HTTP producer contract changed during training")
             try:
                 length = int(response.headers["Content-Length"])
             except (TypeError, ValueError):

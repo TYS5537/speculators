@@ -12,11 +12,38 @@ from speculators_dsv4.contract import (
 from speculators_dsv4.external_data import validate_external_arrow
 from speculators_dsv4.preprocessing import DATA_MANIFEST, validate_data_manifest
 from speculators_dsv4.training_contract import (
+    bind_remote_training_contract,
     read_training_contract,
     validate_draft_contract,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _read_remote_contract(args, report):
+    from hs_connectors import HiddenStatesBackend  # noqa: PLC0415
+
+    if args.on_missing != "generate" or args.on_generate != "delete":
+        raise ValueError(
+            "DSV4 remote HS requires --on-missing generate --on-generate delete; "
+            "persistent index caches are not supported by these transports."
+        )
+    transfer = HiddenStatesBackend.registry[args.hidden_states_backend].from_train_args(
+        args, args.data_path
+    )
+    try:
+        actual = transfer.read_contract()
+        return bind_remote_training_contract(actual, report, args.target_layer_ids)
+    finally:
+        # Never fork dataloader workers with a live native Mooncake client.
+        transfer.close()
+
+
+def _training_contract(args, report):
+    if args.hidden_states_backend == "file":
+        directory = args.hidden_states_path or Path(args.data_path) / "hidden_states"
+        return read_training_contract(directory, report, args.target_layer_ids)
+    return _read_remote_contract(args, report)
 
 
 def _validate_training_data(args, report, rank, world_size):
@@ -59,8 +86,11 @@ def _validate_training_data(args, report, rank, world_size):
 def prepare_training(args, *, rank=0, world_size=1):
     if args.speculator_type not in {"dspark", "mmuse"}:
         raise ValueError("The DSV4 target adapter supports DSpark and MMUSE only.")
-    if args.hidden_states_backend != "file" or args.legacy_data:
-        raise ValueError("DSV4 currently requires the file HS backend and Arrow data.")
+    if (
+        args.hidden_states_backend not in {"file", "http", "mooncake"}
+        or args.legacy_data
+    ):
+        raise ValueError("DSV4 requires file/http/mooncake HS and Arrow data.")
     report = inspect_checkpoint(args.verifier_name_or_path)
     _validate_training_data(args, report, rank, world_size)
     saved = None
@@ -85,8 +115,7 @@ def prepare_training(args, *, rank=0, world_size=1):
     validate_layers(args.target_layer_ids)
     if args.mask_token_id is None:
         args.mask_token_id = report["config"].get("dspark_noise_token_id", 128799)
-    directory = args.hidden_states_path or Path(args.data_path) / "hidden_states"
-    contract = read_training_contract(directory, report, args.target_layer_ids)
+    contract = _training_contract(args, report)
     if saved is not None:
         validate_draft_contract(saved, contract, source=args.from_pretrained)
     args.target_training_contract = contract

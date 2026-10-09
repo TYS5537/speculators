@@ -145,6 +145,34 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._kv_transfer_config.get_from_extra_config("mooncake", {})
         )
         self._store = MooncakeHiddenStatesStore(mooncake_cfg)
+        self._dsv4_contract = self._kv_transfer_config.get_from_extra_config(
+            "dsv4_training_contract", None
+        )
+        self._dsv4_namespace = None
+        self._dsv4_dp_rank = None
+        self._sample_metadata = None
+        if self._dsv4_contract is not None:
+            from speculators_dsv4.mooncake_training import (  # noqa: PLC0415
+                sample_metadata,
+                validate_namespace,
+            )
+            from speculators_dsv4.training_contract import (  # noqa: PLC0415
+                validate_training_contract,
+            )
+
+            self._dsv4_contract = validate_training_contract(self._dsv4_contract)
+            self._dsv4_namespace = validate_namespace(
+                self._kv_transfer_config.get_from_extra_config("dsv4_namespace", None)
+            )
+            self._dsv4_dp_rank = vllm_config.parallel_config.data_parallel_rank
+            self._dsv4_dp_size = self._kv_transfer_config.get_from_extra_config(
+                "dsv4_dp_size", None
+            )
+            if self._dsv4_dp_size != vllm_config.parallel_config.data_parallel_size:
+                raise ValueError("DSV4 Mooncake topology differs from the live target")
+            self._sample_metadata = sample_metadata(
+                self._dsv4_namespace, self._dsv4_contract
+            )
 
         # Scheduler-side state.
         self._request_keys: dict[str, str] = {}
@@ -200,6 +228,19 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         )
         self._kv_cache = kv_caches[cache_layers[0]]
         self._copy_stream = self._device().Stream()
+        if self._dsv4_contract is not None and self._is_tp_rank_zero:
+            from speculators_dsv4.mooncake_training import contract_key  # noqa: PLC0415
+
+            self._ensure_store()
+            self._store.put_json(
+                contract_key(self._dsv4_namespace, self._dsv4_dp_rank),
+                {
+                    "namespace": self._dsv4_namespace,
+                    "dp_rank": self._dsv4_dp_rank,
+                    "dp_size": self._dsv4_dp_size,
+                    "contract": self._dsv4_contract,
+                },
+            )
 
     def _device(self) -> Any:
         """Resolve (once) the accelerator module providing streams/events."""
@@ -265,6 +306,11 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
             self._store.put_sample(
                 pending.mooncake_key,
                 {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
+                **(
+                    {"metadata": self._sample_metadata}
+                    if self._sample_metadata is not None
+                    else {}
+                ),
             )
         except Exception as exc:
             try:
@@ -348,6 +394,10 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
     ) -> tuple[bool, dict[str, Any] | None]:
         req_id = request.request_id
         mooncake_key = self._request_keys.pop(req_id, sanitize_key(req_id))
+        if self._dsv4_namespace is not None:
+            mooncake_key = (
+                f"dsv4hs:{self._dsv4_namespace}:{self._dsv4_dp_rank}:{mooncake_key}"
+            )
 
         kv_params = request.kv_transfer_params or {}
         if kv_params.get("include_output_tokens", False):

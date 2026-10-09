@@ -328,7 +328,12 @@ class ArrowDataset(BaseDataset):
         )
         list_models = client.models.list()
         model_id = list_models.data[0].id
-        if self.model and self.model != model_id:
+        remote_identity = getattr(self.transfer, "allow_model_name_relocation", False)
+        if remote_identity:
+            # The remote contract proves the weight identity despite host-local
+            # checkpoint paths or served-model aliases. Do not relax file/Qwen.
+            self.transfer.setup()
+        if self.model and self.model != model_id and not remote_identity:
             raise ValueError(
                 f"An explicit model name was passed ({self.model}) which doesn't match"
                 f" found model_id {model_id}."
@@ -398,12 +403,14 @@ class ArrowDataset(BaseDataset):
         try:
             if not self.client:
                 self._setup_client()
+            request_options = {"max_retries": self.max_retries}
+            request_options.update(getattr(self.transfer, "request_kwargs", dict)())
             handle = generate_hidden_states(
                 self.client,  # type:ignore[arg-type]
                 self.model,  # type:ignore[arg-type]
                 client_item,
                 timeout=self.request_timeout,
-                max_retries=self.max_retries,
+                **request_options,
             )
 
             loaded_hs = self.transfer.get_generated(handle)
@@ -432,7 +439,9 @@ class ArrowDataset(BaseDataset):
             else:
                 try:
                     self.transfer.delete(handle)
-                except Exception as cleanup_error:  # noqa: BLE001
+                except Exception as cleanup_error:
+                    if getattr(self.transfer, "strict_errors", False):
+                        raise
                     logger.warning(
                         "Loaded a valid hidden-state sample but failed to delete "
                         "handle %s: %s",
@@ -441,7 +450,9 @@ class ArrowDataset(BaseDataset):
                     )
             return loaded_hs
         except Exception:
-            if handle is not None:
+            if handle is not None and not getattr(
+                self.transfer, "preserve_failed_artifacts", False
+            ):
                 try:
                     self.transfer.delete(handle)
                 except Exception as cleanup_error:  # noqa: BLE001
@@ -464,6 +475,15 @@ class ArrowDataset(BaseDataset):
         )
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
+        if getattr(self.transfer, "strict_errors", False):
+            # Remote DSV4 transports must never turn timeout/corruption into a
+            # dropped training row or regenerate a sample behind the user's back.
+            dataset_item = self._get_dataset_item(index)
+            client_item = build_client_item(dataset_item, legacy_final_message=True)
+            return self._generate_hidden_states_once(index, dataset_item, client_item)
+        return self._maybe_generate_legacy_hs(index)
+
+    def _maybe_generate_legacy_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if self.generation_recovery is not None and not self.pretokenized_text_only:
             return self._generate_recoverable_hs(index)
         if not self.client:

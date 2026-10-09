@@ -5,6 +5,7 @@
 set -euo pipefail
 # Defaults use one target host and one separate trainer host.
 MODEL="${MODEL:-/mnt/nfs/canada_group_folder/ckpt/DeepSeek-V4-Flash-bf16}"
+HS_BACKEND="${HS_BACKEND:-http}"
 HS_PATH="${HS_PATH:-/home/s00969542/DSV4F/tmp_hs}"
 VLLM_NPUS="${VLLM_NPUS:-0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15}"
 TP_SIZE="${TP_SIZE:-8}"
@@ -36,9 +37,15 @@ if [[ -n "$TARGET_IFNAME" ]]; then
 fi
 VLLM_STARTUP_TIMEOUT="${VLLM_STARTUP_TIMEOUT:-3600}"
 DSV4_MANIFEST_TIMEOUT="${DSV4_MANIFEST_TIMEOUT:-600}"
-export DSV4_EVAL="${DSV4_EVAL:-1}"  # 0: training HS; 1: reference evaluation.
-# Dedicated block service by default; set 0 for reference/training HS.
-DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-1}"
+export DSV4_EVAL="${DSV4_EVAL:-0}"  # 0: training HS; 1: reference evaluation.
+DSV4_BLOCK_VERIFY="${DSV4_BLOCK_VERIFY:-0}"
+if [[ "$HS_BACKEND" != file && ( "$DSV4_EVAL" != 0 || "$DSV4_BLOCK_VERIFY" != 0 ) ]]; then
+  echo 'Remote training transports require DSV4_EVAL=0 and DSV4_BLOCK_VERIFY=0.' >&2
+  exit 2
+fi
+source "$(dirname "${BASH_SOURCE[0]}")/common/dsv4_hs_transport.sh"
+configure_dsv4_hs_transport server
+PROVENANCE_DIR="${PROVENANCE_DIR:-./output/dspark_dsv4_flash_bestArch_lr4.5e-5/target-${DP_START_RANK}}"
 # Optional target KV reuse. Budget is HOST RAM per target process, not NPU HBM.
 DSV4_KV_REUSE="${DSV4_KV_REUSE:-0}"
 DSV4_KV_CACHE_MB="${DSV4_KV_CACHE_MB:-1024}"
@@ -128,7 +135,7 @@ if [[ "$DP_SIZE" == 4 ]]; then
     echo "DP_RPC_PORT must be an integer from 1 to 65535." >&2
     exit 2
   fi
-  if [[ "$HS_PATH" != /* ]]; then
+  if [[ "$HS_BACKEND" == file && "$HS_PATH" != /* ]]; then
     echo "DP_SIZE=4 requires the same shared absolute HS_PATH on all three hosts." >&2
     exit 2
   fi
@@ -234,6 +241,8 @@ setsid env -u LOCAL_RANK -u RANK -u WORLD_SIZE \
   ASCEND_RT_VISIBLE_DEVICES="$VLLM_NPUS" \
   python scripts/launch_vllm.py "$MODEL" \
     --dsv4 \
+    --provenance-dir "$PROVENANCE_DIR" \
+    "${hs_transport_args[@]}" \
     "${target_bridge_args[@]}" \
     --dsv4-execution-mode "$DSV4_EXECUTION_MODE" \
     --dsv4-manifest-timeout "$DSV4_MANIFEST_TIMEOUT" \

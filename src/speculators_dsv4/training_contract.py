@@ -76,6 +76,25 @@ def read_training_contract(directory, report, layers):
     return actual
 
 
+def bind_remote_training_contract(actual, report, layers):
+    """Verify remote HS identity, recording the trainer's local weight location.
+
+    Only model_path is host-local. The checkpoint/header fingerprint, layer
+    selection, HS layout and actual runtime quantization remain bound on resume.
+    Copies of the checkpoint must preserve shard timestamps for this fingerprint.
+    """
+    actual = validate_training_contract(actual)
+    expected = make_manifest(report, layers)
+    expected["runtime_quantization"] = actual["runtime_quantization"]
+    relocated = {**actual, "model_path": expected["model_path"]}
+    if relocated != expected:
+        raise ValueError(
+            "DSV4 remote HS contract/target mismatch: checkpoint signature and "
+            "HS fields must match; do not relabel another target's activations."
+        )
+    return relocated
+
+
 def validate_draft_contract(saved, expected, *, source):
     """Check saved identity and its redundant model-config fields before loading."""
     expected = validate_training_contract(expected)

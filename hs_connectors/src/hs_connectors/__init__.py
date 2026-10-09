@@ -5,6 +5,7 @@ from hs_connectors.transfer import (
     FP8Transfer,
     HiddenStatesBackend,
     HiddenStatesTransfer,
+    HttpBackend,
     MooncakeBackend,
     MooncakeTransfer,
 )
@@ -16,6 +17,7 @@ __all__ = [
     "FileTransfer",
     "HiddenStatesBackend",
     "HiddenStatesTransfer",
+    "HttpBackend",
     "MooncakeBackend",
     "MooncakeTransfer",
 ]

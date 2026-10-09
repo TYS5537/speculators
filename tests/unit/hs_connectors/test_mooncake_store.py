@@ -77,6 +77,30 @@ def test_put_get_roundtrip_preserves_shape_and_dtype(store):
     assert torch.equal(out["token_ids"], token_ids)
 
 
+def test_dsv4_sample_identity_checked_before_tensor_reads(store, monkeypatch):
+    metadata = {"dsv4_identity": {"checkpoint_signature": "fixture"}}
+    store.put_sample("req-dsv4", {"hidden_states": torch.ones(2, 3)}, metadata=metadata)
+    original = store._store.get_tensor
+    reads = []
+
+    def get_tensor(key):
+        reads.append(key)
+        return original(key)
+
+    monkeypatch.setattr(store._store, "get_tensor", get_tensor)
+    with pytest.raises(MooncakeIntegrityError, match="identity mismatch"):
+        store.get_sample("req-dsv4", expected_metadata={"wrong": "target"})
+    assert reads == []
+    result = store.get_sample("req-dsv4", expected_metadata=metadata)
+    assert torch.equal(result["hidden_states"], torch.ones(2, 3))
+
+
+def test_small_contract_objects_roundtrip_without_files(store):
+    value = {"namespace": "run-001", "dp_rank": 1, "contract": {"signature": "test"}}
+    store.put_json("run-001:contract:1", value)
+    assert store.get_json("run-001:contract:1") == value
+
+
 def test_meta_written_last_gates_visibility(store):
     # get_sample keys off the meta blob, which put_sample writes last. Simulate
     # a half-written sample (tensors present, meta absent) -> consumer waits.

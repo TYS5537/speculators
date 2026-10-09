@@ -5,11 +5,20 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT:${PYTHONPATH:-}"
-: "${HS_PATH:=/home/s00969542/DSV4F/tmp_hs}"
-# Saved deployment token matches the evaluator; override it on both hosts to rotate.
-: "${DSV4_HS_HTTP_TOKEN:=8d4f1c7a9e2b6f30c5a1d8e74b9c2f61a7e5d3c8b0f2496e1c7a4d8b5f2e9031}"
-export DSV4_HS_HTTP_TOKEN
+HS_PATH="${HS_PATH:-/home/s00969542/DSV4F/tmp_hs}"
+HS_HTTP_TRAINING="${HS_HTTP_TRAINING:-1}"
+source "$REPO_ROOT/examples/train/common/dsv4_hs_transport.sh"
+configure_dsv4_hs_http_token
+sidecar_args=()
+case "$HS_HTTP_TRAINING" in
+  0) ;;
+  1)
+    sidecar_args+=(--training)
+    ;;
+  *) echo 'HS_HTTP_TRAINING must be 0 or 1.' >&2; exit 2 ;;
+esac
 exec python3 -m speculators_dsv4.hs_http_server \
+  "${sidecar_args[@]}" \
   --hidden-states-path "$HS_PATH" \
   --host "${HS_HTTP_HOST:-80.48.17.187}" \
   --port "${HS_HTTP_PORT:-8002}" \

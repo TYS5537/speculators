@@ -9,6 +9,33 @@ import textwrap
 from speculators.train.config.schema import TrainConfig
 
 
+def test_http_training_args_survive_resolution_and_yaml_roundtrip():
+    cfg = TrainConfig.resolve(
+        [
+            "--verifier-name-or-path",
+            "m",
+            "--hidden-states-backend",
+            "http",
+            "--hs-http-endpoints",
+            "http://first:8002",
+            "http://second:8002",
+            "--hidden-states-path",
+            "/local/downloads",
+            "--hs-http-timeout",
+            "180",
+        ]
+    )
+    flat = cfg.flatten()
+    assert flat["hs_http_endpoints"] == ["http://first:8002", "http://second:8002"]
+    assert flat["hs_http_timeout"] == 180
+    assert flat["hs_http_max_file_bytes"] == 512 * 1024**2
+    assert (
+        TrainConfig.from_flat(flat).flatten()["hs_http_endpoints"]
+        == flat["hs_http_endpoints"]
+    )
+    assert "DSV4_HS_HTTP_TOKEN" not in cfg.dump_yaml()
+
+
 def test_mooncake_args_survive_from_sources():
     cfg = TrainConfig.from_sources(
         cli={"verifier_name_or_path": "m", "hidden_states_backend": "mooncake"},

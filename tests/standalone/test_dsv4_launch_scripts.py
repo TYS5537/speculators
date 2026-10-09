@@ -132,6 +132,7 @@ class LaunchScriptTests(unittest.TestCase):
             "OUTPUT_DIR": self.output.as_posix(),
             "MODEL": "/fixture/model",
             "HS_PATH": "/fixture/hs",
+            "HS_BACKEND": "file",
             "DATA_PATH": "/fixture/data",
             "VLLM_HOST": "127.0.0.1",
             "VLLM_PORT": "9123",
@@ -194,6 +195,7 @@ class LaunchScriptTests(unittest.TestCase):
             "dspark_dsv4_flash_bf16_trainer.sh",
             "dspark_qwen3_8b_trainer.sh",
             "common/ascend_training_env.sh",
+            "common/dsv4_hs_transport.sh",
             "../evaluate/dspark_dsv4_offline_eval.sh",
             "../evaluate/dspark_dsv4_single_eval.sh",
             "../evaluate/dspark_offline_jsonl.sh",
@@ -212,6 +214,116 @@ class LaunchScriptTests(unittest.TestCase):
                     check=False,
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_http_training_transport_passes_endpoints_and_local_client_budget(self):
+        (self.output / "logs").mkdir(parents=True)
+        result = self.run_script(
+            "trainer",
+            HS_BACKEND="http",
+            DSV4_HS_HTTP_TOKEN="fixture-token-0123456789abcdef0123456789",
+            HS_HTTP_ENDPOINTS="http://first:8002 http://second:8002",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        index = args.index("--hs-http-endpoints")
+        self.assertEqual(
+            args[index + 1 : index + 3], ["http://first:8002", "http://second:8002"]
+        )
+        self.assertEqual(args[args.index("--num-workers") + 1], "1")
+        self.assertNotIn("fixture-token-0123456789abcdef0123456789", args)
+
+    def test_mooncake_server_carries_run_identity_and_provenance(self):
+        result = self.run_script(
+            "server",
+            HS_BACKEND="mooncake",
+            DSV4_EVAL="0",
+            MOONCAKE_NAMESPACE="fixture-run-001",
+            MOONCAKE_PROTOCOL="rdma",
+            MOONCAKE_DEVICE_NAME="rdma-fixture",
+            PROVENANCE_DIR="/fixture/provenance",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(
+            args[args.index("--mooncake-namespace") + 1], "fixture-run-001"
+        )
+        self.assertEqual(args[args.index("--mooncake-device-name") + 1], "rdma-fixture")
+        self.assertEqual(
+            args[args.index("--provenance-dir") + 1], "/fixture/provenance"
+        )
+        self.assertNotIn("--dsv4-block-verify", args)
+
+    def test_user_trainer_defaults_keep_recipe_and_download_locally(self):
+        result = self.run_script(
+            "trainer",
+            HS_BACKEND=None,
+            HS_PATH=None,
+            HS_HTTP_LOCAL_PATH="/fixture/local-downloads",
+            DSV4_EXTERNAL_ARROW=None,
+            TARGET_MASTER_IP=None,
+            VLLM_ENDPOINT="",
+            OUTPUT_DIR=None,
+            TRAINING_SMOKE="1",
+            SMOKE_PHASE="fresh",
+            SMOKE_REPORT_DIR="/fixture/reports",
+        )
+        self.assertEqual(result.returncode, 17, result.stderr)
+        args = self.capture.read_text().splitlines()
+        for flag, expected in (
+            ("--hidden-states-backend", "http"),
+            ("--hidden-states-path", "/fixture/local-downloads"),
+            ("--hs-http-endpoints", "http://80.48.17.187:8002"),
+            ("--vllm-endpoint", "http://80.48.17.187:8001/v1"),
+            ("--save-path", "./output/dspark_dsv4_flash_bestArch_lr4.5e-5/checkpoints"),
+            ("--lr", "4.5e-5"),
+            ("--epochs", "10"),
+            ("--optimizer", "muon"),
+            ("--scheduler-type", "linear"),
+            ("--total-seq-len", "3072"),
+            ("--block-size", "7"),
+            ("--max-anchors", "512"),
+            ("--correction-gate-bias", "0"),
+        ):
+            self.assertEqual(args[args.index(flag) + 1], expected)
+        self.assertIn("--dsv4-external-arrow", args)
+        self.assertIn("--activation-checkpointing", args)
+        self.assertNotIn("/mnt/nfs/dataset/tmp_hs", args)
+        self.assertFalse(any(re.fullmatch(r"[0-9a-f]{64}", arg) for arg in args))
+
+    def test_sidecar_defaults_to_training_and_preserves_endpoint_parameters(self):
+        script = ROOT / "examples/train/dspark_dsv4_hs_http_server.sh"
+        environment = _shell_environment(
+            {
+                "HS_HTTP_TRAINING": None,
+                "HS_PATH": None,
+                "HS_HTTP_HOST": None,
+                "HS_HTTP_PORT": None,
+                "HS_HTTP_MAX_FILE_BYTES": None,
+                "DSV4_HS_HTTP_TOKEN": None,
+            }
+        )
+        source = 'exec() { printf "%s\\0" "$@"; }\n'
+        source += f"source {shlex.quote(script.as_posix())}\n"
+        result = subprocess.run(  # noqa: S603 -- Fixed sidecar script with fake exec.
+            [BASH, "--noprofile", "--norc"],
+            input=source,
+            cwd=ROOT,
+            env=environment,
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = result.stdout.split("\0")[:-1]
+        self.assertIn("--training", args)
+        self.assertEqual(
+            args[args.index("--hidden-states-path") + 1], "/home/s00969542/DSV4F/tmp_hs"
+        )
+        self.assertEqual(args[args.index("--host") + 1], "80.48.17.187")
+        self.assertEqual(args[args.index("--port") + 1], "8002")
+        self.assertEqual(args[args.index("--max-file-bytes") + 1], "536870912")
+        self.assertFalse(any(re.fullmatch(r"[0-9a-f]{64}", arg) for arg in args))
 
     def test_server_snapshot_switch_is_opt_in_and_requires_block(self):
         result = self.run_script(
@@ -557,6 +669,7 @@ exec() {
                     "HS_HTTP_HOST": None if use_defaults else "10.0.0.10",
                     "HS_HTTP_PORT": None if use_defaults else "8002",
                     "HS_HTTP_MAX_FILE_BYTES": None,
+                    "HS_HTTP_TRAINING": "0",
                     "DSV4_HS_HTTP_TOKEN": None
                     if use_defaults
                     else "fixture-secret-01234567890123456789",
@@ -610,7 +723,7 @@ exec() {
     def test_saved_http_tokens_match_without_putting_credentials_in_argv(self):
         tokens = []
         for relative in (
-            "train/dspark_dsv4_hs_http_server.sh",
+            "train/common/dsv4_hs_transport.sh",
             "evaluate/dspark_dsv4_offline_eval.sh",
         ):
             source = (ROOT / "examples" / relative).read_text(encoding="utf-8")
@@ -730,7 +843,7 @@ exec() {
         self.assertIn("execution mode: eager; async scheduling: 0", result.stdout)
         self.assertRegex(self.signals.read_text(), r"^-TERM -- -[1-9][0-9]*\n$")
 
-    def test_server_preserves_user_paths_and_block_defaults(self):
+    def test_server_preserves_user_paths_and_training_defaults(self):
         result = self.run_script(
             "server",
             MODEL=None,
@@ -741,6 +854,7 @@ exec() {
             TARGET_IFNAME=None,
             DSV4_EVAL=None,
             DSV4_BLOCK_VERIFY=None,
+            HS_BACKEND=None,
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         args = self.capture.read_text().splitlines()
@@ -750,13 +864,14 @@ exec() {
             ("--host", "80.48.17.187"),
             ("--port", "8001"),
             ("--dsv4-manifest-timeout", "600"),
-            ("--max-num-seqs", "16"),
-            ("--max-logprobs", "0"),
+            ("--max-num-seqs", "64"),
+            ("--hidden-states-backend", "http"),
             ("--max-model-len", "8192"),
             ("--max-num-batched-tokens", "8192"),
         ):
             self.assertEqual(args[args.index(flag) + 1], expected)
-        self.assertIn("--dsv4-block-verify", args)
+        self.assertNotIn("--dsv4-block-verify", args)
+        self.assertNotIn("--max-logprobs", args)
         self.assertNotIn("--logprobs-mode", args)
         self.assertEqual(self.proxy_environment()["HCCL_IF_IP"], "80.48.17.187")
         self.assertEqual(self.proxy_environment()["HCCL_SOCKET_IFNAME"], "enp48s3u1u1")
@@ -1001,7 +1116,7 @@ exec() {
 
     def test_trainer_default_endpoint_tracks_master_and_no_proxy(self):
         (self.output / "logs").mkdir(parents=True)
-        for master, expected in (("", "80.48.17.186"), ("10.0.0.99", "10.0.0.99")):
+        for master, expected in (("", "80.48.17.187"), ("10.0.0.99", "10.0.0.99")):
             with self.subTest(master=master):
                 result = self.run_script(
                     "trainer", VLLM_ENDPOINT="", TARGET_MASTER_IP=master

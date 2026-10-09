@@ -4,7 +4,9 @@
 set -euo pipefail
 : "${MODEL:?Set MODEL to the training target checkpoint}"
 : "${DATA_PATH:?Set DATA_PATH to prepared DSV4 Arrow data}"
-: "${HS_PATH:?Set HS_PATH to the training server HS directory}"
+if [[ "${HS_BACKEND:-http}" == file ]]; then
+  : "${HS_PATH:?Set HS_PATH to the training server HS directory}"
+fi
 : "${TRAIN_NPUS:?Set TRAIN_NPUS to training device IDs}"
 : "${NUM_TRAIN_NPUS:?Set NUM_TRAIN_NPUS to the number of training devices}"
 SMOKE_ROOT="${SMOKE_ROOT:-./output/dsv4_training_smoke}"

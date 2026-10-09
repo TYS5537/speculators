@@ -87,6 +87,7 @@ class MooncakeStoreConfig:
     protocol: str = "tcp"
     device_name: str = ""
     num_writer_threads: int = 4
+    initialize_accelerator: bool = True
 
     @classmethod
     def from_dict(cls, d: dict | None) -> MooncakeStoreConfig:
@@ -125,12 +126,13 @@ class MooncakeHiddenStatesStore:
         except ImportError as e:  # pragma: no cover - optional dependency
             raise ImportError(
                 "Mooncake is required for the Mooncake hidden-states backend. "
-                "Install it with `pip install mooncake-transfer-engine` or "
-                "`pip install mooncake-transfer-engine-cuda13`."
+                "Install a Mooncake build matching your platform (non-CUDA/Ascend "
+                "on A3, CUDA on NVIDIA); do not install a CUDA wheel on Ascend."
             ) from e
 
         store = MooncakeDistributedStore()
-        ensure_accelerator_context()
+        if self.config.initialize_accelerator:
+            ensure_accelerator_context()
         result = store.setup(
             self.config.local_hostname,
             self.config.metadata_server,
@@ -144,7 +146,31 @@ class MooncakeHiddenStatesStore:
         self._store = store
         return self
 
-    def put_sample(self, key: str, tensors: dict[str, torch.Tensor]) -> None:
+    def close(self) -> None:
+        if self._store is not None:
+            store, self._store = self._store, None
+            _check_store_result("close", self.config.local_hostname, store.close())
+
+    def put_json(self, key: str, value: dict) -> None:
+        if self._store is None:
+            raise RuntimeError("call setup() first")
+        payload = json.dumps(value).encode("utf-8")
+        if len(payload) > 1024**2:
+            raise ValueError("Mooncake contract exceeds size limit")
+        _check_store_result("put", key, self._store.put(key, payload))
+
+    def get_json(self, key: str, *, timeout: float = 120.0) -> dict:
+        raw = self._wait_for(key, timeout, 0.05)
+        if len(raw) > 1024**2:
+            raise ValueError("Mooncake contract exceeds size limit")
+        value = json.loads(raw)
+        if not isinstance(value, dict):
+            raise ValueError("Mooncake contract must be an object")
+        return value
+
+    def put_sample(
+        self, key: str, tensors: dict[str, torch.Tensor], *, metadata=None
+    ) -> None:
         if self._store is None:
             raise RuntimeError("call setup() first")
 
@@ -171,6 +197,8 @@ class MooncakeHiddenStatesStore:
                 "status": "ok",
                 "tensors": manifest_tensors,
             }
+            if metadata is not None:
+                manifest["metadata"] = metadata
             result = self._store.put(meta_key, json.dumps(manifest).encode("utf-8"))
             _check_store_result("put", meta_key, result)
         except Exception:
@@ -219,12 +247,24 @@ class MooncakeHiddenStatesStore:
             _check_store_result("batch_remove", key_to_remove, status)
 
     def get_sample(
-        self, key: str, timeout: float = 120.0, poll_interval: float = 0.05
+        self,
+        key: str,
+        timeout: float = 120.0,
+        poll_interval: float = 0.05,
+        *,
+        expected_metadata=None,
     ) -> dict[str, torch.Tensor]:
         if self._store is None:
             raise RuntimeError("call setup() first")
         raw_manifest = self._wait_for(f"{key}:meta", timeout, poll_interval)
         tensor_specs = self._parse_manifest(key, raw_manifest)
+        if (
+            expected_metadata is not None
+            and json.loads(raw_manifest).get("metadata") != expected_metadata
+        ):
+            raise MooncakeIntegrityError(
+                f"Mooncake HS producer identity mismatch for key={key}"
+            )
 
         result = {}
         for name, spec in tensor_specs.items():
