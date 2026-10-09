@@ -223,7 +223,7 @@ def test_adapt_conv_for_hf_multimodal_processor():
 
 # Tests for _adapt_conv_for_vllm
 @pytest.mark.sanity
-def test_adapt_conv_for_vllm_all_content_formats():
+def test_adapt_conv_for_vllm_all_content_formats(tmp_path):
     """
     Test converting from normalized conversation to vLLM format
     with each supported content format.
@@ -238,7 +238,7 @@ def test_adapt_conv_for_vllm_all_content_formats():
             "content": [  # Content as list
                 "Hello,",  # Text as string
                 {"type": "text", "text": "I am"},  # Text as dictionary
-                {"type": "image", "path": "/path/to/img"},  # Image file path
+                {"type": "image", "path": str(tmp_path / "img")},  # Image file path
                 {"type": "image", "url": "http://path/to/img"},  # Image URL
             ],
         },
@@ -256,7 +256,7 @@ def test_adapt_conv_for_vllm_all_content_formats():
         {"type": "text", "text": "I am"},
         {
             "type": "image_url",
-            "image_url": {"url": "file:///path/to/img"},
+            "image_url": {"url": f"file://{tmp_path / 'img'}"},
         },
         {
             "type": "image_url",

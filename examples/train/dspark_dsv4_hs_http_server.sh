@@ -10,6 +10,9 @@ HS_HTTP_TRAINING="${HS_HTTP_TRAINING:-1}"
 source "$REPO_ROOT/examples/train/common/dsv4_hs_transport.sh"
 configure_dsv4_hs_http_token
 sidecar_args=()
+if [[ -n "${HS_HTTP_SNAPSHOT_TEMP_DIR:-}" ]]; then
+  sidecar_args+=(--snapshot-temp-dir "$HS_HTTP_SNAPSHOT_TEMP_DIR")
+fi
 case "$HS_HTTP_TRAINING" in
   0) ;;
   1)
@@ -22,4 +25,6 @@ exec python3 -m speculators_dsv4.hs_http_server \
   --hidden-states-path "$HS_PATH" \
   --host "${HS_HTTP_HOST:-80.48.17.187}" \
   --port "${HS_HTTP_PORT:-8002}" \
-  --max-file-bytes "${HS_HTTP_MAX_FILE_BYTES:-536870912}"
+  --max-file-bytes "${HS_HTTP_MAX_FILE_BYTES:-536870912}" \
+  --snapshot-memory-bytes "${HS_HTTP_SNAPSHOT_MEMORY_BYTES:-8388608}" \
+  --snapshot-total-memory-bytes "${HS_HTTP_SNAPSHOT_TOTAL_MEMORY_BYTES:-268435456}"

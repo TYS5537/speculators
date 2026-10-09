@@ -225,7 +225,9 @@ target TP0 client**, and 0.25 + 0.25 GiB **per trainer worker**. They are host R
 budgets. Override `MOONCAKE_GLOBAL_SEGMENT_GIB` / `MOONCAKE_LOCAL_BUFFER_GIB`
 per host as needed; 3072 tokens x 6 slots x 4096 BF16 values is about 144 MiB
 per HS sample before token metadata. Begin with low concurrency, then measure
-`fetch_ms`, RAM/store pressure and target throughput before increasing workers.
+`fetch_ms` (enable sampled timings with `--profile-freq 100`), RAM/store pressure
+and target throughput before increasing workers. For the request/download/load
+breakdown, see [runtime profiling](runtime_optimization.md).
 Increase both timeouts and capacity only with evidence, not to hide a stopped server.
 
 Remote training requires `--on-missing generate --on-generate delete`; persistent

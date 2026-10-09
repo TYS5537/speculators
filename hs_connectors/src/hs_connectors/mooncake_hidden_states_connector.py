@@ -32,6 +32,7 @@ from vllm.v1.attention.backend import AttentionMetadata
 from vllm.v1.core.sched.output import SchedulerOutput
 
 from hs_connectors.device import accelerator_module
+from hs_connectors.mooncake_buffers import CopySynchronizationError, HostBufferPool
 from hs_connectors.mooncake_store import (
     MooncakeHiddenStatesStore,
     MooncakeStoreConfig,
@@ -187,6 +188,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
         self._copy_stream: Any | None = None
         self._device_module: Any | None = None
         self._num_writer_threads = mooncake_cfg.num_writer_threads
+        self._buffer_pool = HostBufferPool(mooncake_cfg.pinned_pool_bytes)
+        self._use_copy_events = mooncake_cfg.use_copy_events
         self._executor: ThreadPoolExecutor | None = None
         self._req_futures: dict[str, Future] = {}
         self._accumulated_finished_req_ids: set[str] = set()
@@ -281,6 +284,9 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
 
         num_tokens = pending.token_ids.shape[0]
 
+        lease = None
+        copy_complete = False
+        published = False
         try:
             with self._device().stream(copy_stream):
                 slot_mapping = slot_mapping.to(self._kv_cache.device, non_blocking=True)
@@ -290,28 +296,29 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     num_tokens,
                 )
                 assert_finite("hidden_states", hidden_states)
-                # Async DtoH copy into pinned host memory. Some accelerators do
-                # not support pinned host memory; fall back to a plain CPU copy.
-                try:
-                    pinned_hs = torch.empty_like(
-                        hidden_states, device="cpu", pin_memory=True
-                    )
-                except Exception:  # noqa: BLE001 - accelerator-specific
-                    pinned_hs = torch.empty_like(hidden_states, device="cpu")
-                pinned_hs.copy_(hidden_states, non_blocking=True)
+                lease = self._buffer_pool.acquire(hidden_states)
+                lease.tensor.copy_(hidden_states, non_blocking=True)
+                if self._use_copy_events:
+                    copy_event = self._device().Event()
+                    copy_event.record(copy_stream)
 
             # Wait for the DtoH copy to complete before handing data to the store.
-            copy_stream.synchronize()
+            if self._use_copy_events:
+                copy_event.synchronize()
+            else:
+                copy_stream.synchronize()
+            copy_complete = True
 
             self._store.put_sample(
                 pending.mooncake_key,
-                {"hidden_states": pinned_hs, "token_ids": pending.token_ids},
+                {"hidden_states": lease.tensor, "token_ids": pending.token_ids},
                 **(
                     {"metadata": self._sample_metadata}
                     if self._sample_metadata is not None
                     else {}
                 ),
             )
+            published = True
         except Exception as exc:
             try:
                 # Store error marker instead of the sample, so consumer can re-request
@@ -322,6 +329,19 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     pending.req_id,
                 )
             raise
+        finally:
+            if lease is not None:
+                if not copy_complete:
+                    try:
+                        # Even a failed enqueue/event may leave an in-flight DMA.
+                        copy_stream.synchronize()
+                    except Exception as error:
+                        self._buffer_pool.quarantine(lease)
+                        raise CopySynchronizationError(
+                            "Mooncake copy completion is unknown; retaining its "
+                            "host buffer and refusing to release request KV"
+                        ) from error
+                self._buffer_pool.release(lease, reuse=published)
 
     def get_finished(
         self, finished_req_ids: set[str]
@@ -354,6 +374,8 @@ class MooncakeHiddenStatesConnector(KVConnectorBase_V1, SupportsHMA):
                     exc = future.exception()
                     if exc is not None:
                         logger.error("Mooncake write failed for %s: %r", req_id, exc)
+                        if isinstance(exc, CopySynchronizationError):
+                            raise exc
                     self._req_futures.pop(req_id, None)
                 done_sending.add(req_id)
                 self._accumulated_finished_req_ids.discard(req_id)

@@ -8,6 +8,7 @@ import logging
 import os
 import stat
 import tempfile
+import threading
 from contextlib import contextmanager, suppress
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,6 +31,50 @@ from speculators_dsv4.hs_http import (
 logger = logging.getLogger(__name__)
 MAX_PORT = 65535
 SNAPSHOT_MEMORY_BYTES = 8 * CHUNK_BYTES
+SNAPSHOT_TOTAL_MEMORY_BYTES = 256 * CHUNK_BYTES
+
+
+class SnapshotStorage:
+    """Bound concurrent in-memory snapshot payloads; overflow uses local disk.
+
+    The budget excludes per-request I/O chunks and Python/file-system overhead.
+    Reservations remain held until the response closes its immutable snapshot.
+    """
+
+    def __init__(self, memory_bytes, total_memory_bytes, directory=None):
+        for value in (memory_bytes, total_memory_bytes):
+            if type(value) is not int or value < 0:
+                raise ValueError("Snapshot memory limits must be nonnegative integers")
+        self.memory_bytes = memory_bytes
+        self.total_memory_bytes = total_memory_bytes
+        self.directory = Path(directory).resolve(strict=True) if directory else None
+        if self.directory is not None and not self.directory.is_dir():
+            raise ValueError(
+                "Snapshot temporary directory must be an existing directory"
+            )
+        self.reserved_bytes = 0
+        self._lock = threading.Lock()
+
+    @contextmanager
+    def open(self, size):
+        reservation = 0
+        with self._lock:
+            if 0 < size <= self.memory_bytes and (
+                self.reserved_bytes + size <= self.total_memory_bytes
+            ):
+                reservation = size
+                self.reserved_bytes += size
+        try:
+            with tempfile.SpooledTemporaryFile(
+                max_size=self.memory_bytes, dir=self.directory
+            ) as snapshot:
+                if not reservation:
+                    # max_size=0 otherwise means *unlimited* BytesIO in tempfile.
+                    snapshot.rollover()
+                yield snapshot, reservation
+        finally:
+            with self._lock:
+                self.reserved_bytes -= reservation
 
 
 @contextmanager
@@ -90,19 +135,22 @@ def _file_version(info):
 
 
 @contextmanager
-def _snapshot_file(stream, path, limit):
+def _snapshot_file(stream, path, limit, storage):
     """Hash and send the same bounded snapshot, never two reads of the producer."""
     before = os.fstat(stream.fileno())
     named_before = path.lstat()
     if (before.st_dev, before.st_ino) != (named_before.st_dev, named_before.st_ino):
         raise BlockingIOError("HS artifact was replaced before snapshot")
-    with tempfile.SpooledTemporaryFile(max_size=SNAPSHOT_MEMORY_BYTES) as snapshot:
+    with storage.open(before.st_size) as (snapshot, reservation):
         digest = hashlib.sha256()
         length = 0
         while chunk := stream.read(min(CHUNK_BYTES, limit + 1 - length)):
             length += len(chunk)
             if length > limit:
                 raise ValueError("HS artifact grew beyond the file size limit")
+            if length > reservation:
+                # A growing producer must never exceed its reserved memory.
+                snapshot.rollover()
             snapshot.write(chunk)
             digest.update(chunk)
         version = _file_version(before)
@@ -135,6 +183,9 @@ class HiddenStatesServer(ThreadingHTTPServer):
         *,
         max_file_bytes=DEFAULT_MAX_FILE_BYTES,
         training=False,
+        snapshot_memory_bytes=SNAPSHOT_MEMORY_BYTES,
+        snapshot_total_memory_bytes=SNAPSHOT_TOTAL_MEMORY_BYTES,
+        snapshot_temp_dir=None,
     ):
         self.directory = Path(directory).resolve(strict=True)
         self.token = validate_token(token)
@@ -142,6 +193,9 @@ class HiddenStatesServer(ThreadingHTTPServer):
         if type(max_file_bytes) is not int or max_file_bytes <= 0:
             raise ValueError("HS HTTP file limit must be positive")
         self.max_file_bytes = max_file_bytes
+        self.snapshot_storage = SnapshotStorage(
+            snapshot_memory_bytes, snapshot_total_memory_bytes, snapshot_temp_dir
+        )
         self.manifest = self.read_manifest()
         super().__init__(address, _Handler)
 
@@ -271,7 +325,12 @@ class _Handler(BaseHTTPRequestHandler):
             # deletion. Return 409 through _dispatch and let the client retry.
             with _regular_file(path, self.server.max_file_bytes) as stream:
                 if not delete:
-                    with _snapshot_file(stream, path, self.server.max_file_bytes) as (
+                    with _snapshot_file(
+                        stream,
+                        path,
+                        self.server.max_file_bytes,
+                        self.server.snapshot_storage,
+                    ) as (
                         snapshot,
                         length,
                         digest,
@@ -303,6 +362,23 @@ def main():
     parser.add_argument("--port", type=int, default=8002)
     parser.add_argument("--max-file-bytes", type=int, default=DEFAULT_MAX_FILE_BYTES)
     parser.add_argument(
+        "--snapshot-memory-bytes",
+        type=int,
+        default=SNAPSHOT_MEMORY_BYTES,
+        help="Per-snapshot memory threshold; larger snapshots go directly to disk.",
+    )
+    parser.add_argument(
+        "--snapshot-total-memory-bytes",
+        type=int,
+        default=SNAPSHOT_TOTAL_MEMORY_BYTES,
+        help="Combined in-memory snapshot payload budget; 0 forces disk snapshots.",
+    )
+    parser.add_argument(
+        "--snapshot-temp-dir",
+        type=Path,
+        help="Existing local spill directory; defaults to Python's temp directory.",
+    )
+    parser.add_argument(
         "--training",
         action="store_true",
         help="Serve only dedicated hstrain- training requests (default: hshttp- eval).",
@@ -318,6 +394,9 @@ def main():
         token,
         max_file_bytes=args.max_file_bytes,
         training=args.training,
+        snapshot_memory_bytes=args.snapshot_memory_bytes,
+        snapshot_total_memory_bytes=args.snapshot_total_memory_bytes,
+        snapshot_temp_dir=args.snapshot_temp_dir,
     ) as server:
         logger.info(
             "HS HTTP sidecar listening on %s:%s; "

@@ -194,6 +194,14 @@ def resolve_loss_config(spec: str, implementation: str = "fused") -> LossConfig:
             f"Unknown loss implementation '{implementation}'. Choose from: "
             f"{sorted(_LOSS_FN_MAPS)}"
         ) from None
+    return _parse_loss_config(spec, loss_fn_map)
+
+
+def _parse_loss_config(
+    spec: str,
+    loss_fn_map: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tensor]],
+) -> LossConfig:
+    """Parse weights against the caller's unchanged numerical dispatch policy."""
 
     if spec in loss_fn_map:
         return {spec: (loss_fn_map[spec], 1.0)}

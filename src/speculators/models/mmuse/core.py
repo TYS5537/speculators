@@ -1607,6 +1607,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
             proposal_candidate_logits=proposal_candidate_logits,
             target_log_normalizer=target_log_normalizer,
             target_argmax_ids=target_argmax_ids,
+            confidence_diagnostics=include_diagnostics,
             tv_loss_fn=tv_loss_fn,
         )
         profile.mark("loss_metrics")

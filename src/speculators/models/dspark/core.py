@@ -256,5 +256,6 @@ class DSparkDraftModel(DFlashDraftModel):
             tv_loss_fn=tv_loss_fn,
             target_log_normalizer=target_log_normalizer,
             target_argmax_ids=target_argmax_ids,
+            confidence_diagnostics=False,
         )
         return None, loss, select_logged_metrics(metrics)

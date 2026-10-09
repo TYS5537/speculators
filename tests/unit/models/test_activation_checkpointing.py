@@ -157,6 +157,7 @@ def _assert_gradients_match(plain, checked):
 
 
 @pytest.mark.parametrize("attention_impl", ["eager", "sdpa"])
+@pytest.mark.parametrize("layer_ids", [None, [], [0], [1]])
 @pytest.mark.parametrize(
     ("features", "dropout", "freeze_projection", "autocast"),
     [
@@ -168,7 +169,14 @@ def _assert_gradients_match(plain, checked):
     ],
 )
 def test_checkpoint_matches_forward_gradients_and_optimizer_step(
-    fixed_anchors, *, features, dropout, freeze_projection, autocast, attention_impl
+    fixed_anchors,
+    *,
+    features,
+    dropout,
+    freeze_projection,
+    autocast,
+    attention_impl,
+    layer_ids,
 ):
     torch.manual_seed(17)
     plain = _make_model(
@@ -179,7 +187,7 @@ def test_checkpoint_matches_forward_gradients_and_optimizer_step(
         plain.fc.requires_grad_(False)
         plain.hidden_norm.requires_grad_(False)
     checked = copy.deepcopy(plain)
-    checked.set_activation_checkpointing(True)
+    checked.set_activation_checkpointing(True, layer_ids=layer_ids)
     inputs = _inputs()
     assert not inputs["hidden_states"].requires_grad
     assert not checked.embed_tokens.weight.requires_grad
@@ -189,9 +197,11 @@ def test_checkpoint_matches_forward_gradients_and_optimizer_step(
         torch.manual_seed(29)
         with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
             plain_outputs = plain._backbone_forward(**inputs)
+        expected_rng = torch.get_rng_state().clone()
         torch.manual_seed(29)
         with torch.autocast("cpu", dtype=torch.bfloat16, enabled=autocast):
             checked_outputs = checked._backbone_forward(**inputs)
+        assert torch.equal(torch.get_rng_state(), expected_rng)
         for actual, expected in zip(checked_outputs, plain_outputs, strict=True):
             torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
         assert checked_counts == plain_counts == [1, 1]
@@ -204,9 +214,11 @@ def test_checkpoint_matches_forward_gradients_and_optimizer_step(
         )
         plain_loss.backward()
         checked_loss.backward()
+        assert torch.equal(torch.get_rng_state(), expected_rng)
         _assert_gradients_match(plain, checked)
         assert plain_counts == [1, 1]
-        assert checked_counts == [2, 2]
+        selected = range(len(checked.layers)) if layer_ids is None else layer_ids
+        assert checked_counts == [1 + int(index in selected) for index in range(2)]
         # Anchor selection is outside the checkpointed region.
         assert fixed_anchors.call_count == 2
         if not freeze_projection:
@@ -257,8 +269,8 @@ def test_switch_is_runtime_only_and_inherited(correction):
     assert model.activation_checkpointing is False
     original_config = copy.deepcopy(model.config.to_dict())
     original_state = {name: value.clone() for name, value in model.state_dict().items()}
-    for enabled in (True, False):
-        model.set_activation_checkpointing(enabled)
+    for enabled, layer_ids in ((True, [1]), (True, []), (True, None), (False, None)):
+        model.set_activation_checkpointing(enabled, layer_ids=layer_ids)
         assert model.activation_checkpointing is enabled
         assert model.config.to_dict() == original_config
         assert model.state_dict().keys() == original_state.keys()
@@ -266,6 +278,16 @@ def test_switch_is_runtime_only_and_inherited(correction):
             torch.testing.assert_close(value, original_state[name], rtol=0, atol=0)
     assert DSparkDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
     assert MMuseDraftModel._backbone_forward is DFlashDraftModel._backbone_forward
+
+
+@pytest.mark.parametrize("layer_ids", [[-1], [2], [True], [0.0], ["0"]])
+def test_invalid_layer_selection_leaves_runtime_policy_unchanged(layer_ids):
+    model = _make_model()
+    model.set_activation_checkpointing(True, layer_ids=[0])
+    with pytest.raises(ValueError, match="Checkpoint layer IDs"):
+        model.set_activation_checkpointing(False, layer_ids=layer_ids)
+    assert model.activation_checkpointing is True
+    assert model.activation_checkpoint_layers == frozenset({0})
 
 
 @pytest.mark.parametrize("attention_impl", ["eager", "sdpa"])

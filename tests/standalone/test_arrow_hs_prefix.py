@@ -13,6 +13,8 @@ from unittest.mock import Mock
 
 import numpy as np
 
+from speculators_dsv4.hs_profile import profile_sample, profile_stage, profile_tensors
+
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -135,6 +137,9 @@ class ArrowHSPrefixTests(unittest.TestCase):
             "InvalidResponseError": type("InvalidResponseError", (Exception,), {}),
             "warnings": warnings,
             "cast": cast,
+            "profile_sample": profile_sample,
+            "profile_stage": profile_stage,
+            "profile_tensors": profile_tensors,
         }
         load_definitions(
             ROOT / "src/speculators/data_generation/offline.py",
@@ -146,6 +151,7 @@ class ArrowHSPrefixTests(unittest.TestCase):
             {
                 "BaseDataset",
                 "ArrowDataset",
+                "_ValidatedHiddenStates",
                 "build_client_item",
                 "_has_multimodal_content",
             },

@@ -24,13 +24,11 @@ from speculators_dsv4.hs_http import (
     validate_filename,
     validate_token,
 )
-from speculators_dsv4.training_contract import validate_training_contract
-
-
-def _identity(contract):
-    result = validate_training_contract(contract)
-    result.pop("model_path")
-    return result
+from speculators_dsv4.hs_profile import profile_file, profile_stage
+from speculators_dsv4.training_contract import (
+    contract_identity,
+    validate_training_contract,
+)
 
 
 def _load_tensors(path):
@@ -116,7 +114,7 @@ class HttpTrainingTransfer:
 
     @staticmethod
     def _check_contract(actual, expected):
-        if _identity(actual) != _identity(expected):
+        if contract_identity(actual) != contract_identity(expected):
             raise ValueError(
                 "DSV4 HS HTTP training contract mismatch; all target hosts must "
                 "match checkpoint, layers, dtype and runtime quantization"
@@ -203,13 +201,17 @@ class HttpTrainingTransfer:
         name, request_id, clients = self._owned(handle)
         if handle in self._completed:
             raise ValueError("Training HS handle has already been downloaded")
-        client = self._route(name, clients)
+        with profile_stage("http_route_ms"):
+            client = self._route(name, clients)
         self.directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(
             prefix="hstrain-", dir=self.directory
         ) as temporary:
-            local = client._download_with_retries(name, Path(temporary))  # noqa: SLF001 -- Shared transport implementation.
-            sample = _load_tensors(local)
+            with profile_stage("http_download_ms"):
+                local = client._download_with_retries(name, Path(temporary))  # noqa: SLF001 -- Shared transport implementation.
+            profile_file(local)
+            with profile_stage("http_load_ms"):
+                sample = _load_tensors(local)
         self._completed[handle] = (client, name, request_id)
         return sample
 

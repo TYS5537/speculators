@@ -1157,18 +1157,35 @@ class RecipeTests(unittest.TestCase):
             "--log-dir": "$LOG_DIR/tensorboard",
         }.items():
             self.assertEqual(args[args.index(name) + 1], value)
-        argument_sources = (
-            ROOT / "src/speculators/train/legacy_cli.py",
-            ROOT / "src/speculators/train/mmuse_args.py",
-        )
-        declared = {
+        legacy_source = ROOT / "src/speculators/train/legacy_cli.py"
+        legacy_tree = ast.parse(legacy_source.read_text(encoding="utf-8"))
+        field_declaration = next(
             node.value
-            for source in argument_sources
-            for node in ast.walk(ast.parse(source.read_text(encoding="utf-8")))
+            for node in legacy_tree.body
+            if isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name) and target.id == "_LEGACY_FIELDS"
+                for target in node.targets
+            )
+        )
+        self.assertIsInstance(field_declaration, ast.Call)
+        self.assertIsInstance(field_declaration.func, ast.Attribute)
+        self.assertEqual(field_declaration.func.attr, "split")
+        self.assertFalse(field_declaration.args)
+        self.assertFalse(field_declaration.keywords)
+        # Check only fields exposed by the legacy parser, not the wider schema.
+        declared = {
+            "--" + field.replace("_", "-")
+            for field in ast.literal_eval(field_declaration.func.value).split()
+        }
+        mmuse_source = ROOT / "src/speculators/train/mmuse_args.py"
+        declared.update(
+            node.value
+            for node in ast.walk(ast.parse(mmuse_source.read_text(encoding="utf-8")))
             if isinstance(node, ast.Constant)
             and isinstance(node.value, str)
             and node.value.startswith("--")
-        }
+        )
         # The HS file backend adds this flag outside the training script.
         declared.add("--hidden-states-path")
         for arg in args:

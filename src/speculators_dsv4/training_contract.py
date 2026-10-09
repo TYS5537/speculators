@@ -53,6 +53,13 @@ def validate_training_contract(value):
     return json.loads(json.dumps(value))
 
 
+def contract_identity(contract):
+    """Compare remote producers without their host-local weight directory."""
+    identity = validate_training_contract(contract)
+    identity.pop("model_path")
+    return identity
+
+
 def read_training_contract(directory, report, layers):
     """Bind to the exporter's actual quantization choice, including auto/None."""
     path = Path(directory) / MANIFEST

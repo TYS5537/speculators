@@ -2,6 +2,9 @@
 
 import torch
 
+from speculators.models.dspark.metrics import (
+    select_logged_metrics as select_dspark_metrics,
+)
 from speculators.models.metrics import resolve_loss_config
 from speculators.models.mmuse.metrics import compute_metrics, select_logged_metrics
 
@@ -56,6 +59,24 @@ class TestComputeMetrics:
             "rollout_accept_len_sum",
         }
         assert select_logged_metrics(metrics, include_diagnostics=True) is metrics
+
+    def test_shared_filter_preserves_control_values_and_model_specific_keys(self):
+        metrics = dict.fromkeys(
+            [
+                "supervision_total",
+                "loss",
+                "position_2_acc_total",
+                "position_2_acc_sum_total",
+                "correction_hidden_aux_loss_sum",
+            ],
+            torch.tensor(2.0),
+        )
+        baseline = select_dspark_metrics(metrics)
+        enhanced = select_logged_metrics(metrics)
+        assert list(baseline) == ["supervision_total", "loss", "position_2_acc_total"]
+        assert list(enhanced) == [*baseline, "correction_hidden_aux_loss_sum"]
+        assert all(value is metrics[key] for key, value in enhanced.items())
+        assert select_dspark_metrics(metrics, include_diagnostics=True) is metrics
 
     def test_perfect_draft_low_loss_high_accept(self):
         # block_size=2; with sample_from_anchor=False, position 0 is the anchor

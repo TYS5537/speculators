@@ -4,9 +4,66 @@ Verifies that backend-contributed train args survive the full
 ``resolve -> flatten`` and ``dump_yaml -> --config`` pipelines.
 """
 
+import argparse
+import dataclasses
 import textwrap
 
+import pytest
+from hs_connectors.transfer import MooncakeBackend
+
 from speculators.train.config.schema import TrainConfig
+
+
+@pytest.mark.parametrize("dsv4", [False, True])
+def test_mooncake_train_and_export_configs_preserve_role_defaults(monkeypatch, dsv4):
+    monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "fixture-host")
+    parser = argparse.ArgumentParser()
+    MooncakeBackend.add_train_args(parser)
+    args = parser.parse_args(
+        [
+            "--mooncake-namespace",
+            "fixture-run",
+            "--mooncake-protocol",
+            "rdma",
+            "--mooncake-device-name",
+            "fixture-verbs",
+            "--mooncake-global-segment-gib",
+            "0.25",
+        ]
+    )
+    args.dsv4 = dsv4
+    args.target_hidden_state_format = "deepseek_v4_mean_hc_head" if dsv4 else None
+    args.mooncake_writer_threads = 7
+    transfer = MooncakeBackend.from_train_args(args, "unused")
+    trainer = dataclasses.asdict(transfer.store.config)
+    exporter = MooncakeBackend.build_kv_transfer_config(args)[
+        "kv_connector_extra_config"
+    ]["mooncake"]
+    assert exporter == {**trainer, "num_writer_threads": 7}
+    assert trainer["num_writer_threads"] == 4
+    assert trainer["initialize_accelerator"] is not dsv4
+    assert trainer["global_segment_size"] == 256 * 1024**2
+    assert trainer["local_hostname"] == "fixture-host"
+    assert trainer["device_name"] == "fixture-verbs"
+    assert trainer["pinned_pool_bytes"] == 0
+    assert trainer["use_copy_events"] is False
+
+
+def test_mooncake_copy_optimizations_are_explicit_producer_options(monkeypatch):
+    monkeypatch.setenv("MOONCAKE_LOCAL_HOSTNAME", "fixture-host")
+    parser = argparse.ArgumentParser()
+    MooncakeBackend.add_launch_args(parser)
+    args = parser.parse_args(
+        ["--mooncake-pinned-pool-mib", "256", "--mooncake-copy-events"]
+    )
+    config = MooncakeBackend.build_kv_transfer_config(args)[
+        "kv_connector_extra_config"
+    ]["mooncake"]
+    assert config["pinned_pool_bytes"] == 256 * 1024**2
+    assert config["use_copy_events"] is True
+    args.mooncake_pinned_pool_mib = -1
+    with pytest.raises(ValueError, match="nonnegative"):
+        MooncakeBackend.build_kv_transfer_config(args)
 
 
 def test_http_training_args_survive_resolution_and_yaml_roundtrip():

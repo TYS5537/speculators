@@ -10,10 +10,9 @@ token is slot 1.
 
 from __future__ import annotations
 
-import argparse
-import json
+import argparse  # noqa: TC003 -- Keep runtime type hints and the legacy helper API.
 import logging
-import os
+import os  # noqa: F401 -- Retained for callers patching the legacy script environment.
 import sys
 import time
 from collections.abc import Callable  # noqa: TC003 -- Runtime type hints.
@@ -23,7 +22,10 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+from speculators_eval import cli as _eval_cli
 from speculators_eval import data as _eval_data
+from speculators_eval import loading as _eval_loading
+from speculators_eval import orchestration as _eval_orchestration
 from speculators_eval import parallel as _eval_parallel
 from speculators_eval import reporting as _eval_reporting
 from speculators_eval.diagnostics import capture_sample_failure
@@ -1521,23 +1523,10 @@ def run_ascend_data_parallel(args: argparse.Namespace) -> None:
     _eval_parallel.run_ascend_data_parallel(args, entrypoint=Path(__file__))
 
 
-def _resolve_draft_attn_impl(device: str, draft_attn_impl: str) -> str | None:
-    if draft_attn_impl != "auto":
-        return draft_attn_impl
-    if str(device).startswith("npu"):
-        return "sdpa"
-    return None
+_resolve_draft_attn_impl = _eval_loading.resolve_draft_attn_impl
 
 
-def _parse_bool_override(value: str | None) -> bool | None:
-    if value is None:
-        return None
-    lowered = value.lower()
-    if lowered in {"true", "1", "yes"}:
-        return True
-    if lowered in {"false", "0", "no"}:
-        return False
-    raise ValueError(f"Expected boolean value, got {value}")
+_parse_bool_override = _eval_loading.parse_bool_override
 
 
 def _validate_target_cache_support(verifier_model: str, target_backend="hf") -> dict:
@@ -1555,146 +1544,30 @@ def _validate_target_cache_support(verifier_model: str, target_backend="hf") -> 
     return target_config
 
 
-def _write_backend_metadata(args, report):
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    mode = getattr(args, "dsv4_verification_mode", "reference")
-    metadata = {
-        "target_backend": "dsv4-vllm",
-        "verification_mode": mode,
-        "verification": (
-            "checked-native-greedy-trajectory-replay"
-            if mode == "replay"
-            else "immutable-kv-snapshot-accepted-tail-replay"
-            if getattr(args, "dsv4_kv_reuse", False)
-            else "full-prefix-block-recompute"
-            if mode == "block"
-            else "full-prefix-per-position-recompute"
-        ),
-        "probability_source": (
-            "cached-native-greedy-tokens-no-off-trajectory-probabilities"
-            if mode == "replay"
-            else "target_native_full_vocabulary_head_packet"
-            if mode == "block"
-            else "target_api_full_vocabulary_logprobs"
-        ),
-        "block_output_policy": getattr(args, "dsv4_block_output", "auto"),
-        "diagnostic_profile": getattr(args, "dsv4_profile", False),
-        "target_kv_reuse": getattr(args, "dsv4_kv_reuse", False),
-        "draft_kv_reuse": getattr(args, "draft_kv_reuse", False),
-        "online_speedup_benchmark": False,
-        "target_model": report["model_path"],
-        "checkpoint_signature": report["checkpoint_signature"],
-        "hidden_states_path": str(Path(args.hidden_states_path).resolve()),
-        "hs_transport": "http" if getattr(args, "hs_http_endpoint", None) else "file",
-        "hs_http_endpoint": getattr(args, "hs_http_endpoint", None),
-        "max_model_len": args.dsv4_max_model_len,
-        "temperature": args.temperature,
-        "top_p": 1.0,
-        "top_k": "disabled",
-        "acceptance_length": "1 + accepted_draft_tokens / proposals",
-        "position_accept_rates": "accepted_prefix_count / proposed_count",
-    }
-    if mode == "replay":
-        metadata.update(
-            replay_cache=str(args.dsv4_replay_cache.resolve()),
-            replay_cache_tag=args.dsv4_replay_cache_tag,
-            replay_audit_samples_per_worker=args.dsv4_replay_audit_samples,
-            probability_diagnostics_available=False,
-            timing_scope=(
-                "cache preparation + local replay + optional live audits; "
-                "NOT serving speed"
-            ),
-            experimental=True,
-        )
-    with (args.output_dir / "eval_backend.json").open("w", encoding="utf-8") as stream:
-        json.dump(metadata, stream, indent=2)
+_write_backend_metadata = _eval_loading.write_backend_metadata
 
 
 def run(args: argparse.Namespace) -> None:
-    if getattr(args, "dsv4_verification_mode", "reference") == "replay":
-        if (
-            getattr(args, "target_backend", "hf") != "dsv4-vllm"
-            or args.temperature != 0.0
-            or getattr(args, "dsv4_kv_reuse", False)
-            or getattr(args, "dsv4_block_output", "auto") != "auto"
-            or getattr(args, "measure_base_speedup", False)
-        ):
-            raise ValueError(
-                "Replay requires dsv4-vllm, temperature=0, auto output, "
-                "no target snapshots/base-speedup"
-            )
-        if args.dsv4_replay_audit_samples < 0:
-            raise ValueError("Replay audit sample count must be nonnegative")
-    if getattr(args, "dsv4_kv_reuse", False) and (
-        getattr(args, "target_backend", "hf") != "dsv4-vllm"
-        or getattr(args, "dsv4_verification_mode", "reference") != "block"
-    ):
-        raise ValueError("--dsv4-kv-reuse requires dsv4-vllm and block verification")
+    _eval_orchestration.validate_run_options(args)
     # Close service clients on failed setup, transport errors and interrupts too.
     with ExitStack() as resources:
         _run(args, resources)
 
 
-def _prepare_hs_http(args, target_backend):
-    endpoint = getattr(args, "hs_http_endpoint", None)
-    if not endpoint:
-        return None
-    from speculators_dsv4.hs_http import (  # noqa: PLC0415
-        validate_endpoint,
-        validate_token,
-    )
-
-    if target_backend != "dsv4-vllm":
-        raise ValueError("--hs-http-endpoint requires --target-backend dsv4-vllm")
-    args.hs_http_endpoint = validate_endpoint(endpoint)
-    validate_token(os.environ.get("DSV4_HS_HTTP_TOKEN"))
-    if not args.hidden_states_path:
-        args.hidden_states_path = args.output_dir / "target-hs-downloads"
-    return args.hs_http_endpoint
+_prepare_hs_http = _eval_loading.prepare_hs_http
 
 
-@dataclass(frozen=True)
-class _TargetSetup:
-    """Validated target metadata; no loaded model or service client."""
-
-    backend: str
-    target_config: dict
-    report: dict | None
-    hs_http_endpoint: str | None
-
-
-@dataclass(frozen=True)
-class _LoadedEvaluation:
-    """References shared by runner construction and evaluation, without ownership."""
-
-    target_model: Any
-    draft_model: Any
-    tokenizer: Any
-    draft_config: Any
+_TargetSetup = _eval_loading.TargetSetup
+_LoadedEvaluation = _eval_loading.LoadedEvaluation
 
 
 def _prepare_target_backend(args: argparse.Namespace) -> _TargetSetup:
-    """Validate transport/cache contracts and publish metadata before dispatch."""
-    target_backend = getattr(args, "target_backend", "hf")
-    if getattr(args, "dsv4_profile", False) and target_backend != "dsv4-vllm":
-        raise ValueError("--dsv4-profile requires --target-backend dsv4-vllm")
-    hs_http_endpoint = _prepare_hs_http(args, target_backend)
-    target_config = _validate_target_cache_support(args.verifier_model, target_backend)
-    report = None
-    if target_backend == "dsv4-vllm":
-        from speculators_dsv4.contract import inspect_checkpoint  # noqa: PLC0415
-
-        if not args.vllm_endpoint or not args.hidden_states_path:
-            raise ValueError("DSV4 needs --vllm-endpoint and --hidden-states-path")
-        if args.measure_base_speedup:
-            raise ValueError(
-                "DSV4 recompute evaluates acceptance, not online base speedup"
-            )
-        if args.dtype != "bfloat16":
-            raise ValueError("DSV4 evaluation requires --dtype bfloat16")
-        report = inspect_checkpoint(args.verifier_model)
-        _write_backend_metadata(args, report)
-    return _TargetSetup(target_backend, target_config, report, hs_http_endpoint)
+    return _eval_orchestration.prepare_target_backend(
+        args,
+        prepare_hs_http=_prepare_hs_http,
+        validate_target_cache_support=_validate_target_cache_support,
+        write_backend_metadata=_write_backend_metadata,
+    )
 
 
 def _run(args: argparse.Namespace, resources: ExitStack) -> None:
@@ -1713,43 +1586,20 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
 def _load_evaluation_models(
     args: argparse.Namespace, setup: _TargetSetup, resources: ExitStack
 ) -> _LoadedEvaluation:
-    """Load models only in a single-device process, after parent dispatch."""
-    global torch, DynamicCache  # noqa: PLW0603 -- Existing decoding helpers use these.
-
-    import torch as torch_module  # noqa: PLC0415
-    from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
-    from transformers import DynamicCache as DynamicCacheClass  # noqa: PLC0415
-
-    from speculators.model import SpeculatorModel  # noqa: PLC0415
-
-    torch = torch_module
-    DynamicCache = DynamicCacheClass
-    torch.manual_seed(args.seed)
-    device = torch.device(args.device)
-    dtype = getattr(torch, args.dtype) if args.dtype != "auto" else "auto"
-
-    target_model = None
-    if setup.backend == "hf":
-        tokenizer = AutoTokenizer.from_pretrained(
-            args.verifier_model,
-            trust_remote_code=args.trust_remote_code,
-        )
-        target_model = (
-            AutoModelForCausalLM.from_pretrained(
-                args.verifier_model,
-                torch_dtype=dtype,
-                trust_remote_code=args.trust_remote_code,
-            )
-            .to(device)
-            .eval()
-        )
-
-    draft_model, draft_config = _load_evaluation_draft(
-        args, setup, target_model, device, model_class=SpeculatorModel
+    return _eval_loading.load_evaluation_models(
+        args,
+        setup,
+        resources,
+        set_runtime=_install_runtime,
+        load_draft=_load_evaluation_draft,
+        load_dsv4_target=_load_dsv4_target,
     )
-    if setup.backend == "dsv4-vllm":
-        target_model, tokenizer = _load_dsv4_target(args, setup, draft_model, resources)
-    return _LoadedEvaluation(target_model, draft_model, tokenizer, draft_config)
+
+
+def _install_runtime(torch_module, dynamic_cache_class) -> None:
+    global torch, DynamicCache  # noqa: PLW0603 -- Decoding helpers use these.
+    torch = torch_module
+    DynamicCache = dynamic_cache_class
 
 
 def _load_evaluation_draft(
@@ -1760,122 +1610,31 @@ def _load_evaluation_draft(
     *,
     model_class,
 ):
-    """Bind target identity and overrides before loading/casting draft weights.
-
-    The caller imports the model class before seeding, retaining the original
-    import/RNG order. Keep precision resolution after config and vocabulary checks.
-    """
-    draft_config = _load_draft_config(args.draft_model)
-    if setup.backend == "dsv4-vllm":
-        from speculators_dsv4.eval_contract import bind_draft_verifier  # noqa: PLC0415
-
-        bind_draft_verifier(draft_config, setup.report)
-    sample_from_anchor = _parse_bool_override(args.sample_from_anchor)
-    if sample_from_anchor is not None:
-        draft_config.sample_from_anchor = sample_from_anchor
-    draft_attn_impl = _resolve_draft_attn_impl(args.device, args.draft_attn_impl)
-    if draft_attn_impl is not None:
-        draft_config.transformer_layer_config._attn_implementation = draft_attn_impl
-    d2t, t2d = _load_vocab_mapping_tensors(
-        draft_model_path=args.draft_model,
-        d2t_path=args.d2t_path,
-        t2d_path=args.t2d_path,
+    return _eval_loading.load_evaluation_draft(
+        args,
+        setup,
+        target_model,
+        device,
+        model_class=model_class,
+        torch=torch,
+        load_draft_config=_load_draft_config,
+        parse_bool_override=_parse_bool_override,
+        resolve_draft_attn_impl=_resolve_draft_attn_impl,
+        load_vocab_mapping_tensors=_load_vocab_mapping_tensors,
+        ensure_loaded_vocab_mappings=_ensure_loaded_vocab_mappings,
     )
-    # Use the loaded target's dtype, including the dtype resolved by HF's "auto".
-    # Older supported Transformers versions otherwise load the draft in FP32.
-    draft_dtype = torch.bfloat16 if setup.backend == "dsv4-vllm" else target_model.dtype
-    draft_model = model_class.from_pretrained(
-        args.draft_model,
-        config=draft_config,
-        d2t=d2t,
-        t2d=t2d,
-        torch_dtype=draft_dtype,
-    )
-    # from_pretrained also refreshes borrowed verifier weights before returning.
-    draft_model = draft_model.to(device=device, dtype=draft_dtype).eval()
-    _ensure_loaded_vocab_mappings(draft_model, args)
-    return draft_model, draft_config
 
 
 def _load_dsv4_target(
     args: argparse.Namespace, setup: _TargetSetup, draft_model, resources: ExitStack
 ):
-    """Register each client immediately; the run's ExitStack owns both lifetimes."""
-    from urllib.parse import urlsplit, urlunsplit  # noqa: PLC0415
-
-    import openai  # noqa: PLC0415
-
-    from speculators_dsv4.offline import DSV4OfflineTarget  # noqa: PLC0415
-    from speculators_dsv4.tokenizer import DSV4ServerTokenizer  # noqa: PLC0415
-
-    client = openai.OpenAI(
-        base_url=args.vllm_endpoint,
-        api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-        timeout=args.target_request_timeout,
-        max_retries=0,
-    )
-    resources.callback(client.close)
-    target_class = DSV4OfflineTarget
-    target_options = {}
-    if args.dsv4_verification_mode == "replay":
-        from speculators_dsv4.replay import DSV4GreedyReplayTarget  # noqa: PLC0415
-
-        target_class = DSV4GreedyReplayTarget
-        target_options = {
-            "replay_cache": args.dsv4_replay_cache,
-            "replay_tag": args.dsv4_replay_cache_tag,
-            "audit_samples": args.dsv4_replay_audit_samples,
-        }
-    if getattr(args, "dsv4_kv_reuse", False):
-        from speculators_dsv4.cached_target import DSV4CachedTarget  # noqa: PLC0415
-
-        target_class = DSV4CachedTarget
-    target_model = target_class(
+    return _eval_loading.load_dsv4_target(
+        args,
+        setup,
         draft_model,
-        setup.report,
-        hidden_states_path=args.hidden_states_path,
-        client=client,
-        model_name=args.served_model_name,
-        max_model_len=args.dsv4_max_model_len,
-        timeout=args.target_request_timeout,
-        keep_hidden_states=args.keep_target_hs,
-        verification_mode=args.dsv4_verification_mode,
-        hs_http_endpoint=setup.hs_http_endpoint,
-        hs_http_token=os.environ.get("DSV4_HS_HTTP_TOKEN"),
-        profile=getattr(args, "dsv4_profile", False),
-        **target_options,
+        resources,
+        logger=logger,
     )
-    endpoint = urlsplit(args.vllm_endpoint)
-    root_path = endpoint.path.rstrip("/").removesuffix("/v1")
-    tokenizer_client = openai.OpenAI(
-        base_url=urlunsplit((endpoint.scheme, endpoint.netloc, root_path, "", "")),
-        api_key=os.environ.get("OPENAI_API_KEY", "EMPTY"),
-        timeout=args.target_request_timeout,
-        max_retries=0,
-    )
-    resources.callback(tokenizer_client.close)
-    tokenizer = DSV4ServerTokenizer(
-        tokenizer_client,
-        target_model.model_name,
-        target_model.generation_config.eos_token_id,
-        vocab_size=setup.target_config["vocab_size"],
-    )
-    if args.dsv4_verification_mode == "replay":
-        logger.warning(
-            "Experimental DSV4 greedy trajectory replay: acceptance counts only; "
-            "no target probability diagnostics. Timings include cache preparation "
-            "and optional live audits, NOT online speculative speed."
-        )
-    else:
-        logger.warning(
-            "DSV4 %s verification uses %s and native target "
-            "probabilities. Reported elapsed time is NOT online speculative speed.",
-            args.dsv4_verification_mode,
-            "host KV snapshots with accepted-tail replay"
-            if getattr(args, "dsv4_kv_reuse", False)
-            else "full-prefix recomputation",
-        )
-    return target_model, tokenizer
 
 
 def _log_loaded_draft(draft_model, draft_config) -> None:
@@ -1917,174 +1676,23 @@ def _log_loaded_draft(draft_model, draft_config) -> None:
 def _evaluate_loaded_models(
     args: argparse.Namespace, models: _LoadedEvaluation
 ) -> None:
-    """Construct runners and execute the unchanged dataset/reporting pipeline."""
-    target_model, draft_model, tokenizer = (
-        models.target_model,
-        models.draft_model,
-        models.tokenizer,
+    return _eval_orchestration.evaluate_loaded_models(
+        args,
+        models,
+        make_runner=DSparkOfflineRunner,
+        make_base_runner=BaseModelOfflineRunner,
+        resolve_stop_token_ids=resolve_stop_token_ids,
+        discover_datasets=_discover_datasets,
+        split_csv=_split_csv,
+        evaluate_dataset=_evaluate_dataset,
+        write_outputs=_write_outputs,
+        write_timings=write_timings,
+        logger=logger,
     )
-    runner = DSparkOfflineRunner(target_model, draft_model, tokenizer, args)
-    base_runner = (
-        BaseModelOfflineRunner(target_model, tokenizer, args)
-        if args.measure_base_speedup
-        else None
-    )
-    if base_runner is not None and float(args.temperature) > 0:
-        logger.warning(
-            "Base speedup at temperature > 0 compares sampled output throughput; "
-            "use --temperature 0 for identical greedy output paths."
-        )
-    stop_token_ids = resolve_stop_token_ids(target_model, tokenizer)
-    dataset_paths = _discover_datasets(
-        args.datasets_root,
-        _split_csv(args.datasets) or None,
-    )
-    rows: list[dict[str, Any]] = []
-    artifacts_by_dataset: dict[str, list[dict[str, Any]]] = {}
-    profiler = getattr(target_model, "profiler", None)
-    profiles = {}
-    for path in dataset_paths:
-        if profiler is not None:
-            profiler.reset()
-        row, artifacts = _evaluate_dataset(
-            path=path,
-            runner=runner,
-            base_runner=base_runner,
-            args=args,
-            stop_token_ids=stop_token_ids,
-        )
-        rows.append(row)
-        if profiler is not None and profiler.enabled:
-            profiles[row["dataset"]] = profiler.snapshot()
-            write_timings(args.output_dir, profiles)
-        if not args.skip_artifacts:
-            artifacts_by_dataset[row["dataset"]] = artifacts
-    _write_outputs(args.output_dir, rows, artifacts_by_dataset)
-    logger.info("Wrote results to %s", args.output_dir)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Offline DSpark/MMuse evaluation on JSONL data.",
-    )
-    parser.add_argument("--verifier-model", required=True)
-    parser.add_argument("--draft-model", required=True)
-    parser.add_argument("--target-backend", choices=["hf", "dsv4-vllm"], default="hf")
-    parser.add_argument("--vllm-endpoint", default=None)
-    parser.add_argument("--hidden-states-path", type=Path, default=None)
-    parser.add_argument(
-        "--hs-http-endpoint",
-        default=None,
-        help="Optional authenticated HS sidecar URL (not the vLLM /v1 URL). "
-        "Use DSV4_HS_HTTP_TOKEN; --hidden-states-path becomes "
-        "a local download directory.",
-    )
-    parser.add_argument("--served-model-name", default=None)
-    parser.add_argument("--dsv4-max-model-len", type=int, default=4096)
-    parser.add_argument(
-        "--dsv4-verification-mode",
-        choices=["reference", "block", "replay"],
-        default="reference",
-    )
-    parser.add_argument(
-        "--dsv4-replay-cache", type=Path, default=Path("dsv4_greedy_traces")
-    )
-    parser.add_argument("--dsv4-replay-cache-tag", default="")
-    parser.add_argument(
-        "--dsv4-replay-audit-samples",
-        type=int,
-        default=0,
-        help="Compare the first N samples per worker against live block decoding",
-    )
-    parser.add_argument(
-        "--dsv4-kv-reuse",
-        action="store_true",
-        help="Reuse native V4 target KV via a matching --dsv4-kv-reuse block server",
-    )
-    parser.add_argument(
-        "--dsv4-block-output",
-        choices=["auto", "full"],
-        default="auto",
-        help="Auto uses compact greedy IDs for temperature=0 only when Correction "
-        "does not need target logits. Full retains the version-1 probability path.",
-    )
-    parser.add_argument(
-        "--dsv4-profile",
-        action="store_true",
-        help="Write timing.json with synchronized diagnostic timings; block mode "
-        "also requests server timings and requires the updated server.",
-    )
-    parser.add_argument("--target-request-timeout", type=float, default=120.0)
-    parser.add_argument("--keep-target-hs", action="store_true")
-    parser.add_argument("--datasets-root", type=Path, required=True)
-    parser.add_argument("--datasets", default=None)
-    parser.add_argument("--output-dir", type=Path, default=Path("dspark_offline_eval"))
-    parser.add_argument(
-        "--max-samples",
-        type=int,
-        default=None,
-        help=(
-            "Override the DeepSpec per-dataset sample cap. When unset, known "
-            "DeepSpec datasets use the limits from DeepSpec-Ascend/eval.py."
-        ),
-    )
-    parser.add_argument("--max-new-tokens", type=int, default=512)
-    parser.add_argument("--temperature", type=float, default=0.0)
-    parser.add_argument("--seed", type=int, default=980406)
-    parser.add_argument(
-        "--enable-thinking",
-        choices=["false", "true", "default"],
-        default="false",
-    )
-    parser.add_argument(
-        "--raw-prompt-mode",
-        choices=["auto", "chat_template", "raw"],
-        default="auto",
-    )
-    parser.add_argument("--device", default="cuda")
-    parser.add_argument("--dtype", default="bfloat16")
-    parser.add_argument(
-        "--draft-kv-reuse",
-        action="store_true",
-        help="Cache confirmed draft context projections/KV across rounds (HF or "
-        "DSV4 target); opt-in, with no checkpoint changes",
-    )
-    parser.add_argument(
-        "--draft-attn-impl",
-        choices=["auto", "simple_flex_attention", "sdpa", "eager"],
-        default="auto",
-    )
-    parser.add_argument("--no-progress", action="store_true")
-    parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument(
-        "--measure-base-speedup",
-        action="store_true",
-        help=(
-            "Also run verifier-only autoregressive decoding and report measured "
-            "DSpark output-throughput speedup."
-        ),
-    )
-    parser.add_argument(
-        "--throughput-warmup-samples",
-        type=int,
-        default=1,
-        help="Warmup prompts per dataset before paired throughput timing.",
-    )
-    parser.add_argument("--skip-artifacts", action="store_true")
-    parser.add_argument("--trust-remote-code", action="store_true")
-    parser.add_argument("--d2t-path", type=Path, default=None)
-    parser.add_argument("--t2d-path", type=Path, default=None)
-    parser.add_argument(
-        "--sample-from-anchor",
-        choices=["true", "false"],
-        default=None,
-        help="Override checkpoint config. Leave unset to use checkpoint value.",
-    )
-    parser.add_argument("--ascend-devices", default=None)
-    parser.add_argument("--worker-shard-index", type=int, default=None)
-    parser.add_argument("--worker-num-shards", type=int, default=1)
-    parser.add_argument("--worker-progress-path", type=Path, help=argparse.SUPPRESS)
-    return parser.parse_args()
+    return _eval_cli.parse_args()
 
 
 def main() -> None:

@@ -27,6 +27,14 @@ configure_dsv4_hs_transport() {
       if [[ "$role" == server ]]; then
         export MOONCAKE_LOCAL_HOSTNAME="${MOONCAKE_LOCAL_HOSTNAME:-$TARGET_LOCAL_IP}"
         hs_transport_args+=(--mooncake-writer-threads "${MOONCAKE_WRITER_THREADS:-2}")
+        if [[ -n "${MOONCAKE_PINNED_POOL_MIB:-}" ]]; then
+          hs_transport_args+=(--mooncake-pinned-pool-mib "$MOONCAKE_PINNED_POOL_MIB")
+        fi
+        case "${MOONCAKE_COPY_EVENTS:-0}" in
+          0) ;;
+          1) hs_transport_args+=(--mooncake-copy-events) ;;
+          *) echo 'MOONCAKE_COPY_EVENTS must be 0 or 1.' >&2; return 2 ;;
+        esac
         MOONCAKE_GLOBAL_SEGMENT_GIB="${MOONCAKE_GLOBAL_SEGMENT_GIB:-4}"
         MOONCAKE_LOCAL_BUFFER_GIB="${MOONCAKE_LOCAL_BUFFER_GIB:-0.5}"
       else

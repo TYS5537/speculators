@@ -27,6 +27,7 @@ from speculators.models.metrics import (
     compute_accuracy_multi_step,
     dpace_loss_decay,
     position_weights,
+    select_metric_schema,
 )
 
 __all__ = [
@@ -55,22 +56,9 @@ def select_logged_metrics(
     include_diagnostics: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Keep the compact DSpark train/validation logging schema."""
-    if include_diagnostics:
-        return metrics
-
-    def should_keep(key: str) -> bool:
-        if key == "supervision_total":
-            return True  # Internal trainer control, removed by metric normalization.
-        name = key
-        if name.endswith("_sum"):
-            name = name.removesuffix("_sum")
-        elif name.endswith("_total"):
-            name = name.removesuffix("_total")
-        return name in _CORE_LOGGED_METRICS or (
-            name.startswith("position_") and name.endswith("_acc")
-        )
-
-    return {key: value for key, value in metrics.items() if should_keep(key)}
+    return select_metric_schema(
+        metrics, _CORE_LOGGED_METRICS, include_diagnostics=include_diagnostics
+    )
 
 
 def _masked_weighted_mean(
@@ -189,6 +177,7 @@ def compute_metrics(  # noqa: C901
     tv_loss_fn: Callable | None = None,
     target_log_normalizer: torch.Tensor | None = None,
     target_argmax_ids: torch.Tensor | None = None,
+    confidence_diagnostics: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """Compute the DSpark loss and a metrics dict (``*_sum``/``*_total`` pairs)."""
 
@@ -241,6 +230,7 @@ def compute_metrics(  # noqa: C901
             draft_p = softmax(proposal_candidate_logits.float(), dim=-1)
             candidate_target_p = target_p.gather(-1, proposal_candidate_ids)
             accept_rate = torch.minimum(draft_p, candidate_target_p).sum(dim=-1)
+            del candidate_target_p
             selected = proposal_candidate_logits.argmax(dim=-1, keepdim=True)
             pred_ids = proposal_candidate_ids.gather(-1, selected).squeeze(-1)
         else:
@@ -251,12 +241,14 @@ def compute_metrics(  # noqa: C901
                 else torch.minimum(draft_p, target_p).sum(dim=-1)
             )
             pred_ids = torch.argmax(logits, dim=-1)
+        del draft_p
         rollout_accept_rate = None
         if rollout_logits is not None:
             if rollout_logits.shape != logits.shape:
                 raise ValueError("rollout_logits and logits must have the same shape")
             rollout_p = softmax(rollout_logits.float(), dim=-1)
             rollout_accept_rate = torch.minimum(rollout_p, target_p).sum(dim=-1)
+            del rollout_p
         collaboration_base_accept_rate = None
         if collaboration_base_logits is not None:
             if collaboration_base_logits.shape != logits.shape:
@@ -267,6 +259,11 @@ def compute_metrics(  # noqa: C901
             collaboration_base_accept_rate = torch.minimum(
                 collaboration_base_p, target_p
             ).sum(dim=-1)
+            del collaboration_base_p
+        # Only optional base diagnostics need these full-vocabulary probabilities
+        # after this point. Do not retain them while building the loss graph.
+        if base_logits is None:
+            del target_p
 
     confidence_dpace_weights = None
     if per_position_loss_weight == "dpace":
@@ -383,25 +380,29 @@ def compute_metrics(  # noqa: C901
         conf_loss = _masked_weighted_mean(bce, loss_mask, conf_weights)
         loss = loss + confidence_head_alpha * conf_loss
 
-        conf_prob = confidence_logits.float().sigmoid()
+        if confidence_diagnostics or confidence_length_alpha > 0.0:
+            conf_prob = confidence_logits.float().sigmoid()
         with torch.no_grad():
-            mask_f = loss_mask.to(accept_rate.dtype)
-            mask_total = mask_f.sum().clamp_min(1.0)
             metrics["confidence_loss_sum"] = conf_loss.detach().clone()
             metrics["confidence_loss_total"] = torch.ones((), device=device)
-            metrics["confidence_abs_error_sum"] = (
-                (conf_prob - accept_rate).abs() * mask_f
-            ).sum()
-            metrics["confidence_abs_error_total"] = mask_total
-            metrics["confidence_pred_mean_sum"] = (conf_prob * mask_f).sum()
-            metrics["confidence_pred_mean_total"] = mask_total.clone()
-            conf_prefix = (
-                conf_prob.view(num_blocks, block_size)[:, start_pos:] * draft_mask
-            ).cumprod(dim=-1)
-            metrics["confidence_cumprod_bias_sum"] = (
-                (conf_prefix - accept_prefix) * draft_mask
-            ).sum()
-            metrics["confidence_cumprod_bias_total"] = draft_mask.sum().clamp_min(1.0)
+            if confidence_diagnostics:
+                mask_f = loss_mask.to(accept_rate.dtype)
+                mask_total = mask_f.sum().clamp_min(1.0)
+                metrics["confidence_abs_error_sum"] = (
+                    (conf_prob - accept_rate).abs() * mask_f
+                ).sum()
+                metrics["confidence_abs_error_total"] = mask_total
+                metrics["confidence_pred_mean_sum"] = (conf_prob * mask_f).sum()
+                metrics["confidence_pred_mean_total"] = mask_total.clone()
+                conf_prefix = (
+                    conf_prob.view(num_blocks, block_size)[:, start_pos:] * draft_mask
+                ).cumprod(dim=-1)
+                metrics["confidence_cumprod_bias_sum"] = (
+                    (conf_prefix - accept_prefix) * draft_mask
+                ).sum()
+                metrics["confidence_cumprod_bias_total"] = draft_mask.sum().clamp_min(
+                    1.0
+                )
 
         if confidence_length_alpha > 0.0:
             pred_len = _accept_length(
@@ -441,6 +442,7 @@ def compute_metrics(  # noqa: C901
         if base_logits is not None:
             base_p = softmax(base_logits.float(), dim=-1)
             base_accept_rate = torch.minimum(base_p, target_p).sum(dim=-1)
+            del base_p, target_p
             base_accept_blocks = base_accept_rate.view(num_blocks, block_size)
             base_prefix = (base_accept_blocks[:, start_pos:] * draft_mask).cumprod(
                 dim=-1

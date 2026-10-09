@@ -122,6 +122,39 @@ def test_trace_generation_chunking_reuse_and_identity(target):
     assert len(target.calls) == 12
 
 
+def test_native_replay_request_keeps_greedy_and_stop_options(target):
+    target.prepare_sample(torch.tensor([[1, 2]]), 6, [4])
+    call = target.calls[0]
+    request_id = call["extra_body"]["request_id"]
+    assert call == {
+        "model": "target",
+        "prompt": [1, 2],
+        "max_tokens": 6,
+        "n": 1,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "frequency_penalty": 0.0,
+        "presence_penalty": 0.0,
+        "stop": [],
+        "timeout": 120,
+        "extra_headers": {"X-Request-Id": request_id},
+        "extra_body": {
+            "request_id": request_id,
+            "top_k": 0,
+            "min_p": 0.0,
+            "repetition_penalty": 1.0,
+            "ignore_eos": True,
+            "stop_token_ids": [],
+            "skip_special_tokens": False,
+            "add_special_tokens": False,
+            "return_token_ids": True,
+            "kv_transfer_params": {GREEDY_REQUEST_KEY: {"version": 1}},
+        },
+    }
+    # The server receives the full budget; the evaluator applies its own stop IDs.
+    assert target.trace["tokens"].tolist() == [1, 2, 3, 4]
+
+
 def test_failed_native_argmax_check_never_publishes_cache(target):
     target.corrupt_block = True
     with pytest.raises(ValueError, match="disagree"):

@@ -1,6 +1,5 @@
 import argparse
 import logging
-import random
 import sys
 from pathlib import Path
 
@@ -20,6 +19,7 @@ from speculators.train.cli import (
     DSPARK_PAPER_LOSS_FN,  # noqa: F401 -- Backward-compatible script export.
     DSPARK_PAPER_NUM_LAYERS,  # noqa: F401 -- Backward-compatible script export.
     _checkpoint_freq,  # noqa: F401 -- Backward-compatible script export.
+    set_seed,  # noqa: F401 -- Backward-compatible script export.
 )
 from speculators.train.draft_config import (
     DRAFT_ARCH_CONFIGS,  # noqa: F401 -- Backward-compatible script export.
@@ -40,19 +40,6 @@ from speculators.train.model_config import (
 )
 
 logger = logging.getLogger(__name__)
-
-
-def set_seed(seed: int, deterministic: bool = False):
-    """Set random seeds for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)  # noqa: NPY002
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-    if deterministic:
-        # For deterministic behavior (may impact performance)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
 
 def _maybe_apply_mrope_full_head_hack(

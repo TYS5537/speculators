@@ -79,7 +79,9 @@ def test_local_config_preserves_historical_resolved_training_values(monkeypatch)
     # New experiment directories deliberately avoid the upstream baseline's data
     # and auto-resume checkpoints. Inactive connector options are not YAML fields.
     excluded = {"data_path", "save_path"} | {
-        key for key in expected if key.startswith("mooncake_")
+        key
+        for key in expected
+        if key.startswith(("mooncake_", "hs_http_")) or key == "hs_transfer_timeout"
     }
     assert {key: value for key, value in actual.items() if key not in excluded} == {
         key: value for key, value in expected.items() if key not in excluded

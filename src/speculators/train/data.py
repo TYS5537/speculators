@@ -30,10 +30,19 @@ from speculators.train.recovery import (
     RecoveryMetadata,
     SampleUnavailable,
 )
+from speculators_dsv4.hs_profile import profile_sample, profile_stage, profile_tensors
 
 logger = logging.getLogger("speculators")
 
 BatchType = dict[str, Any]
+
+
+class _ValidatedHiddenStates(dict):
+    """Private proof for this load only; never serialized or trusted from cache.
+
+    A dict subclass preserves the generation helpers' mapping return contract.
+    The final model batch is a separate plain dict and contains no marker keys.
+    """
 
 
 def list_files(path):
@@ -391,7 +400,26 @@ class ArrowDataset(BaseDataset):
         # Views only: leave a longer cached file and its loaded tensors intact.
         prefix = {"token_ids": tokens[:length], "hidden_states": hidden[:length]}
         check_hidden_states(prefix, input_ids.tolist())
-        return prefix
+        return _ValidatedHiddenStates(prefix)
+
+    def _validate_generated_hs(self, loaded_hs, dataset_item, index, client_item):
+        with profile_stage("validate_ms"):
+            if self.pretokenized_text_only:
+                return self._align_text_hs(
+                    loaded_hs,
+                    dataset_item["input_ids"],
+                    self._map_to_file_idx(index),
+                    allow_prefix=False,
+                )
+            # Multimodal alignment validates the entire response before slicing,
+            # including NaN/Inf outside the prefix used for this training row.
+            return _ValidatedHiddenStates(
+                align_hidden_states(
+                    loaded_hs,
+                    dataset_item["input_ids"].tolist(),
+                    allow_prefix="messages" in client_item,
+                )
+            )
 
     def _generate_hidden_states_once(
         self,
@@ -405,40 +433,34 @@ class ArrowDataset(BaseDataset):
                 self._setup_client()
             request_options = {"max_retries": self.max_retries}
             request_options.update(getattr(self.transfer, "request_kwargs", dict)())
-            handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                **request_options,
-            )
+            with profile_stage("request_ms"):
+                handle = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    **request_options,
+                )
 
-            loaded_hs = self.transfer.get_generated(handle)
+            with profile_stage("get_generated_ms"):
+                loaded_hs = self.transfer.get_generated(handle)
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
             # Covers token/shape mismatches and non-finite values. The Mooncake
             # transfer performs manifest/checksum validation first.
-            if self.pretokenized_text_only:
-                loaded_hs = self._align_text_hs(
-                    loaded_hs,
-                    dataset_item["input_ids"],
-                    self._map_to_file_idx(index),
-                    allow_prefix=False,
-                )
-            else:
-                loaded_hs = align_hidden_states(
-                    loaded_hs,
-                    dataset_item["input_ids"].tolist(),
-                    allow_prefix="messages" in client_item,
-                )
+            loaded_hs = self._validate_generated_hs(
+                loaded_hs, dataset_item, index, client_item
+            )
 
             file_idx = self._map_to_file_idx(index)
             if self.on_generate == "cache":
-                self.transfer.cache(handle, file_idx)
+                with profile_stage("cache_write_ms"):
+                    self.transfer.cache(handle, file_idx)
             else:
                 try:
-                    self.transfer.delete(handle)
+                    with profile_stage("delete_ms"):
+                        self.transfer.delete(handle)
                 except Exception as cleanup_error:
                     if getattr(self.transfer, "strict_errors", False):
                         raise
@@ -454,7 +476,8 @@ class ArrowDataset(BaseDataset):
                 self.transfer, "preserve_failed_artifacts", False
             ):
                 try:
-                    self.transfer.delete(handle)
+                    with profile_stage("delete_ms"):
+                        self.transfer.delete(handle)
                 except Exception as cleanup_error:  # noqa: BLE001
                     logger.warning(
                         "Failed to clean generated hidden-state handle %s: %s",
@@ -494,35 +517,32 @@ class ArrowDataset(BaseDataset):
         client_item = build_client_item(dataset_item, legacy_final_message=True)
 
         try:
-            handle = generate_hidden_states(
-                self.client,  # type:ignore[arg-type]
-                self.model,  # type:ignore[arg-type]
-                client_item,
-                timeout=self.request_timeout,
-                max_retries=self.max_retries,
-            )
+            with profile_stage("request_ms"):
+                handle = generate_hidden_states(
+                    self.client,  # type:ignore[arg-type]
+                    self.model,  # type:ignore[arg-type]
+                    client_item,
+                    timeout=self.request_timeout,
+                    max_retries=self.max_retries,
+                )
 
-            loaded_hs = self.transfer.get_generated(handle)
+            with profile_stage("get_generated_ms"):
+                loaded_hs = self.transfer.get_generated(handle)
             if loaded_hs is None:
                 raise ValueError(f"Failed to load hidden states for handle {handle}")
 
             file_idx = self._map_to_file_idx(index)
-            if self.pretokenized_text_only:
-                loaded_hs = self._align_text_hs(
-                    loaded_hs, dataset_item["input_ids"], file_idx, allow_prefix=False
-                )
-            else:
-                loaded_hs = align_hidden_states(
-                    loaded_hs,
-                    dataset_item["input_ids"].tolist(),
-                    allow_prefix="messages" in client_item,
-                )
+            loaded_hs = self._validate_generated_hs(
+                loaded_hs, dataset_item, index, client_item
+            )
 
             match self.on_generate:
                 case "cache":
-                    self.transfer.cache(handle, file_idx)
+                    with profile_stage("cache_write_ms"):
+                        self.transfer.cache(handle, file_idx)
                 case "delete":
-                    self.transfer.delete(handle)
+                    with profile_stage("delete_ms"):
+                        self.transfer.delete(handle)
         except Exception as e:
             if "messages" in client_item and isinstance(
                 e, (ValueError, InvalidResponseError)
@@ -542,9 +562,11 @@ class ArrowDataset(BaseDataset):
 
         return loaded_hs
 
+    @profile_sample
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
-        loaded_hs = self.transfer.get_cached(file_idx)
+        with profile_stage("cache_read_ms"):
+            loaded_hs = self.transfer.get_cached(file_idx)
         cached = loaded_hs is not None
 
         if loaded_hs is None:
@@ -569,9 +591,10 @@ class ArrowDataset(BaseDataset):
 
         dataset_item = self._get_dataset_item(index)
         if cached and self.pretokenized_text_only:
-            loaded_hs = self._align_text_hs(
-                loaded_hs, dataset_item["input_ids"], file_idx, allow_prefix=True
-            )
+            with profile_stage("validate_ms"):
+                loaded_hs = self._align_text_hs(
+                    loaded_hs, dataset_item["input_ids"], file_idx, allow_prefix=True
+                )
 
         # loaded_hs structure: {
         #   "hidden_states": [seq_len, num_layers, hidden_size]
@@ -579,11 +602,19 @@ class ArrowDataset(BaseDataset):
         # }
 
         try:
-            loaded_hs = align_hidden_states(
-                loaded_hs,
-                dataset_item["input_ids"].tolist(),
-                allow_prefix=_has_multimodal_content(dataset_item.get("messages", [])),
-            )
+            # Generated results and external cached prefixes were just checked.
+            # Never trust a marker returned by a native cache/third-party loader.
+            if (cached and not self.pretokenized_text_only) or not isinstance(
+                loaded_hs, _ValidatedHiddenStates
+            ):
+                with profile_stage("validate_ms"):
+                    loaded_hs = align_hidden_states(
+                        loaded_hs,
+                        dataset_item["input_ids"].tolist(),
+                        allow_prefix=_has_multimodal_content(
+                            dataset_item.get("messages", [])
+                        ),
+                    )
         except (KeyError, ValueError) as exc:
             raise ValueError(
                 f"Invalid hidden states for row {file_idx}: {exc}. "
@@ -591,6 +622,7 @@ class ArrowDataset(BaseDataset):
                 "to preserve invalid caches separately and retry them."
             ) from exc
 
+        profile_tensors(loaded_hs)
         return {
             "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
                 1

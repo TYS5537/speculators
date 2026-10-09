@@ -3,6 +3,7 @@
 import torch
 
 from speculators.models.dspark.metrics import compute_metrics
+from speculators.models.metrics import select_metric_schema
 
 __all__ = ["compute_metrics", "select_logged_metrics"]
 
@@ -31,19 +32,6 @@ def select_logged_metrics(
     include_diagnostics: bool = False,
 ) -> dict[str, torch.Tensor]:
     """Keep the compact MMUSE train/validation logging schema."""
-    if include_diagnostics:
-        return metrics
-
-    def should_keep(key: str) -> bool:
-        if key == "supervision_total":
-            return True  # Internal trainer control, removed by metric normalization.
-        name = key
-        if name.endswith("_sum"):
-            name = name.removesuffix("_sum")
-        elif name.endswith("_total"):
-            name = name.removesuffix("_total")
-        return name in _CORE_LOGGED_METRICS or (
-            name.startswith("position_") and name.endswith("_acc")
-        )
-
-    return {key: value for key, value in metrics.items() if should_keep(key)}
+    return select_metric_schema(
+        metrics, _CORE_LOGGED_METRICS, include_diagnostics=include_diagnostics
+    )

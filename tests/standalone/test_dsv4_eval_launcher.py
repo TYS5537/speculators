@@ -208,6 +208,13 @@ class PlanningTests(LauncherFixture):
             self.flag(plan.target_command, "--pipeline-parallel-size"), "1"
         )
         self.assertEqual(self.flag(plan.target_command, "--max-num-seqs"), "1")
+        self.assertEqual(
+            self.flag(plan.target_command, "--provenance-dir"), str(plan.output_dir)
+        )
+        self.assertLess(
+            plan.target_command.index("--provenance-dir"),
+            plan.target_command.index("--"),
+        )
         self.assertIn("--dsv4", plan.target_command)
         self.assertIn("--dsv4-block-verify", plan.target_command)
         self.assertEqual(self.flag(plan.target_command, "--max-logprobs"), "0")

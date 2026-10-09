@@ -240,6 +240,8 @@ class LaunchScriptTests(unittest.TestCase):
             MOONCAKE_NAMESPACE="fixture-run-001",
             MOONCAKE_PROTOCOL="rdma",
             MOONCAKE_DEVICE_NAME="rdma-fixture",
+            MOONCAKE_PINNED_POOL_MIB=None,
+            MOONCAKE_COPY_EVENTS=None,
             PROVENANCE_DIR="/fixture/provenance",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -252,6 +254,22 @@ class LaunchScriptTests(unittest.TestCase):
             args[args.index("--provenance-dir") + 1], "/fixture/provenance"
         )
         self.assertNotIn("--dsv4-block-verify", args)
+        self.assertNotIn("--mooncake-pinned-pool-mib", args)
+        self.assertNotIn("--mooncake-copy-events", args)
+
+    def test_mooncake_copy_optimizations_are_wired_only_when_requested(self):
+        result = self.run_script(
+            "server",
+            HS_BACKEND="mooncake",
+            DSV4_EVAL="0",
+            MOONCAKE_NAMESPACE="fixture-run-001",
+            MOONCAKE_PINNED_POOL_MIB="256",
+            MOONCAKE_COPY_EVENTS="1",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        args = self.capture.read_text().splitlines()
+        self.assertEqual(args[args.index("--mooncake-pinned-pool-mib") + 1], "256")
+        self.assertLess(args.index("--mooncake-copy-events"), args.index("--"))
 
     def test_user_trainer_defaults_keep_recipe_and_download_locally(self):
         result = self.run_script(
@@ -299,6 +317,9 @@ class LaunchScriptTests(unittest.TestCase):
                 "HS_HTTP_HOST": None,
                 "HS_HTTP_PORT": None,
                 "HS_HTTP_MAX_FILE_BYTES": None,
+                "HS_HTTP_SNAPSHOT_MEMORY_BYTES": None,
+                "HS_HTTP_SNAPSHOT_TOTAL_MEMORY_BYTES": None,
+                "HS_HTTP_SNAPSHOT_TEMP_DIR": None,
                 "DSV4_HS_HTTP_TOKEN": None,
             }
         )
@@ -323,6 +344,11 @@ class LaunchScriptTests(unittest.TestCase):
         self.assertEqual(args[args.index("--host") + 1], "80.48.17.187")
         self.assertEqual(args[args.index("--port") + 1], "8002")
         self.assertEqual(args[args.index("--max-file-bytes") + 1], "536870912")
+        self.assertEqual(args[args.index("--snapshot-memory-bytes") + 1], "8388608")
+        self.assertEqual(
+            args[args.index("--snapshot-total-memory-bytes") + 1], "268435456"
+        )
+        self.assertNotIn("--snapshot-temp-dir", args)
         self.assertFalse(any(re.fullmatch(r"[0-9a-f]{64}", arg) for arg in args))
 
     def test_server_snapshot_switch_is_opt_in_and_requires_block(self):
@@ -669,6 +695,15 @@ exec() {
                     "HS_HTTP_HOST": None if use_defaults else "10.0.0.10",
                     "HS_HTTP_PORT": None if use_defaults else "8002",
                     "HS_HTTP_MAX_FILE_BYTES": None,
+                    "HS_HTTP_SNAPSHOT_MEMORY_BYTES": None
+                    if use_defaults
+                    else "16777216",
+                    "HS_HTTP_SNAPSHOT_TOTAL_MEMORY_BYTES": None
+                    if use_defaults
+                    else "67108864",
+                    "HS_HTTP_SNAPSHOT_TEMP_DIR": None
+                    if use_defaults
+                    else "/fixture/spill",
                     "HS_HTTP_TRAINING": "0",
                     "DSV4_HS_HTTP_TOKEN": None
                     if use_defaults
@@ -696,6 +731,18 @@ exec() {
             self.assertFalse(any(re.fullmatch(r"[0-9a-f]{64}", arg) for arg in args))
             if sidecar:
                 self.assertIn("speculators_dsv4.hs_http_server", args)
+                self.assertEqual(
+                    args[args.index("--snapshot-memory-bytes") + 1],
+                    "8388608" if use_defaults else "16777216",
+                )
+                self.assertEqual(
+                    args[args.index("--snapshot-total-memory-bytes") + 1],
+                    "268435456" if use_defaults else "67108864",
+                )
+                if not use_defaults:
+                    self.assertEqual(
+                        args[args.index("--snapshot-temp-dir") + 1], "/fixture/spill"
+                    )
                 self.assertEqual(
                     args[args.index("--host") + 1],
                     "80.48.17.187" if use_defaults else "10.0.0.10",

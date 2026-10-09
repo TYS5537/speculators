@@ -20,7 +20,7 @@ from urllib.request import ProxyHandler, Request, build_opener
 from speculators_dsv4 import HS_FORMAT, hs_http_server
 from speculators_dsv4.contract import MANIFEST
 from speculators_dsv4.hs_http import HttpHiddenStates, validate_endpoint, validate_token
-from speculators_dsv4.hs_http_server import HiddenStatesServer
+from speculators_dsv4.hs_http_server import HiddenStatesServer, SnapshotStorage
 
 TOKEN = "test-only-token-0123456789abcdef0123456789"
 
@@ -208,7 +208,7 @@ class HttpTransportTests(unittest.TestCase):
             closed.set()
 
         with (
-            patch.object(hs_http_server, "SNAPSHOT_MEMORY_BYTES", 8),
+            patch.object(self.server, "snapshot_storage", SnapshotStorage(8, 16)),
             patch.object(
                 hs_http_server.tempfile, "SpooledTemporaryFile", create_snapshot
             ),
@@ -220,6 +220,7 @@ class HttpTransportTests(unittest.TestCase):
         # The client can finish reading just before the server closes its snapshot.
         self.assertTrue(closed.wait(timeout=2))
         self.assertTrue(snapshots[0].closed)
+        self.assertEqual(self.server.snapshot_storage.reserved_bytes, 0)
 
     def test_send_failure_does_not_append_an_http_error_to_binary_body(self):
         _, path = self.artifact()
@@ -648,6 +649,78 @@ class HttpTransportTests(unittest.TestCase):
         self.assertEqual(len(set(directories)), 8)
         self.assertTrue(all(not path.exists() for _, path in pairs))
         self.assertEqual(list(self.local.iterdir()), [])
+
+
+class SnapshotStorageTests(unittest.TestCase):
+    def test_budget_is_shared_by_concurrent_requests_and_released(self):
+        from concurrent.futures import ThreadPoolExecutor  # noqa: PLC0415
+
+        storage = SnapshotStorage(16, 32)
+        barrier = threading.Barrier(4)
+
+        def snapshot(_):
+            with storage.open(16) as (stream, reserved):
+                stream.write(b"x" * 16)
+                barrier.wait(timeout=5)
+                self.assertLessEqual(storage.reserved_bytes, 32)
+                self.assertEqual(stream._rolled, reserved == 0)
+                barrier.wait(timeout=5)
+                return reserved
+
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            reservations = list(workers.map(snapshot, range(4)))
+        self.assertEqual(sorted(reservations), [0, 0, 16, 16])
+        self.assertEqual(storage.reserved_bytes, 0)
+
+    def test_large_and_zero_budget_snapshots_start_on_disk(self):
+        for storage, size in (
+            (SnapshotStorage(8, 64), 9),
+            (SnapshotStorage(8, 0), 1),
+            (SnapshotStorage(0, 64), 1),
+        ):
+            with self.subTest(size=size, threshold=storage.memory_bytes):
+                with storage.open(size) as (stream, reservation):
+                    self.assertTrue(stream._rolled)
+                    self.assertEqual(reservation, 0)
+
+    def test_temporary_directory_and_exception_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            storage = SnapshotStorage(8, 16, directory)
+            original = tempfile.SpooledTemporaryFile
+            with patch.object(
+                hs_http_server.tempfile, "SpooledTemporaryFile", wraps=original
+            ) as create:
+                with self.assertRaisesRegex(RuntimeError, "send failed"):
+                    with storage.open(4) as (stream, reservation):
+                        self.assertEqual(reservation, 4)
+                        raise RuntimeError("send failed")
+            self.assertTrue(stream.closed)
+            self.assertEqual(create.call_args.kwargs["dir"], Path(directory).resolve())
+            self.assertEqual(storage.reserved_bytes, 0)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_failed_snapshot_creation_releases_reservation(self):
+        storage = SnapshotStorage(8, 16)
+        with patch.object(
+            hs_http_server.tempfile, "SpooledTemporaryFile", side_effect=OSError("full")
+        ):
+            with self.assertRaises(OSError):
+                with storage.open(4):
+                    self.fail("snapshot creation must fail")
+        self.assertEqual(storage.reserved_bytes, 0)
+
+    def test_invalid_limits_and_non_directory_are_rejected(self):
+        for threshold, total in ((-1, 8), (8, -1), (True, 8), (8, 1.5)):
+            with (
+                self.subTest(threshold=threshold, total=total),
+                self.assertRaises(ValueError),
+            ):
+                SnapshotStorage(threshold, total)
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "file"
+            path.write_text("not a directory")
+            with self.assertRaises(ValueError):
+                SnapshotStorage(8, 16, path)
 
 
 if __name__ == "__main__":

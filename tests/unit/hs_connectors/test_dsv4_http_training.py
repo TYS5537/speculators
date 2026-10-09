@@ -3,15 +3,22 @@
 import json
 import threading
 
+import pytest
 import torch
 from safetensors.torch import save_file
 
+from speculators_dsv4 import hs_profile
 from speculators_dsv4.contract import DEFAULT_LAYERS, MANIFEST, make_manifest
 from speculators_dsv4.hs_http_server import HiddenStatesServer
 from speculators_dsv4.hs_training_http import HttpTrainingTransfer
 
 
-def test_http_training_preserves_bf16_payload_and_token_ids(tmp_path):
+@pytest.mark.parametrize("profile_every", [0, 1])
+def test_http_training_preserves_bf16_payload_and_token_ids(
+    tmp_path, monkeypatch, capsys, profile_every
+):
+    monkeypatch.setenv("SPECULATORS_HS_PROFILE_EVERY", str(profile_every))
+    monkeypatch.setattr(hs_profile, "_STATE", None)
     remote = tmp_path / "target-local"
     remote.mkdir()
     contract = {
@@ -42,13 +49,36 @@ def test_http_training_preserves_bf16_payload_and_token_ids(tmp_path):
                 "token_ids": torch.arange(7, dtype=torch.int64),
             }
             save_file(original, path)
-            loaded = transfer.get_generated(str(path))
+            file_bytes = path.stat().st_size
+
+            @hs_profile.profile_sample
+            def download():
+                with hs_profile.profile_stage("get_generated_ms"):
+                    return transfer.get_generated(str(path))
+
+            loaded = download()
             for name, value in original.items():
                 assert loaded[name].dtype == value.dtype
                 assert torch.equal(loaded[name], value)
             transfer.delete(str(path))
             assert not path.exists()
             assert list((tmp_path / "trainer-local").iterdir()) == []
+            records = [
+                json.loads(line)
+                for line in capsys.readouterr().err.splitlines()
+                if line.startswith('{"event":"hs_profile"')
+            ]
+            assert len(records) == profile_every
+            if profile_every:
+                stats = records[0]["stats"]
+                assert {
+                    "http_route_ms",
+                    "http_download_ms",
+                    "http_load_ms",
+                } <= stats.keys()
+                assert stats["http_file_bytes"]["latest"] == file_bytes
+                assert token not in json.dumps(records)
+                assert str(path) not in json.dumps(records)
         finally:
             server.shutdown()
             thread.join(timeout=2)

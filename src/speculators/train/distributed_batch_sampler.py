@@ -27,6 +27,8 @@ Adapted from https://github.com/imoneoi/multipack_sampler.
 # Standard
 import warnings
 from heapq import heapreplace
+from itertools import islice
+from operator import index as integer_index
 from typing import NamedTuple
 
 import numpy as np
@@ -191,6 +193,7 @@ class MultipackDistributedBatchSamplerV2(Sampler):
         self.rank = rank
         self.seed = seed
         self.epoch = 0
+        self._start_batch = 0
         self.batch_max_length = batch_max_length
         self.max_batches = max_batches
         self.lengths = np.array(lengths)
@@ -219,14 +222,36 @@ class MultipackDistributedBatchSamplerV2(Sampler):
 
     def __iter__(self):
         batches = self._generate_batches(self.epoch)
-        return iter(batches)
+        return islice(batches, self._start_batch, None)
 
     def __len__(self):
         batches = self._generate_batches(self.epoch)
-        return len(batches)
+        return len(batches) - self._start_batch
 
     def set_epoch(self, epoch: int):
         self.epoch = epoch
+        self._start_batch = 0
+
+    def set_start_batch(self, epoch: int, index: int) -> None:
+        """Resume from an absolute batch index in an epoch's full schedule.
+
+        Iteration and ``len`` expose only the remaining batches, while the full
+        cached schedule stays intact. ``set_epoch`` always clears the offset,
+        including when called with the current epoch. An index equal to the
+        full length is allowed and exposes an empty iterator.
+        """
+        if isinstance(index, bool):
+            raise TypeError("start batch index must be an integer, not bool")
+        index = integer_index(index)
+        if index < 0:
+            raise ValueError("start batch index must be nonnegative")
+        batches = self._generate_batches(epoch)
+        if index > len(batches):
+            raise ValueError(
+                f"start batch index {index} exceeds epoch length {len(batches)}"
+            )
+        self.epoch = epoch
+        self._start_batch = index
 
     def _generate_batches(self, epoch: int) -> list[NDArray]:
         """Generate batches for this rank

@@ -1,4 +1,3 @@
-import json
 import math
 from collections.abc import Callable
 from functools import cache
@@ -16,6 +15,7 @@ from speculators.losses.eager import (
     tv_loss,
 )
 from speculators.losses.utils import (
+    _parse_loss_config,
     dflash_loss_decay,
     dpace_loss_decay,  # noqa: F401 -- Preserve the legacy public import path.
     exp_loss_decay,  # noqa: F401 -- Preserve the legacy public import path.
@@ -307,39 +307,30 @@ def resolve_loss_config(spec: str) -> LossConfig:
     Accepts either a plain loss name (``"kl_div"``) or a JSON dict mapping
     loss names to weights (``'{"ce": 0.1, "tv": 0.9}'``).
     """
-    if spec in _LOSS_FN_MAP:
-        return {spec: (_LOSS_FN_MAP[spec], 1.0)}
+    return _parse_loss_config(spec, _LOSS_FN_MAP)
 
-    try:
-        parsed = json.loads(spec)
-    except json.JSONDecodeError:
-        raise ValueError(
-            f"Unknown loss function '{spec}'. Pass a known name "
-            f"({sorted(_LOSS_FN_MAP.keys())}) or a JSON dict, "
-            f'e.g. \'{{"ce": 0.1, "tv": 0.9}}\'.'
-        ) from None
 
-    if not isinstance(parsed, dict) or not parsed:
-        raise ValueError(
-            "Loss config must be a non-empty JSON dict mapping loss names to weights, "
-            f'e.g. \'{{"ce": 0.1, "tv": 0.9}}\'. Got: {spec}'
-        )
+def select_metric_schema(
+    metrics: dict[str, torch.Tensor],
+    names: frozenset[str],
+    *,
+    include_diagnostics: bool = False,
+) -> dict[str, torch.Tensor]:
+    """Select a model's compact logging schema without changing metric values."""
+    if include_diagnostics:
+        return metrics
 
-    config: LossConfig = {}
-    for name, weight in parsed.items():
-        if name not in _LOSS_FN_MAP:
-            raise ValueError(
-                f"Unknown loss function '{name}' in loss config. "
-                f"Choose from: {sorted(_LOSS_FN_MAP.keys())}"
-            )
-        if not isinstance(weight, (int, float)):
-            raise ValueError(
-                f"Loss weight for '{name}' must be a number, "
-                f"got {type(weight).__name__}"
-            )
-        config[name] = (_LOSS_FN_MAP[name], float(weight))
+    def should_keep(key: str) -> bool:
+        if key == "supervision_total":
+            return True  # Internal trainer control, removed by metric normalization.
+        name = key
+        if name.endswith("_sum"):
+            name = name.removesuffix("_sum")
+        elif name.endswith("_total"):
+            name = name.removesuffix("_total")
+        return name in names or (name.startswith("position_") and name.endswith("_acc"))
 
-    return config
+    return {key: value for key, value in metrics.items() if should_keep(key)}
 
 
 def compound_loss(

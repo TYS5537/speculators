@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import dataclasses
 import fcntl
 import os
@@ -19,7 +20,6 @@ from hs_connectors.fp8_utils import SCALES_KEY, dequantize_fp8_tensor
 from hs_connectors.mooncake_store import MooncakeHiddenStatesStore, MooncakeStoreConfig
 
 if TYPE_CHECKING:
-    import argparse
     from collections.abc import Callable
 
 
@@ -503,33 +503,49 @@ class MooncakeBackend(HiddenStatesBackend):
             default=4,
             help="Number of asynchronous Mooncake writer threads in the vLLM client.",
         )
+        _add_argument_if_absent(
+            parser,
+            "--mooncake-pinned-pool-mib",
+            type=int,
+            default=0,
+            help="Producer host-buffer reuse budget in MiB; 0 disables reuse.",
+        )
+        _add_argument_if_absent(
+            parser,
+            "--mooncake-copy-events",
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help="Wait on each producer copy event instead of its stream.",
+        )
+
+    @staticmethod
+    def _store_config(args, *, initialize_accelerator, **kwargs):
+        return MooncakeStoreConfig(
+            local_hostname=os.environ.get("MOONCAKE_LOCAL_HOSTNAME")
+            or socket.gethostbyname(socket.gethostname()),
+            metadata_server=args.mooncake_metadata_server,
+            master_server_address=args.mooncake_master,
+            global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
+            local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
+            protocol=args.mooncake_protocol,
+            device_name=getattr(args, "mooncake_device_name", ""),
+            initialize_accelerator=initialize_accelerator,
+            **kwargs,
+        )
 
     @staticmethod
     def from_train_args(
         args: argparse.Namespace,
         data_path: str,  # noqa: ARG004
     ) -> MooncakeTransfer:
-        local_hostname = os.environ.get(
-            "MOONCAKE_LOCAL_HOSTNAME"
-        ) or socket.gethostbyname(socket.gethostname())
-
-        store = MooncakeHiddenStatesStore(
-            MooncakeStoreConfig(
-                local_hostname=local_hostname,
-                metadata_server=args.mooncake_metadata_server,
-                master_server_address=args.mooncake_master,
-                global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
-                local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
-                protocol=args.mooncake_protocol,
-                device_name=getattr(args, "mooncake_device_name", ""),
-                initialize_accelerator=getattr(args, "target_hidden_state_format", None)
-                != "deepseek_v4_mean_hc_head",
-            )
-        )
-        if (
+        dsv4 = (
             getattr(args, "target_hidden_state_format", None)
             == "deepseek_v4_mean_hc_head"
-        ):
+        )
+        store = MooncakeHiddenStatesStore(
+            MooncakeBackend._store_config(args, initialize_accelerator=not dsv4)
+        )
+        if dsv4:
             from speculators_dsv4.mooncake_training import (  # noqa: PLC0415
                 Dsv4MooncakeTransfer,
             )
@@ -545,20 +561,12 @@ class MooncakeBackend(HiddenStatesBackend):
 
     @staticmethod
     def build_kv_transfer_config(args: argparse.Namespace) -> dict[str, Any]:
-        local_hostname = os.environ.get(
-            "MOONCAKE_LOCAL_HOSTNAME"
-        ) or socket.gethostbyname(socket.gethostname())
-
-        mooncake_cfg = MooncakeStoreConfig(
-            local_hostname=local_hostname,
-            metadata_server=args.mooncake_metadata_server,
-            master_server_address=args.mooncake_master,
-            global_segment_size=round(args.mooncake_global_segment_gib * 1024**3),
-            local_buffer_size=round(args.mooncake_local_buffer_gib * 1024**3),
-            protocol=args.mooncake_protocol,
-            device_name=getattr(args, "mooncake_device_name", ""),
+        mooncake_cfg = MooncakeBackend._store_config(
+            args,
             initialize_accelerator=not getattr(args, "dsv4", False),
             num_writer_threads=args.mooncake_writer_threads,
+            pinned_pool_bytes=getattr(args, "mooncake_pinned_pool_mib", 0) * 1024**2,
+            use_copy_events=getattr(args, "mooncake_copy_events", False),
         )
 
         return {

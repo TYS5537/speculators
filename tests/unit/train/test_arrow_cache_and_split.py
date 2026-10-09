@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from speculators_dsv4.hs_profile import profile_sample, profile_stage, profile_tensors
+
 ROOT = Path(__file__).parents[3]
 
 
@@ -54,7 +56,13 @@ def data_api():
         node
         for node in source.body
         if isinstance(node, (ast.ClassDef, ast.FunctionDef))
-        and node.name in ("BaseDataset", "ArrowDataset", "_has_multimodal_content")
+        and node.name
+        in (
+            "BaseDataset",
+            "ArrowDataset",
+            "_has_multimodal_content",
+            "_ValidatedHiddenStates",
+        )
     ]
     namespace = {
         "torch": torch,
@@ -66,6 +74,9 @@ def data_api():
         "load_from_disk": lambda *_args: dataset,
         "check_hidden_states": offline.check_hidden_states,
         "align_hidden_states": offline.align_hidden_states,
+        "profile_sample": profile_sample,
+        "profile_stage": profile_stage,
+        "profile_tensors": profile_tensors,
     }
     module = ast.parse("from __future__ import annotations")
     module.body.extend(classes)

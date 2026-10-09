@@ -1,5 +1,4 @@
 import datetime
-import importlib.metadata
 import logging
 import os
 import shlex
@@ -8,7 +7,13 @@ import warnings
 from pathlib import Path
 
 from speculators.data_generation.preprocessing import get_tokenizer, load_processor
-from speculators.provenance import atomic_write, find_repo_root, git_diff, git_sha
+from speculators.provenance import (
+    atomic_write,
+    find_repo_root,
+    git_diff,
+    git_sha,
+    package_versions,
+)
 
 logger = logging.getLogger("speculators")
 
@@ -120,13 +125,7 @@ def save_train_command(save_path: str, argv: list[str] | None = None) -> None:
     repo_root = find_repo_root(Path(__file__))
     sha = git_sha(repo_root)
 
-    pkg_versions: list[str] = []
-    for pkg in ("speculators", "vllm", "transformers", "torch", "compressed-tensors"):
-        try:
-            ver = importlib.metadata.version(pkg)
-        except importlib.metadata.PackageNotFoundError:
-            ver = "not installed"
-        pkg_versions.append(f"# {pkg}: {ver}")
+    pkg_versions = package_versions()
 
     header = "\n".join(
         [

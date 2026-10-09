@@ -388,6 +388,8 @@ def run_benchmark(bench_args, train_args) -> dict:
         scheduler_type="none",
         hidden_states_dtype=hidden_states_dtype,
         log_freq=1,
+        # Benchmarks consume one synchronized profile per warmup/measured step.
+        profile_freq=1,
         fsdp_shard=train_args.fsdp_shard,
         max_steps=total_steps,
     )

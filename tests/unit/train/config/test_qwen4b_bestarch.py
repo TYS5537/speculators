@@ -77,7 +77,11 @@ def test_legacy_bestarch_matches_historical_settings_except_full_attention():
         "muon_parameter_policy",
         "muon_lr",
         "full_attention_indices",
-    } | {key for key in expected if key.startswith("mooncake_")}
+    } | {
+        key
+        for key in expected
+        if key.startswith(("mooncake_", "hs_http_")) or key == "hs_transfer_timeout"
+    }
     assert {key: value for key, value in actual.items() if key not in excluded} == {
         key: value for key, value in expected.items() if key not in excluded
     }

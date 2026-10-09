@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import ast
+import inspect
 import json
 import logging
 import sys
@@ -22,9 +24,28 @@ from benchmark import (  # type: ignore[import-not-found]
     compute_aggregate_throughput,
     compute_statistics,
     create_synthetic_batch,
+    run_benchmark,
     select_measured_profiles,
     shutdown_dataloader_workers,
 )
+
+
+def test_benchmark_explicitly_profiles_every_measured_step():
+    tree = ast.parse(inspect.getsource(run_benchmark))
+    config_call = next(
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "TrainerConfig"
+    )
+    profile_frequency = next(
+        keyword.value
+        for keyword in config_call.keywords
+        if keyword.arg == "profile_freq"
+    )
+    assert ast.literal_eval(profile_frequency) == 1
+
 
 # ---------------------------------------------------------------------------
 # compute_statistics

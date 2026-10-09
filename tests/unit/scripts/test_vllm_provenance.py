@@ -165,7 +165,9 @@ class TestSaveVllmProvenance:
         assert prov_dir.is_dir()
 
     def test_bad_dir_warns_and_returns(self, tmp_path: Path, capsys):
-        _save_vllm_provenance(["cmd"], "/dev/null/impossible", "org/model")
+        parent = tmp_path / "regular-file"
+        parent.write_text("not a directory")
+        _save_vllm_provenance(["cmd"], str(parent / "impossible"), "org/model")
         captured = capsys.readouterr()
         assert "Warning:" in captured.err
 

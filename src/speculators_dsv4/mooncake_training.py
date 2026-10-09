@@ -9,7 +9,10 @@ import os
 import re
 from uuid import uuid4
 
-from speculators_dsv4.training_contract import validate_training_contract
+from speculators_dsv4.training_contract import (
+    contract_identity,
+    validate_training_contract,
+)
 
 
 def validate_namespace(value):
@@ -22,12 +25,6 @@ def validate_namespace(value):
             "(8-64 safe characters) on every host"
         )
     return value
-
-
-def contract_identity(contract):
-    identity = validate_training_contract(contract)
-    identity.pop("model_path")
-    return identity
 
 
 def contract_key(namespace, rank):

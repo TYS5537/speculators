@@ -6,10 +6,9 @@ Precedence is ``flag > yaml > default`` via pydantic-settings source ordering;
 
 import argparse
 import sys
-import types
 import warnings
 from pathlib import Path
-from typing import Any, Literal, Union, get_args, get_origin
+from typing import Any
 
 import yaml
 from pydantic import ValidationError
@@ -19,6 +18,10 @@ from hs_connectors import HiddenStatesBackend
 from speculators.models.mmuse.config import (
     MMUSE_OPTION_FIELDS,
     validate_mmuse_options,
+)
+from speculators.train.config.cli_fields import (
+    _annotation_spec,  # noqa: F401
+    field_argument_kwargs,
 )
 from speculators.train.config.schema import (
     _GROUPS,
@@ -175,78 +178,20 @@ def _backfill_backend_defaults(selected_backend: str, merged: dict[str, Any]) ->
             merged[action.dest] = action.default
 
 
-def _annotation_spec(annotation: Any) -> tuple[Any, bool, list[Any] | None]:
-    """Reduce a field annotation to ``(base_type, is_list, choices)``.
-
-    Strips an optional ``| None``; maps ``list[T]`` to a ``nargs`` list and
-    ``Literal[...]`` to ``choices``. ``base_type`` is the argparse ``type=``
-    callable; for a ``Literal`` it is the element type so parsed values and
-    ``choices`` compare like-for-like. A genuine multi-type union (e.g.
-    ``int | str``) is rejected rather than silently truncated.
-    """
-    origin = get_origin(annotation)
-    if origin in (Union, types.UnionType):
-        non_none = [arg for arg in get_args(annotation) if arg is not type(None)]
-        if len(non_none) != 1:
-            raise TypeError(
-                f"CLI generation supports only single-type optionals; got "
-                f"{annotation!r} with {len(non_none)} non-None arms."
-            )
-        annotation = non_none[0]
-        origin = get_origin(annotation)
-    if origin is list:
-        (inner,) = get_args(annotation)
-        return inner, True, None
-    if origin is Literal:
-        choices = list(get_args(annotation))
-        elem_types = {type(choice) for choice in choices}
-        base = elem_types.pop() if len(elem_types) == 1 else str
-        return base, False, choices
-    return annotation, False, None
-
-
 def _add_field_argument(
     parser: argparse._ArgumentGroup, name: str, field: FieldInfo
 ) -> None:
-    """Add one argparse flag derived from a pydantic field.
-
-    Defaults are ``SUPPRESS``ed so the parsed namespace holds only the flags the
-    user actually passed -- that set is the ``flag`` layer of the precedence walk.
-    """
-    base, is_list, choices = _annotation_spec(field.annotation)
-    flag = _dest_to_flag(name)
-    kwargs: dict[str, Any] = {"dest": name, "default": argparse.SUPPRESS}
-    if field.description:
-        kwargs["help"] = field.description
+    """Add a schema flag, suppressing defaults for the CLI precedence layer."""
+    kwargs = field_argument_kwargs(field)
     extra = field.json_schema_extra if isinstance(field.json_schema_extra, dict) else {}
-
-    # A str field may draw its choices from a dynamic registry named indirectly by a
-    # _CLI_CHOICES marker, so the choice set is resolved here (where the registry is
-    # known) with no field-name literal.
     choices_key = extra.get("cli_choices")
     if isinstance(choices_key, str):
         choices = list(_CLI_CHOICE_REGISTRIES[choices_key])
-
-    if base is bool and not is_list:
-        # True/None-default bools, or those explicitly tagged, render as
-        # --x/--no-x; a plain False-default bool is a simple store_true flag.
-        # store_true can only set true, so it can't flip a YAML-set true back to
-        # false -- a bool needing CLI false-override must be tagged _CLI_BOOL_OPTIONAL.
-        optional = (
-            extra.get("cli_bool") == "optional"
-            or field.default is None
-            or field.default is True
-        )
-        action = argparse.BooleanOptionalAction if optional else "store_true"
-        parser.add_argument(flag, action=action, **kwargs)
-        return
-
-    if is_list:
-        kwargs["nargs"] = "+"
-    kwargs["type"] = base
-    if choices:
-        kwargs["choices"] = choices
-    parser.add_argument(flag, **kwargs)
+        if choices:
+            kwargs["choices"] = choices
+        else:
+            kwargs.pop("choices", None)
+    parser.add_argument(_dest_to_flag(name), dest=name, **kwargs)
 
 
 def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:

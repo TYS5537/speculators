@@ -88,6 +88,14 @@ class MooncakeStoreConfig:
     device_name: str = ""
     num_writer_threads: int = 4
     initialize_accelerator: bool = True
+    pinned_pool_bytes: int = 0
+    use_copy_events: bool = False
+
+    def __post_init__(self):
+        if type(self.pinned_pool_bytes) is not int or self.pinned_pool_bytes < 0:
+            raise ValueError("Pinned pool bytes must be a nonnegative integer")
+        if type(self.use_copy_events) is not bool:
+            raise ValueError("use_copy_events must be a boolean")
 
     @classmethod
     def from_dict(cls, d: dict | None) -> MooncakeStoreConfig:

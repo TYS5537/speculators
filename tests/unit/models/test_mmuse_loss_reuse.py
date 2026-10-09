@@ -45,6 +45,36 @@ def test_numerically_distinct_legacy_policies_are_not_replaced():
         )
 
 
+@pytest.mark.parametrize(
+    ("resolve", "ce", "tv"),
+    [
+        (metrics.resolve_loss_config, eager.ce_loss, metrics.tv_loss_fused_or_eager),
+        (utils.resolve_loss_config, utils.ce_loss, utils.tv_loss),
+        (
+            partial(utils.resolve_loss_config, implementation="eager"),
+            eager.ce_loss,
+            eager.tv_loss,
+        ),
+    ],
+)
+def test_shared_parser_preserves_recipe_functions_weights_and_order(resolve, ce, tv):
+    config = resolve('{"tv": 0.9, "ce": 0.1}')
+    assert list(config.items()) == [("tv", (tv, 0.9)), ("ce", (ce, 0.1))]
+    assert resolve("tv") == {"tv": (tv, 1.0)}
+
+
+@pytest.mark.parametrize(
+    "spec", ["unknown", "{", "{}", "[]", '{"bad": 1}', '{"tv": "1"}']
+)
+def test_shared_parser_preserves_validation_errors_across_recipes(spec):
+    with pytest.raises(ValueError) as legacy:
+        metrics.resolve_loss_config(spec)
+    for implementation in ("eager", "fused"):
+        with pytest.raises(ValueError) as upstream:
+            utils.resolve_loss_config(spec, implementation)
+        assert str(upstream.value) == str(legacy.value)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize(
     "spec", ["kl_div", "rkl", "ce", "tv", "lk_hybrid", "jsd", "nla"]

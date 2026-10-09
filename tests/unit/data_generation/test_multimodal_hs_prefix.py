@@ -20,6 +20,9 @@ from jinja2 import Template
 from packaging.version import Version
 from safetensors.torch import load_file, save_file
 
+from speculators.data_generation import preprocessing_helpers
+from speculators_dsv4.hs_profile import profile_sample, profile_stage, profile_tensors
+
 ROOT = Path(__file__).parents[3]
 
 
@@ -80,12 +83,16 @@ def api(monkeypatch):
         "align_hidden_states": offline.align_hidden_states,
         "InvalidResponseError": client.InvalidResponseError,
         "generate_hidden_states": client.generate_hidden_states,
+        "profile_sample": profile_sample,
+        "profile_stage": profile_stage,
+        "profile_tensors": profile_tensors,
     }
     _definitions(
         "src/speculators/train/data.py",
         {
             "BaseDataset",
             "ArrowDataset",
+            "_ValidatedHiddenStates",
             "_has_multimodal_content",
             "build_client_item",
         },
@@ -102,6 +109,19 @@ def api(monkeypatch):
         ("tqdm", SimpleNamespace(tqdm=object)),
     ):
         monkeypatch.setitem(sys.modules, name, module)
+    runner = _module(
+        "prefix_runner", "src/speculators/data_generation/offline_runner.py"
+    )
+    monkeypatch.setitem(
+        sys.modules, "speculators.data_generation.offline_runner", runner
+    )
+    if "speculators.data_generation" in sys.modules:
+        monkeypatch.setattr(
+            sys.modules["speculators.data_generation"],
+            "offline_runner",
+            runner,
+            raising=False,
+        )
     script = _module("prefix_cli", "scripts/data_generation_offline.py")
     return SimpleNamespace(
         offline=offline, client=client, data=namespace, script=script
@@ -246,6 +266,32 @@ def test_online_and_cached_states_share_exact_token_prefix(api, cached):
     assert len(calls) == int(not cached)
 
 
+@pytest.mark.parametrize("cached", [False, True])
+def test_multimodal_full_payload_is_checked_once_before_slicing(api, cached):
+    full = _payload()
+    service, _ = _service(api, "generated", full["token_ids"].tolist())
+    dataset = _dataset(api, service, full, cached=cached)
+    validator = Mock(wraps=api.offline.check_hidden_states)
+    api.offline.align_hidden_states.__globals__["check_hidden_states"] = validator
+    row = dataset._get_raw_data(0)
+    assert validator.call_count == 1
+    assert validator.call_args.args[0] is full
+    assert row["input_ids"].tolist() == [10, 20]
+
+
+@pytest.mark.parametrize("nonfinite", ["nan", "inf"])
+def test_cached_multimodal_suffix_is_still_validated(api, nonfinite):
+    full = _payload()
+    full["hidden_states"][-1, 0, 0] = float(nonfinite)
+    service, calls = _service(api, "generated", full["token_ids"].tolist())
+    dataset = _dataset(api, service, full, cached=True)
+    with pytest.raises(ValueError, match="non-finite"):
+        dataset._get_raw_data(0)
+    assert calls == []
+    dataset.transfer.delete.assert_not_called()
+    dataset.transfer.cache.assert_not_called()
+
+
 def test_online_full_response_cache_is_reused_on_the_next_read(api):
     full = _payload()
     service, calls = _service(api, "generated", full["token_ids"].tolist())
@@ -264,7 +310,7 @@ def test_online_full_response_cache_is_reused_on_the_next_read(api):
     assert full["token_ids"].tolist() == [10, 20, 30, 40]
 
 
-@pytest.mark.parametrize("failure", ["response", "states", "shape", "nan"])
+@pytest.mark.parametrize("failure", ["response", "states", "shape", "nan", "inf"])
 def test_online_invalid_media_payload_raises_instead_of_silently_skipping(api, failure):
     full = _payload()
     service_tokens = full["token_ids"].tolist()
@@ -275,7 +321,7 @@ def test_online_invalid_media_payload_raises_instead_of_silently_skipping(api, f
     elif failure == "shape":
         full["hidden_states"] = full["hidden_states"][:-1]
     else:
-        full["hidden_states"][-1, 0, 0] = torch.nan
+        full["hidden_states"][-1, 0, 0] = float(failure)
     service, _ = _service(api, "generated", service_tokens)
     dataset = _dataset(api, service, full)
     with pytest.raises((ValueError, api.client.InvalidResponseError)):
@@ -431,6 +477,8 @@ def test_template_end_markers_match_preprocessing(
         "json": json,
         "Path": Path,
         "log": logging.getLogger("template-parity"),
+        "_adapt_conv_for_vllm": preprocessing_helpers._adapt_conv_for_vllm,
+        "_parse_tools": preprocessing_helpers.parse_conv_tools,
     }
     _definitions(
         "src/speculators/data_generation/legacy_preprocessing.py",

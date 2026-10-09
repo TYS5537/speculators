@@ -1,8 +1,67 @@
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
 from speculators.train.trainer import _StepTimer
+
+
+def test_batch_wait_excludes_work_between_yields():
+    clock = [0.0]
+
+    def batches():
+        clock[0] += 0.1
+        yield "first"
+        clock[0] += 0.2
+        yield "second"
+
+    timer = _StepTimer()
+    with (
+        patch("speculators.train.trainer._synchronize_device"),
+        patch(
+            "speculators.train.trainer.time.perf_counter", side_effect=lambda: clock[0]
+        ),
+    ):
+        iterator = timer.batches(batches(), lambda: True)
+        assert next(iterator) == "first"
+        assert timer._marks["queue_ready"] - timer._marks["start"] == pytest.approx(0.1)
+        clock[0] += 100.0  # Logging/checkpoint work must not inflate the next fetch.
+        assert next(iterator) == "second"
+        assert timer._marks["queue_ready"] - timer._marks["start"] == pytest.approx(0.2)
+
+
+def test_detail_marks_partition_fetch_and_forward():
+    timer = _StepTimer(True)
+    for index, name in enumerate(
+        ("start", "queue_ready", "recovery", "fetch", "model", "fwd", "bwd", "opt")
+    ):
+        timer.mark_value(name, float(index))
+    profile = timer.profile(32)
+    assert profile["fetch_ms"] == sum(
+        profile[key] for key in ("queue_wait_ms", "recovery_ms", "h2d_ms")
+    )
+    assert profile["fwd_ms"] == profile["model_fwd_ms"] + profile["supervision_ms"]
+
+
+def test_rank_summary_retains_local_and_reports_tail():
+    def gather(outputs, values):
+        for scale, output in enumerate(outputs, 1):
+            output.copy_(values * scale)
+
+    with (
+        patch("speculators.train.trainer.dist.get_world_size", return_value=2),
+        patch(
+            "speculators.train.trainer.dist.all_gather", side_effect=gather
+        ) as collective,
+    ):
+        summary = _StepTimer.rank_summary(
+            {"fetch_ms": 10.0, "step_ms": 40.0}, torch.device("cpu")
+        )
+    collective.assert_called_once()
+    assert summary["fetch_ms"] == 10.0
+    assert summary["fetch_ms_rank_p50"] == 15.0
+    assert summary["fetch_ms_rank_p95"] == pytest.approx(19.5)
+    assert summary["step_ms_rank_max"] == 80.0
 
 
 def test_disabled_timer_returns_none():

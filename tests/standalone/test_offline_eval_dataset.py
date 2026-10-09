@@ -106,6 +106,10 @@ class _DatasetRun:
         self.record("stats", response)
         self.add_response(response)
 
+    def make_stats(self, *, probability_diagnostics_available=True):
+        self.stats.probability_diagnostics_available = probability_diagnostics_available
+        return self.stats
+
     def run(self):
         patches = {
             "_load_jsonl": Mock(return_value=self.records),
@@ -118,7 +122,7 @@ class _DatasetRun:
             ),
             "tqdm": self.progress if self.progress_available else None,
             "logger": SimpleNamespace(info=lambda *args: self.record("log", *args)),
-            "EvalStats": lambda: self.stats,
+            "EvalStats": self.make_stats,
         }
         with ExitStack() as stack:
             for name, value in patches.items():
@@ -168,7 +172,8 @@ class OfflineEvalDatasetTests(unittest.TestCase):
         self.assertEqual(row["total_output_tokens"], 20)
         self.assertEqual(row["num_requests"], 5)
         self.assertEqual(row["dataset"], "group/custom")
-        self.assertEqual(list(row), reporting.RESULT_COLUMNS)
+        # CSV column order is defined by the writer, not summary dict insertion order.
+        self.assertCountEqual(row, reporting.RESULT_COLUMNS)
         self.assertEqual(row["num_proposals"], 10)
         self.assertEqual(row["num_proposed_draft_tokens"], 20)
         self.assertEqual(row["num_accepted_draft_tokens"], 10)

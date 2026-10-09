@@ -1,17 +1,17 @@
 """Invalid hidden states must never become a reusable training cache."""
 
-import ast
 import asyncio
 import importlib.util
-import logging
 import shutil
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
-from uuid import uuid4
 
 import pytest
 import torch
-from safetensors.torch import load_file, save_file
+from safetensors.torch import save_file
+
+from speculators.data_generation import offline_runner
 
 ROOT = Path(__file__).parents[3]
 
@@ -105,15 +105,7 @@ def test_corrupt_safetensors_are_quarantined_not_deleted(offline, tmp_path):
     assert quarantined.read_bytes() == b"incomplete safetensors"
 
 
-def _worker(offline, source, moves, *, interrupt_copy=False):
-    path = ROOT / "scripts/data_generation_offline.py"
-    methods = [
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
-        and node.name in ("worker", "_publish_hidden_states")
-    ]
-
+def _worker(source, moves, monkeypatch, *, interrupt_copy=False):
     async def generate(*_args, **_kwargs):
         return str(source)
 
@@ -127,28 +119,17 @@ def _worker(offline, source, moves, *, interrupt_copy=False):
             raise OSError("Copy interrupted")
         return shutil.move(src, dst)
 
-    namespace = {
-        "asyncio": asyncio,
-        "uuid4": uuid4,
-        "Path": Path,
-        "shutil": SimpleNamespace(move=move),
-        "logger": logging.getLogger("test-cache-worker"),
-        "load_file": load_file,
-        "check_hidden_states": offline.check_hidden_states,
-        "generate_hidden_states_async": generate,
-    }
-    module = ast.parse("from __future__ import annotations")
-    module.body.extend(methods)
-    exec(  # noqa: S102 -- Run the actual worker without network/client imports.
-        compile(module, str(path), "exec"), namespace
-    )
-    return namespace["worker"]
+    monkeypatch.setattr(offline_runner, "shutil", SimpleNamespace(move=move))
+    monkeypatch.setattr(offline_runner, "generate_hidden_states_async", generate)
+    return partial(offline_runner.worker, legacy=True)
 
 
 @pytest.mark.parametrize(
     ("valid", "interrupt_copy"), [(False, False), (True, False), (True, True)]
 )
-def test_worker_validates_before_publishing(offline, tmp_path, valid, interrupt_copy):
+def test_worker_validates_before_publishing(
+    offline, tmp_path, monkeypatch, valid, interrupt_copy
+):
     source = tmp_path / "response.safetensors"
     data = _payload()
     if not valid:
@@ -157,7 +138,7 @@ def test_worker_validates_before_publishing(offline, tmp_path, valid, interrupt_
     destination = tmp_path / "cache"
     destination.mkdir()
     moves, skipped = [], []
-    worker = _worker(offline, source, moves, interrupt_copy=interrupt_copy)
+    worker = _worker(source, moves, monkeypatch, interrupt_copy=interrupt_copy)
 
     async def run():
         queue = asyncio.Queue()

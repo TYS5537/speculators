@@ -407,6 +407,11 @@ class TrainerArgs(_Group):
     activation_checkpointing: bool = Field(
         default=False, json_schema_extra=_CLI_BOOL_OPTIONAL
     )
+    activation_checkpoint_layers: list[int] | None = Field(
+        default=None,
+        description="Optional zero-based decoder layers to recompute. Requires "
+        "checkpointing; unset preserves recomputation of all decoder layers.",
+    )
 
     epochs: int = Field(default=20, description="Number of training epochs.")
     checkpoint_freq: float = Field(
@@ -423,6 +428,12 @@ class TrainerArgs(_Group):
     )
     log_freq: int = Field(
         default=1, description="Log training metrics every N steps (default: 1)."
+    )
+    profile_freq: int = Field(
+        default=0,
+        ge=0,
+        description="Synchronize and profile every N optimizer steps, independently "
+        "of log frequency. Default 0 disables intrusive step timing.",
     )
     save_path: str = Field(
         default="./output/checkpoints",

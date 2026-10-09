@@ -81,3 +81,23 @@ def test_unsupported_model_fails_before_placement(monkeypatch):
         trainer.setup_model()
 
     model.to.assert_not_called()
+
+
+@pytest.mark.parametrize("layers", [[], [0], [0, 2]])
+def test_selective_layers_passed_only_when_explicit(monkeypatch, layers):
+    monkeypatch.setattr(SpeculatorModel, "verify_training_compatible", lambda _: None)
+    model = SimpleNamespace(to=Mock(), set_activation_checkpointing=Mock())
+    trainer = _trainer(model, enabled=True)
+    trainer.config = trainer.config._replace(activation_checkpoint_layers=layers)
+    trainer.setup_model()
+    model.set_activation_checkpointing.assert_called_once_with(True, layer_ids=layers)
+
+
+def test_selective_layers_require_checkpointing(monkeypatch):
+    monkeypatch.setattr(SpeculatorModel, "verify_training_compatible", lambda _: None)
+    model = SimpleNamespace(to=Mock())
+    trainer = _trainer(model)
+    trainer.config = trainer.config._replace(activation_checkpoint_layers=[0])
+    with pytest.raises(ValueError, match="requires checkpointing"):
+        trainer.setup_model()
+    model.to.assert_not_called()

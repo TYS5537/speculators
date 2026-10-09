@@ -298,6 +298,33 @@ class DSV4OfflineTarget:
         ):
             return self.client.completions.create(**kwargs)
 
+    def _prefix_completion(
+        self, prefix, request_id, *, extra_body, extra_headers=None, **sampling
+    ):
+        """Send exact token IDs with neutral filters; callers choose sampling/output."""
+        return self._completion(
+            model=self.model_name,
+            prompt=prefix,
+            n=1,
+            top_p=1.0,
+            frequency_penalty=0.0,
+            presence_penalty=0.0,
+            timeout=self.timeout,
+            extra_headers={"X-Request-Id": request_id, **(extra_headers or {})},
+            extra_body={
+                "request_id": request_id,
+                "top_k": 0,
+                "min_p": 0.0,
+                "repetition_penalty": 1.0,
+                "ignore_eos": True,
+                "skip_special_tokens": False,
+                "add_special_tokens": False,
+                "return_token_ids": True,
+                **extra_body,
+            },
+            **sampling,
+        )
+
     def validate_request_budget(
         self, prompt_length, max_new_tokens, max_proposal_tokens
     ):
@@ -363,30 +390,14 @@ class DSV4OfflineTarget:
 
         request_id = self._new_request_id()
         self.num_target_requests += 1
-        response = self._completion(
-            model=self.model_name,
-            prompt=prefix,
+        response = self._prefix_completion(
+            prefix,
+            request_id,
             max_tokens=1,
-            n=1,
             echo=False,
             temperature=1.0,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
             logprobs=self.vocab_size,
-            timeout=self.timeout,
-            extra_headers={"X-Request-Id": request_id},
-            extra_body={
-                "request_id": request_id,
-                "top_k": 0,
-                "min_p": 0.0,
-                "repetition_penalty": 1.0,
-                "ignore_eos": True,
-                "skip_special_tokens": False,
-                "add_special_tokens": False,
-                "return_token_ids": True,
-                "return_tokens_as_token_ids": True,
-            },
+            extra_body={"return_tokens_as_token_ids": True},
         )
         self._validate_response(response, request_id)
         transfer_params = getattr(response, "kv_transfer_params", None) or {}
@@ -549,32 +560,19 @@ class DSV4OfflineTarget:
             options.update(
                 output_mode=self.block_output_mode, profile=self.profiler.enabled
             )
-        headers = {"X-Request-Id": request_id}
+        headers = {}
         if cache_options is not None:
             options["cache"] = cache_options
         if dp_rank is not None:
             headers["X-data-parallel-rank"] = str(dp_rank)
-        response = self._completion(
-            model=self.model_name,
-            prompt=prefix,
+        response = self._prefix_completion(
+            prefix,
+            request_id,
             max_tokens=1,
-            n=1,
             echo=False,
             temperature=1.0,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
-            timeout=self.timeout,
             extra_headers=headers,
             extra_body={
-                "request_id": request_id,
-                "top_k": 0,
-                "min_p": 0.0,
-                "repetition_penalty": 1.0,
-                "ignore_eos": True,
-                "skip_special_tokens": False,
-                "add_special_tokens": False,
-                "return_token_ids": True,
                 "kv_transfer_params": {
                     BLOCK_REQUEST_KEY: options,
                 },

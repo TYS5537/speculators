@@ -243,6 +243,33 @@ def test_all_valid_training_retains_existing_numerical_updates(
     assert trainer.global_step == 3
 
 
+@pytest.mark.parametrize("profile_freq", [0, 1, 2])
+def test_profiling_independent_of_logging_and_numerical_updates(
+    trainer_module, tmp_path, monkeypatch, profile_freq
+):
+    sync = Mock()
+    monkeypatch.setattr(trainer_module, "_synchronize_device", sync)
+    trainer = _make_trainer(trainer_module, tmp_path, [_batch() for _ in range(3)])
+    baseline = _make_trainer(trainer_module, tmp_path, [_batch() for _ in range(3)])
+    baseline.train_epoch(0)
+    trainer_module.metric_logger.reset_mock()
+    trainer.config = trainer.config._replace(log_freq=2, profile_freq=profile_freq)
+    trainer.train_epoch(0)
+    events = [call.args[0] for call in trainer_module.metric_logger.info.call_args_list]
+    assert all(
+        "profile" not in event or event["profile"] is not None for event in events
+    )
+    assert [event["global_step"] for event in events if "train" in event] == [2]
+    assert [event["global_step"] for event in events if event.get("profile")] == (
+        [] if profile_freq == 0 else [1, 2, 3] if profile_freq == 1 else [2]
+    )
+    assert bool(sync.call_count) == (profile_freq > 0)
+    torch.testing.assert_close(
+        trainer.model.weight, baseline.model.weight, rtol=0, atol=0
+    )
+    assert trainer.schedulers[0].state_dict() == baseline.schedulers[0].state_dict()
+
+
 @pytest.mark.parametrize("active_ranks", [1, 2])
 def test_training_logs_average_only_supervised_ranks(
     trainer_module, tmp_path, active_ranks

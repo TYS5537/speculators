@@ -46,7 +46,14 @@ def _load_dispatch(namespace):
         )
     )
     initializer = ast.parse("def initialize(self):\n    pass\n").body[0]
-    initializer.body = [default_policy]
+    default_selection = next(
+        node
+        for node in methods["__init__"].body
+        if isinstance(node, ast.AnnAssign)
+        and isinstance(node.target, ast.Attribute)
+        and node.target.attr == "activation_checkpoint_layers"
+    )
+    initializer.body = [default_policy, default_selection]
     module = ast.Module(
         body=[
             ast.ImportFrom(
@@ -164,6 +171,23 @@ class CheckpointDispatchTests(unittest.TestCase):
                             len(self.checkpoint_calls),
                             2 if enabled and training and grad_enabled else 0,
                         )
+
+    def test_explicit_selection_only_checkpoints_selected_layers(self):
+        for indices in ([], [0], [1], [1, 0]):
+            with self.subTest(indices=indices):
+                self.checkpoint_calls.clear()
+                self.namespace["set_activation_checkpointing"](
+                    self.model, True, layer_ids=indices
+                )
+                self.run_dispatch()
+                self.assertEqual(
+                    [module for module, _, _ in self.checkpoint_calls],
+                    [
+                        layer
+                        for index, layer in enumerate(self.layers)
+                        if index in indices
+                    ],
+                )
 
 
 if __name__ == "__main__":

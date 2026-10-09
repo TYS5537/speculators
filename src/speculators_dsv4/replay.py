@@ -74,28 +74,14 @@ class DSV4GreedyReplayTarget(DSV4OfflineTarget):
     def _build_trace(self, prompt, max_new_tokens, stop_token_ids):
         request_id = self._new_request_id()
         self.num_target_requests += 1
-        response = self._completion(
-            model=self.model_name,
-            prompt=prompt,
+        response = self._prefix_completion(
+            prompt,
+            request_id,
             max_tokens=max_new_tokens,
-            n=1,
             temperature=0.0,
-            top_p=1.0,
-            frequency_penalty=0.0,
-            presence_penalty=0.0,
             stop=[],
-            timeout=self.timeout,
-            extra_headers={"X-Request-Id": request_id},
             extra_body={
-                "request_id": request_id,
-                "top_k": 0,
-                "min_p": 0.0,
-                "repetition_penalty": 1.0,
-                "ignore_eos": True,
                 "stop_token_ids": [],
-                "skip_special_tokens": False,
-                "add_special_tokens": False,
-                "return_token_ids": True,
                 "kv_transfer_params": {GREEDY_REQUEST_KEY: {"version": GREEDY_VERSION}},
             },
         )

@@ -344,7 +344,7 @@ def _child_env(devices):
 
 
 def _target_command(
-    args, *, report, layers, hs_path, model_name, port, memory, tp_size
+    args, *, report, layers, hs_path, output_dir, model_name, port, memory, tp_size
 ):
     command = [
         args.target_python,
@@ -354,6 +354,8 @@ def _target_command(
         "--dsv4",
         "--hidden-states-path",
         str(hs_path),
+        "--provenance-dir",
+        str(output_dir),
         "--target-layer-ids",
         *map(str, layers),
         *(
@@ -535,6 +537,7 @@ def build_plan(args, *, run_id=None, port=None):
             report=report,
             layers=layers,
             hs_path=hs_path,
+            output_dir=output_dir,
             model_name=model_name,
             port=port,
             memory=memory,

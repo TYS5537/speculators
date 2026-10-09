@@ -50,7 +50,11 @@ def test_legacy_entry_preserves_resolved_values_and_yaml(
     restored = TrainConfig.from_sources(cli={}, config_path=str(path), argv=argv)
     # The old parser exposes all connector defaults, even for inactive backends.
     # YAML intentionally records only the selected connector's active settings.
-    inactive = {key for key in flat if key.startswith("mooncake_")}
+    inactive = {
+        key
+        for key in flat
+        if key.startswith(("mooncake_", "hs_http_")) or key == "hs_transfer_timeout"
+    }
     assert {
         key: value for key, value in restored.flatten().items() if key not in inactive
     } == {key: value for key, value in flat.items() if key not in inactive}

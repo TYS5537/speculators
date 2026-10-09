@@ -3,15 +3,13 @@
 import argparse
 
 from hs_connectors import HiddenStatesBackend
-from speculators.data_generation.vllm_client import (
-    DEFAULT_MAX_RETRIES,
-    DEFAULT_REQUEST_TIMEOUT,
-)
 from speculators.models.metrics import resolve_loss_config
 from speculators.models.mmuse.config import (
     mmuse_option_defaults,
     validate_mmuse_options,
 )
+from speculators.train.config.cli_fields import field_argument_kwargs
+from speculators.train.config.schema import _GROUPS, _ROOT_FIELDS, TrainConfig
 from speculators.train.draft_config import DRAFT_ARCH_CONFIGS
 from speculators.train.mmuse_args import (
     add_mmuse_backbone_args,
@@ -43,629 +41,135 @@ def _checkpoint_freq(value: str) -> float:
     return fvalue
 
 
+# Explicit allowlist preserves the legacy flag surface and registration order.
+# New config-only fields must not silently add flags (or change abbreviations) here.
+_LEGACY_FIELDS = """
+    verifier_name_or_path trust_remote_code speculator_type from_pretrained
+    draft_config dry_run data_path hidden_states_backend vllm_endpoint on_missing
+    on_generate request_timeout max_retries legacy_data save_path epochs lr
+    train_data_ratio no_resume_from_checkpoint logger total_seq_len log_freq
+    profile_freq
+    log_dir run_name num_layers draft_arch draft_hidden_act draft_mrope_full_head_hack
+    target_layer_ids target_hidden_state_format dsv4_external_arrow token_freq_path
+    draft_vocab_size d2t_path t2d_path mask_token_id ttt_steps num_speculative_steps
+    ttt_step_loss_decay loss_fn step_weight_beta seed hidden_states_dtype
+    deterministic_cuda norm_before_residual embed_requires_grad norm_before_fc
+    fc_norm norm_output block_size sample_from_anchor max_anchors dflash_decay_gamma
+    per_position_loss_weight dpace_alpha markov_rank markov_head_type
+    enable_confidence_head confidence_head_with_markov confidence_detach_features
+    confidence_head_alpha confidence_length_alpha confidence_loss_weighting
+    first_error_focal_alpha adaptive_loss ssal_curriculum ssal_curriculum_start
+    ssal_curriculum_end draft_attn_impl num_depths down_sample_ratio
+    down_sample_ratio_min sliding_window full_attention_indices
+    sliding_window_non_causal num_workers prefetch_factor noise_std checkpoint_freq
+    save_best activation_checkpointing activation_checkpoint_layers
+    fsdp_shard scheduler_type
+    scheduler_warmup_steps scheduler_warmup_ratio scheduler_total_steps
+    scheduler_num_cosine_cycles optimizer weight_decay muon_lr muon_momentum
+    muon_weight_decay muon_ns_steps muon_adjust_lr_fn
+""".split()  # noqa: SIM905 -- Compact, ordered compatibility allowlist.
+
+# Only differences from the schema belong here. Algorithm-derived defaults and
+# validation still run in finalize_train_args, never during parser construction.
+_LEGACY_DEFAULTS = {
+    "verifier_name_or_path": None,
+    "lr": 1e-4,
+    "num_layers": 1,
+    "loss_fn": "kl_div",
+    "block_size": 8,
+    "max_anchors": 3072,
+    "per_position_loss_weight": "fixed-exp-decay",
+    "sliding_window_non_causal": False,
+}
+_LEGACY_HELP = {
+    "speculator_type": "Type of speculator model to train "
+    "(eagle3, dflash, dspark, mmuse, peagle, mtp); muse is a legacy alias for mmuse",
+    "epochs": "Training epochs (default: 20; DSpark paper default: 10).",
+    "num_layers": "Draft decoder layers (default: 1; DSpark paper default: 5).",
+    "block_size": "Draft block size (default: 8; DSpark paper default: 7).",
+    "max_anchors": "Maximum anchor positions for DFlash, DSpark, "
+    "and P-EAGLE training (default: 3072).",
+    "loss_fn": "Loss function specification. Pass a name for a single loss "
+    "(kl_div, rkl, jsd, ce, tv, nla, lk_hybrid) or a JSON dict for a weighted "
+    'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'. The DSpark default '
+    "is the paper's CE=0.1, TV=0.9 combination.",
+    "muon_lr": "LR for the Muon (2D weights) group. Only used with --optimizer muon. "
+    "Defaults to 10*lr (and --lr defaults to 1e-4)",
+    "dflash_decay_gamma": "Decay gamma for DFlash/DSpark loss weighting "
+    "(default: 4.0; DSpark paper default: its block size).",
+    "per_position_loss_weight": "Per-position loss weight option for D-PACE support "
+    "(default: fixed-exp-decay).",
+    "sliding_window_non_causal": "Use non-causal (bidirectional) masking within "
+    "draft blocks for sliding window attention layers. Full attention layers are "
+    "always bidirectional. Note: vLLM currently doesn't support these models.",
+    "target_layer_ids": "(Optional) A (space separated) list of integer layer ids. "
+    "Defaults to [2, num_hidden_layers // 2, num_hidden_layers - 3, "
+    "num_hidden_layers]. "
+    "Note: must be set explicitly if custom values were used to launch vllm",
+    "target_hidden_state_format": "Opt-in DSV4 auxiliary-mean / post-hc_head "
+    "teacher HS contract.",
+    "dsv4_external_arrow": "Accept external tokenized text Arrow without this repo's "
+    "data manifest. You confirm its tokenizer/template/masks match the current "
+    "DSV4 target. Checks all rows structurally and caps token/mask prefixes "
+    "at --total-seq-len before HS requests without rewriting Arrow/order. "
+    "Never bypasses an existing manifest or the target HS/checkpoint contract.",
+    "legacy_data": "DEPRECATED. Use the old data format which stores hidden states "
+    "alongside token_ids and assistant_masks, in data_i.pt files. "
+    "This option will be removed soon.",
+    "activation_checkpointing": "Recompute DFlash/DSpark dense decoder layers during "
+    "backward to save activation memory. Leaves correction/other heads and loss "
+    "unchanged. Training only; independent of --fsdp-shard. Disabled by default.",
+}
+
+
 def build_train_parser() -> argparse.ArgumentParser:
-    """Declare training options without parsing or applying algorithm defaults."""
+    """Declare legacy options from shared fields without resolving a TrainConfig."""
     parser = argparse.ArgumentParser()
     mmuse_defaults = mmuse_option_defaults()
-    parser.add_argument("--verifier-name-or-path", type=str, required=True)
-    parser.add_argument(
-        "--trust-remote-code",
-        action="store_true",
-        help="Allow executing code from HF Hub when loading the verifier's tokenizer.",
-    )
-    parser.add_argument(
-        "--speculator-type",
-        type=str,
-        default="eagle3",
-        help="Type of speculator model to train "
-        "(eagle3, dflash, dspark, mmuse, peagle, mtp); "
-        "muse is a legacy alias for mmuse",
-    )
-    parser.add_argument(
-        "--from-pretrained",
-        type=str,
-        default="",
-        help="Path or HF id of a pretrained draft. May also point to a "
-        "local directory containing only a config.json, in which case a "
-        "fresh draft is initialized from that full speculator config. Takes precedence "
-        "over and is mutually exclusive with --draft-config and the decoder-shaping "
-        "flags (--num-layers, --draft-arch, --draft-hidden-act, --sliding-window, "
-        "--full-attention-indices).",
-    )
-    parser.add_argument(
-        "--draft-config",
-        type=str,
-        default="",
-        help="HF id, directory, or JSON path of a decoder config (LlamaConfig for "
-        "eagle3/peagle, Qwen3Config for dflash) to use as the draft "
-        "transformer_layer_config; the rest of the speculator is built from the other "
-        "CLI args. Mutually exclusive with --from-pretrained and with the "
-        "decoder-shaping flags (--num-layers, --draft-arch, --draft-hidden-act, "
-        "--sliding-window, --full-attention-indices).",
-    )
-    parser.add_argument(
-        "--dry-run",
-        action="store_true",
-        default=False,
-        help="Build the speculator, initialize weights, save a checkpoint to "
-        "--save-path, then exit before training. Useful to validate the config and "
-        "weights (e.g. in vLLM) before launching a full run. Can be combined with "
-        "--draft-config or --from-pretrained.",
-    )
-    parser.add_argument(
-        "--data-path",
-        type=str,
-        default="./output",
-        help=(
-            "Root data directory containing the preprocessed dataset, "
-            "vocab mappings (d2t.npy, t2d.npy), token frequencies "
-            "(token_freq.pt), and hidden states (default: ./output)"
-        ),
-    )
-    backend_registry = HiddenStatesBackend.registry
-    parser.add_argument(
-        "--hidden-states-backend",
-        choices=list(backend_registry.keys()),
-        default="file",
-        help=(
-            "Hidden states transfer backend. Each backend may add its own "
-            "CLI arguments (see below). Default: 'file'."
-        ),
-    )
-    for backend_cls in backend_registry.values():
-        backend_cls.add_train_args(parser)
-
-    parser.add_argument(
-        "--vllm-endpoint",
-        type=str,
-        default="http://localhost:8000/v1",
-        help=(
-            "vLLM endpoint address to use if generating hidden states on-demand."
-            " Only required if `--on-missing=generate` and samples are missing."
-            " Note: the vLLM instance must be configured to cache hidden states"
-            " to a location that is accessible from the training instance. i.e."
-            " on the same node, or a shared network drive. (Default: 'http://localhost:8000/v1')"
-        ),
-    )
-    parser.add_argument(
-        "--on-missing",
-        choices=["generate", "skip", "warn", "raise"],
-        default="generate",
-        help=(
-            "Dataloader behaviour when there are no cached hidden states for a sample."
-            "Default: 'generate', which attempts to generate the hidden states on-"
-            "demand using the provided vLLM endpoint. The other options skip the sample"
-            ", skip and warn, or raise an error respectively."
-        ),
-    )
-    parser.add_argument(
-        "--on-generate",
-        choices=["cache", "delete"],
-        default="delete",
-        help=(
-            "Dataloader behaviour when a new hidden state has been generated"
-            " (only applies if args.on_missing=='generate'). Default: 'delete', "
-            "deletes hidden states once they are loaded. 'cache' will instead store"
-            "the hidden states in the args.hidden_states_path. This can be used to "
-            "enable hybrid online/offline training, with hidden states generated on the"
-            "first epoch, and reused on subsequent epochs."
-        ),
-    )
-    parser.add_argument(
-        "--request-timeout",
-        type=float,
-        default=DEFAULT_REQUEST_TIMEOUT,
-        help=(
-            "Timeout in seconds for each individual vLLM request "
-            f"(default: {DEFAULT_REQUEST_TIMEOUT}). "
-            "Only applies if --on-missing=generate."
-        ),
-    )
-    parser.add_argument(
-        "--max-retries",
-        type=int,
-        default=DEFAULT_MAX_RETRIES,
-        help=(
-            "Maximum number of retry attempts per vLLM request on failure "
-            f"(default: {DEFAULT_MAX_RETRIES}). "
-            "Only applies if --on-missing=generate."
-        ),
-    )
-    parser.add_argument(
-        "--legacy-data",
-        action="store_true",
-        help=(
-            "DEPRECATED. Use the old data format which stores hidden states alongside "
-            "token_ids and assistant_masks, in data_i.pt files. This option will be "
-            "removed soon."
-        ),
-    )
-    parser.add_argument("--save-path", type=str, default="./output/checkpoints")
-    parser.add_argument(
-        "--epochs",
-        type=int,
-        default=20,
-        help="Training epochs (default: 20; DSpark paper default: 10).",
-    )
-    parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--train-data-ratio", type=float, default=0.9)
-    parser.add_argument("--no-resume-from-checkpoint", action="store_true")
-    parser.add_argument(
-        "--logger",
-        type=str,
-        default="",
-        help=(
-            "One of 'trackio', 'wandb', 'tensorboard', 'mlflow' or "
-            "comma separated list."
-        ),
-    )
-    parser.add_argument("--total-seq-len", type=int, default=8192)
-    parser.add_argument(
-        "--log-freq",
-        type=int,
-        default=1,
-        help="Log training metrics every N steps (default: 1)",
-    )
-    parser.add_argument("--log-dir", type=str, default="./logs")
-    parser.add_argument("--run-name", type=str, default=None)
-    parser.add_argument(
-        "--num-layers",
-        type=int,
-        default=1,
-        help="Draft decoder layers (default: 1; DSpark paper default: 5).",
-    )
-    parser.add_argument(
-        "--draft-arch",
-        type=str,
-        default=None,
-        choices=list(DRAFT_ARCH_CONFIGS.keys()),
-        help="Architecture for draft decoder layers "
-        "(default: 'llama' for eagle3, 'qwen3' otherwise).",
-    )
-    parser.add_argument(
-        "--draft-hidden-act",
-        type=str,
-        default="silu",
-        help="Activation function for draft decoder layers. Defaults to 'silu' for "
-        "sigmoid linear unit. Qwen3 layers of dflash expect 'silu' activation for "
-        "vLLM deployment. If another function is desired, set as a string or leave "
-        "as None to automatically fall back to the verifier's activation function.",
-    )
-    parser.add_argument(
-        "--draft-mrope-full-head-hack",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help=(
-            "For MRoPE configs with partial_rotary_factor < 1, rescale "
-            "mrope_section and set partial_rotary_factor=1.0 so HF training "
-            "and vLLM inference use equivalent full-head rotary semantics."
-        ),
-    )
-    parser.add_argument(
-        "--target-layer-ids",
-        type=int,
-        nargs="+",
-        help=(
-            "(Optional) A (space separated) list of integer layer ids. Defaults to"
-            "[2, num_hidden_layers // 2, num_hidden_layers - 3, num_hidden_layers]. "
-            "Note: must be set explicitly if custom values were used to launch vllm"
-        ),
-    )
-    parser.add_argument(
-        "--target-hidden-state-format",
-        choices=["standard", "deepseek_v4_mean_hc_head"],
-        default="standard",
-        help="Opt-in DSV4 auxiliary-mean / post-hc_head teacher HS contract.",
-    )
-    parser.add_argument(
-        "--dsv4-external-arrow",
-        action="store_true",
-        help=(
-            "Accept external tokenized text Arrow without this repo's data manifest. "
-            "You confirm its tokenizer/template/masks match the current "
-            "DSV4 target. Checks all rows structurally and caps token/mask prefixes "
-            "at --total-seq-len before HS requests without rewriting Arrow/order. "
-            "Never bypasses an existing manifest or the target HS/checkpoint contract."
-        ),
-    )
-    parser.add_argument(
-        "--token-freq-path",
-        type=str,
-        default=None,
-        help=(
-            "Path to token frequency distribution file (.pt). Used together with "
-            "--draft-vocab-size to build vocab mappings at training time. Falls back "
-            "to '<data-path>/token_freq.pt' if not provided. If neither that file "
-            "exists nor --draft-vocab-size is set, vocab mapping is skipped and the "
-            "full verifier vocab is used."
-        ),
-    )
-    parser.add_argument(
-        "--draft-vocab-size",
-        type=int,
-        default=None,
-        help=(
-            "Vocabulary size for the draft model. Must be provided together with a "
-            "token frequency file (--token-freq-path or '<data-path>/token_freq.pt') "
-            "to generate vocab mappings. If either is absent, vocab mapping is skipped "
-            "and the full verifier vocab is used, making this argument a no-op."
-        ),
-    )
-    parser.add_argument("--d2t-path", type=str, default=None)
-    parser.add_argument("--t2d-path", type=str, default=None)
-    parser.add_argument("--mask-token-id", type=int, default=None)
-    parser.add_argument("--ttt-steps", type=int, default=3)
-    parser.add_argument(
-        "--num-speculative-steps",
-        type=int,
-        default=3,
-        help="Number of MTP prediction steps (default: 3). Only used with MTP.",
-    )
-    parser.add_argument("--ttt-step-loss-decay", type=float, default=1.0)
-    parser.add_argument(
-        "--loss-fn",
-        type=str,
-        default="kl_div",
-        help=(
-            "Loss function specification. Pass a name for a single loss "
-            "(kl_div, rkl, jsd, ce, tv, nla, lk_hybrid) or a JSON dict for a weighted "
-            'combination, e.g. \'{"ce": 0.1, "tv": 0.9}\'. The DSpark default '
-            "is the paper's CE=0.1, TV=0.9 combination."
-        ),
-    )
-    parser.add_argument(
-        "--step-weight-beta",
-        type=float,
-        default=0.6,
-        help=(
-            "Exponential decay factor for MTP step weights. "
-            "Higher values weight earlier prediction steps more heavily. "
-            "Only used with MTP algorithm."
-        ),
-    )
-    parser.add_argument(
-        "--seed", type=int, default=42, help="Random seed for reproducibility"
-    )
-    parser.add_argument(
-        "--hidden-states-dtype",
-        type=str,
-        default="bfloat16",
-        help="Data type for dataloader hidden states and autocast compute. "
-        "Model master weights are always kept in fp32. "
-        "Options: float32 (full precision), bfloat16 (recommended). "
-        "Note: float16 is not supported (requires gradient scaling).",
-    )
-    parser.add_argument(
-        "--deterministic-cuda",
-        action="store_true",
-        default=False,
-        help="Sets cuda to deterministic mode. This may impact performance.",
-    )
-    # Model hyperparameters
-    parser.add_argument(
-        "--norm-before-residual",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Toggle normalization before residual connections (default: True)",
-    )
-    parser.add_argument(
-        "--embed-requires-grad",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="Whether to train embedding layer weights (default: False)",
-    )
-    parser.add_argument(
-        "--norm-before-fc",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Apply a single RMSNorm to the concatenated auxiliary hidden states "
-        "before the FC projection (gpt-oss style). See --fc-norm for the "
-        "per-layer alternative from the Eagle 3.1 paper. "
-        "(default: True for eagle3, False otherwise). "
-        "Disable with --no-norm-before-fc.",
-    )
-    parser.add_argument(
-        "--fc-norm",
-        action="store_true",
-        default=False,
-        help="Apply per-layer RMSNorm to each auxiliary hidden state before "
-        "concatenation and FC projection (Eagle 3.1 paper approach).",
-    )
-    parser.add_argument(
-        "--norm-output",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Feed post-norm hidden states back across TTT steps to stabilize "
-        "magnitude drift across speculation depths "
-        "(default: True for eagle3, False otherwise). "
-        "Disable with --no-norm-output.",
-    )
-    # D-Flash specific parameters
-    parser.add_argument(
-        "--block-size",
-        type=int,
-        default=8,
-        help="Draft block size (default: 8; DSpark paper default: 7).",
-    )
-    parser.add_argument(
-        "--sample-from-anchor",
-        action=argparse.BooleanOptionalAction,
-        default=None,
-        help="Sample from the anchor position (all positions predict). "
-        "Default: False for dflash, True for dspark. ",
-    )
-    parser.add_argument(
-        "--max-anchors",
-        type=int,
-        default=3072,
-        help="Maximum anchor positions for DFlash, DSpark, "
-        "and P-EAGLE training (default: 3072).",
-    )
-    parser.add_argument(
-        "--dflash-decay-gamma",
-        type=float,
-        default=4.0,
-        help=(
-            "Decay gamma for DFlash/DSpark loss weighting (default: 4.0; "
-            "DSpark paper default: its block size)."
-        ),
-    )
-    # D-Pace specific arguments (loss weight option + smoothing)
-    parser.add_argument(
-        "--per-position-loss-weight",
-        choices=["fixed-exp-decay", "dpace"],
-        default="fixed-exp-decay",
-        help="Per-position loss weight option for D-PACE support"
-        "default: fixed-exp-decay",
-    )
-    parser.add_argument(
-        "--dpace-alpha",
-        type=float,
-        default=0.5,
-        help="Smoothing constant for D-PACE loss (default: 0.5)",
-    )
-    add_mmuse_backbone_args(parser, mmuse_defaults)
-    # DSpark baseline heads and MMuse-specific Correction extensions.
-    parser.add_argument(
-        "--markov-rank",
-        type=int,
-        default=256,
-        help="DSpark: low-rank dim of the Markov logit-bias head (0 disables it).",
-    )
-    parser.add_argument(
-        "--markov-head-type",
-        type=str,
-        default="vanilla",
-        choices=["vanilla", "gated", "rnn"],
-        help="DSpark: sequential head variant (default: vanilla).",
-    )
-    add_mmuse_correction_args(parser, mmuse_defaults)
-    parser.add_argument(
-        "--enable-confidence-head",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="DSpark: attach the per-position acceptance confidence head.",
-    )
-    parser.add_argument(
-        "--confidence-head-with-markov",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="DSpark: feed the active sequential state into the confidence "
-        "head alongside the backbone hidden state.",
-    )
-    parser.add_argument(
-        "--confidence-detach-features",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="DSpark: detach all ConfidenceHead inputs so its loss is auxiliary.",
-    )
-    parser.add_argument(
-        "--confidence-head-alpha",
-        type=float,
-        default=1.0,
-        help="DSpark: weight of the confidence-head BCE term (default: 1.0).",
-    )
-    parser.add_argument(
-        "--confidence-length-alpha",
-        type=float,
-        default=0.0,
-        help="DSpark: Smooth-L1 weight on predicted accept length (default: 0).",
-    )
-    parser.add_argument(
-        "--confidence-loss-weighting",
-        type=str,
-        default="match-draft",
-        choices=["uniform", "match-draft"],
-        help="DSpark: how to weight confidence BCE over positions "
-        "(default: match-draft, matching the DSpark objective).",
-    )
-    parser.add_argument(
-        "--first-error-focal-alpha",
-        type=float,
-        default=0.0,
-        help="DSpark: weight of first-error focal CE (default: 0).",
-    )
-    parser.add_argument(
-        "--adaptive-loss",
-        type=str,
-        default="none",
-        choices=["none", "cat", "ssal"],
-        help="DSpark: adaptive position weights (default: none = fixed decay).",
-    )
-    parser.add_argument(
-        "--ssal-curriculum",
-        action=argparse.BooleanOptionalAction,
-        default=False,
-        help="DSpark: mix decay→SSAL over training (requires --adaptive-loss ssal).",
-    )
-    parser.add_argument(
-        "--ssal-curriculum-start",
-        type=float,
-        default=0.1,
-        help="Progress fraction where decay→SSAL mix begins (default: 0.1).",
-    )
-    parser.add_argument(
-        "--ssal-curriculum-end",
-        type=float,
-        default=0.6,
-        help="Progress fraction where mix reaches pure SSAL (default: 0.6).",
-    )
-    parser.add_argument(
-        "--draft-attn-impl",
-        type=str,
-        default="simple_flex_attention",
-        choices=["simple_flex_attention", "sdpa", "eager"],
-        help="Attention implementation for draft layers. "
-        "Use 'sdpa' or 'eager' for hardware that doesn't support flex attention."
-        "Not supported for MTP.",
-    )
-    # P-EAGLE specific parameters
-    parser.add_argument(
-        "--num-depths",
-        type=int,
-        default=8,
-        help="Number of parallel prediction depths for P-EAGLE (default: 8)",
-    )
-    parser.add_argument(
-        "--down-sample-ratio",
-        type=float,
-        default=0.7,
-        help="Geometric decay ratio for COD sampling in P-EAGLE (default: 0.7)",
-    )
-    parser.add_argument(
-        "--down-sample-ratio-min",
-        type=float,
-        default=0.2,
-        help="Minimum retention ratio for COD sampling in P-EAGLE (default: 0.2)",
-    )
-    parser.add_argument(
-        "--sliding-window",
-        type=int,
-        default=2048,
-        help="Sliding window size for sliding window attention layers (default: 2048). "
-        "All draft layers use sliding window by default (except mtp).",
-    )
-    parser.add_argument(
-        "--full-attention-indices",
-        type=int,
-        nargs="+",
-        default=[],
-        help="(Optional) Space-separated draft layer indices that should use full "
-        "attention instead of sliding window. All draft layers use sliding window "
-        "by default (except mtp). "
-        "(e.g. '--full-attention-indices 0 2' makes layers 0 and 2 use full "
-        "attention; the rest use sliding window).",
-    )
-    parser.add_argument(
-        "--sliding-window-non-causal",
-        action="store_true",
-        default=False,
-        help="Use non-causal (bidirectional) masking within draft blocks for sliding "
-        "window attention layers. Full attention layers are always bidirectional. "
-        "Note: vLLM currently doesn't support these models.",
-    )
-    # Dataloader parameters
-    parser.add_argument(
-        "--num-workers", type=int, default=12, help="Number of dataloader workers"
-    )
-    parser.add_argument(
-        "--prefetch-factor", type=int, default=4, help="Dataloader prefetch factor"
-    )
-    parser.add_argument(
-        "--noise-std",
-        type=float,
-        default=0.05,
-        help="Standard deviation for noise augmentation",
-    )
-    # Checkpoint Parameters
-    parser.add_argument(
-        "--checkpoint-freq",
-        type=_checkpoint_freq,
-        default=1.0,
-        help="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "
-        "checkpointing (e.g. 0.5 = every half epoch).",
-    )
-    parser.add_argument(
-        "--save-best",
-        action="store_true",
-        default=False,
-        help="Pointing to checkpoint with lowest validation loss.",
-    )
-
-    parser.add_argument(
-        "--activation-checkpointing",
-        action="store_true",
-        default=False,
-        help="Recompute DFlash/DSpark dense decoder layers during backward to "
-        "save activation memory. Leaves correction/other heads and loss unchanged. "
-        "Training only; independent of --fsdp-shard. Disabled by default.",
-    )
-
-    # distributed strategy
-    parser.add_argument(
-        "--fsdp-shard",
-        action="store_true",
-        default=False,
-        help="Shard model parameters across GPUs with FSDP. By default, "
-        "parameters are fully replicated (DDP-like). Enable this when the "
-        "model does not fit in a single GPU's memory.",
-    )
-
-    # lr scheduler
-    parser.add_argument(
-        "--scheduler-type",
-        type=str,
-        default="linear",
-        choices=["linear", "cosine", "none"],
-    )
-    parser.add_argument("--scheduler-warmup-steps", type=int, default=None)
-    parser.add_argument(
-        "--scheduler-warmup-ratio",
-        type=float,
-        default=None,
-        help=(
-            "Warmup as a fraction of total scheduler steps, in [0, 1]. Ignored "
-            "(with a warning) when --scheduler-warmup-steps is also set."
-        ),
-    )
-    parser.add_argument("--scheduler-total-steps", type=int, default=None)
-    parser.add_argument("--scheduler-num-cosine-cycles", type=float, default=0.5)
-
-    # optimizer
-    parser.add_argument(
-        "--optimizer",
-        type=str,
-        default="muon",
-        choices=["adamw", "muon"],
-        help=(
-            "Optimizer to use. 'muon' applies Muon to 2D weight matrices and AdamW to "
-            "the remaining params (norms, biases, embeddings, lm_head)."
-        ),
-    )
-    parser.add_argument(
-        "--weight-decay",
-        type=float,
-        default=0.01,
-        help="Weight decay for the AdamW optimizer (and the AdamW group in muon mode).",
-    )
-    parser.add_argument(
-        "--muon-lr",
-        type=float,
-        default=None,
-        help="LR for the Muon (2D weights) group. Only used with --optimizer muon. "
-        "Defaults to 10*lr (and --lr defaults to 1e-4)",
-    )
-    parser.add_argument("--muon-momentum", type=float, default=0.95)
-    parser.add_argument("--muon-weight-decay", type=float, default=0.1)
-    parser.add_argument("--muon-ns-steps", type=int, default=5)
-    parser.add_argument(
-        "--muon-adjust-lr-fn",
-        type=str,
-        default="match_rms_adamw",
-        choices=["original", "match_rms_adamw"],
-        help="Muon LR adjustment. 'match_rms_adamw' matches AdamW's update RMS.",
-    )
-
+    fields = {name: TrainConfig.model_fields[name] for name in _ROOT_FIELDS}
+    fields.update(
+        {
+            name: field
+            for group in _GROUPS.values()
+            for name, field in group.model_fields.items()
+        }
+    )
+    overrides = {
+        "verifier_name_or_path": {"required": True},
+        "draft_arch": {"choices": list(DRAFT_ARCH_CONFIGS)},
+        "hidden_states_backend": {
+            "type": None,
+            "choices": list(HiddenStatesBackend.registry),
+        },
+        "on_missing": {"type": None},
+        "on_generate": {"type": None},
+        "target_hidden_state_format": {"type": None},
+        "per_position_loss_weight": {"type": None},
+        "sliding_window_non_causal": {"action": "store_true"},
+        "activation_checkpointing": {"action": "store_true"},
+        "checkpoint_freq": {"type": _checkpoint_freq},
+    }
+    for name in _LEGACY_FIELDS:
+        field = fields[name]
+        kwargs = field_argument_kwargs(field)
+        kwargs["default"] = (
+            _LEGACY_DEFAULTS[name]
+            if name in _LEGACY_DEFAULTS
+            else field.get_default(call_default_factory=True)
+        )
+        kwargs.update(overrides.get(name, {}))
+        if name in _LEGACY_HELP:
+            kwargs["help"] = _LEGACY_HELP[name]
+        parser.add_argument("--" + name.replace("_", "-"), dest=name, **kwargs)
+        # Keep these registrars live and at their original positions. In particular,
+        # do not use resolution's import-time backend snapshot or instantiate MMuse.
+        if name == "hidden_states_backend":
+            for backend_cls in HiddenStatesBackend.registry.values():
+                backend_cls.add_train_args(parser)
+        elif name == "dpace_alpha":
+            add_mmuse_backbone_args(parser, mmuse_defaults)
+        elif name == "markov_head_type":
+            add_mmuse_correction_args(parser, mmuse_defaults)
     return parser
 
 

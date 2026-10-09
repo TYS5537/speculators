@@ -15,56 +15,26 @@ Usage:
 import argparse
 import asyncio
 import logging
-import os
-import shutil
 import sys
-from pathlib import Path
-from typing import Any
-from uuid import uuid4
+from functools import partial
 
-import openai
 from datasets import load_from_disk
-from safetensors.torch import load_file, save_file
-from tqdm import tqdm
 
-from speculators.data_generation.offline import (
-    align_hidden_states,
-    check_hidden_states,
-    get_existing_hidden_state_indices,
-    get_indices_to_process,
-    validate_existing_hidden_states,
-)
+from speculators.data_generation import offline_runner as _offline_runner
 from speculators.data_generation.vllm_client import (
     DEFAULT_MAX_RETRIES,
     DEFAULT_REQUEST_TIMEOUT,
-    generate_hidden_states_async,
-    wait_for_lock_async,
 )
-from speculators.train.data import build_client_item
 from speculators.train.logger import setup_root_logger
 
 logger = logging.getLogger(__name__)
 
-
-class _FailureTracker:
-    """Tracks consecutive sample failures across async workers.
-
-    When the number of consecutive failures (with no successes in between)
-    reaches ``threshold``, the tracker signals that the run should abort.
-    Because asyncio is single-threaded, no locking is needed.
-    """
-
-    def __init__(self, threshold: int):
-        self.threshold = threshold
-        self._consecutive = 0
-
-    def record_success(self) -> None:
-        self._consecutive = 0
-
-    def record_failure(self) -> bool:
-        """Record a failure. Returns True when the threshold is reached."""
-        self._consecutive += 1
-        return self._consecutive >= self.threshold
+# Preserve the historical helper imports while sharing their implementation.
+_FailureTracker = _offline_runner.FailureTracker
+_publish_hidden_states = _offline_runner.publish_hidden_states
+worker = partial(_offline_runner.worker, legacy=True, log=logger)
+_feed_queue = partial(_offline_runner.feed_queue, legacy=True)
+_shutdown_workers = partial(_offline_runner.shutdown_workers, log=logger)
 
 
 def parse_args():
@@ -195,255 +165,8 @@ def parse_args():
     return parser.parse_args()
 
 
-def _publish_hidden_states(
-    source: str, target: Path, prefix: dict | None = None
-) -> None:
-    # The source can be on another filesystem: copying directly to hs_i would
-    # expose an incomplete cache after interruption. Only rename once complete.
-    temporary = target.with_name(f".{target.name}.{uuid4().hex}.tmp")
-    if prefix is None:
-        shutil.move(source, temporary)
-    else:
-        save_file(prefix, temporary)
-    temporary.replace(target)
-    if prefix is not None:
-        Path(source).unlink()
-
-
-async def worker(  # noqa: C901
-    client,
-    model: str,
-    queue: "asyncio.Queue[dict[str, Any]]",
-    pbar: tqdm,
-    vllm_semaphore: asyncio.Semaphore,
-    write_semaphore: asyncio.Semaphore,
-    hidden_states_output_dir: Path,
-    validate_outputs: bool,
-    request_timeout: float | None,
-    max_retries: int,
-    fail_on_error: bool,
-    skipped_indices: list[int],
-    cancel_event: asyncio.Event,
-    failure_tracker: _FailureTracker | None,
-):
-    """Worker that pulls items from queue and sends them to the vLLM endpoint."""
-    while True:
-        item = await queue.get()
-        if item is None:
-            queue.task_done()
-            return
-
-        idx = item["idx"]
-
-        # Drain remaining items quickly after cancellation
-        if cancel_event.is_set():
-            queue.task_done()
-            continue
-
-        target_hidden_states_path = hidden_states_output_dir / f"hs_{idx}.safetensors"
-
-        try:
-            async with vllm_semaphore:  # Limit number of active generate calls
-                hidden_states_path = await generate_hidden_states_async(
-                    client,
-                    model,
-                    item,
-                    timeout=request_timeout,
-                    max_retries=max_retries,
-                )
-            lock_path = hidden_states_path + ".lock"
-            if Path(lock_path).exists():  # noqa: ASYNC240
-                await wait_for_lock_async(lock_path)
-
-            async with write_semaphore:  # Limit number of active disk writes
-                allow_prefix = item.get("messages") is not None
-                prefix = None
-                if validate_outputs or allow_prefix:
-
-                    def _load_and_check(
-                        path=hidden_states_path,
-                        tokens=item["input_ids"],
-                        allow_prefix=allow_prefix,
-                    ):
-                        loaded = load_file(path)
-                        if allow_prefix:
-                            return align_hidden_states(
-                                loaded, tokens, allow_prefix=True
-                            )
-                        check_hidden_states(loaded, tokens)
-                        return None
-
-                    prefix = await asyncio.to_thread(_load_and_check)
-                # Only validated output may acquire the reusable cache name.
-                # On validation failure the source remains available for diagnosis.
-                await asyncio.to_thread(
-                    _publish_hidden_states,
-                    hidden_states_path,
-                    target_hidden_states_path,
-                    prefix,
-                )
-        except Exception as e:
-            if fail_on_error:
-                logger.exception(
-                    "Fatal: sample %d aborted with --fail-on-error: %s", idx, e
-                )
-                logging.shutdown()
-                os._exit(1)
-            logger.warning("Skipping sample %d due to error: %s", idx, e)
-            skipped_indices.append(idx)
-            if failure_tracker is not None and failure_tracker.record_failure():
-                cancel_event.set()
-                raise RuntimeError(
-                    f"Aborting: {failure_tracker.threshold} consecutive samples "
-                    "errored out. The vLLM server may be unreachable."
-                ) from e
-        else:
-            if failure_tracker is not None:
-                failure_tracker.record_success()
-        finally:
-            pbar.update(1)
-            queue.task_done()
-
-
-async def _feed_queue(to_process, dataset, queue, cancel_event):
-    """Feed dataset items into the worker queue, respecting cancellation."""
-    for i in to_process:
-        if cancel_event.is_set():
-            break
-
-        dataset_item = dataset[i]
-        client_item = build_client_item(dataset_item) | {"idx": i}
-        if "messages" in client_item:
-            client_item.setdefault("continue_final_message", False)
-
-        # Check cancel_event while waiting for queue space to avoid
-        # deadlocking when all workers have died.
-        while not cancel_event.is_set():
-            try:
-                queue.put_nowait(client_item)
-                break
-            except asyncio.QueueFull:
-                await asyncio.sleep(0.1)
-
-
-async def _shutdown_workers(workers, queue, cancel_event):
-    """Shut down workers and propagate the first real exception."""
-    logger.info("Waiting for remaining file saves to complete...")
-    if cancel_event.is_set():
-        # Workers may be dead or draining — cancel any that are
-        # still alive so we don't deadlock on sentinel puts.
-        for w in workers:
-            if not w.done():
-                w.cancel()
-    else:
-        # Normal shutdown: send sentinel values so workers exit
-        for _ in range(len(workers)):
-            await queue.put(None)
-    results = await asyncio.gather(*workers, return_exceptions=True)
-
-    # Propagate the first real worker exception (skip CancelledError)
-    for result in results:
-        if isinstance(result, Exception) and not isinstance(
-            result, asyncio.CancelledError
-        ):
-            raise result
-
-
 async def generate_and_save_hidden_states(args, dataset):
-    if args.output is None:
-        hidden_states_dir = Path(args.preprocessed_data) / "hidden_states"
-    else:
-        hidden_states_dir = Path(args.output)
-    hidden_states_dir.mkdir(parents=True, exist_ok=True)
-
-    existing_file_indices = get_existing_hidden_state_indices(hidden_states_dir)
-    num_samples = len(dataset)
-    if args.validate_outputs:
-        requested = set(
-            get_indices_to_process(
-                num_samples, args.max_samples, [], args.world_size, args.rank
-            )
-        )
-        local_existing = [
-            index for index in existing_file_indices if index in requested
-        ]
-        valid_existing = await asyncio.to_thread(
-            validate_existing_hidden_states,
-            hidden_states_dir,
-            dataset,
-            local_existing,
-        )
-        invalid = set(local_existing) - set(valid_existing)
-        existing_file_indices = [i for i in existing_file_indices if i not in invalid]
-
-    to_process = get_indices_to_process(
-        num_samples,
-        args.max_samples,
-        existing_file_indices,
-        args.world_size,
-        args.rank,
-    )
-    if not to_process:
-        return
-
-    logger.info(f"Processing {len(to_process)} samples")
-
-    queue: asyncio.Queue = asyncio.Queue(maxsize=args.concurrency * 4)
-    vllm_semaphore = asyncio.Semaphore(args.concurrency)
-    write_semaphore = asyncio.Semaphore(args.concurrency)
-
-    skipped_indices: list[int] = []
-    cancel_event = asyncio.Event()
-
-    max_consec = args.max_consecutive_errors
-    if max_consec is None:
-        max_consec = args.concurrency
-    failure_tracker = _FailureTracker(max_consec) if not args.fail_on_error else None
-
-    async with openai.AsyncOpenAI(
-        base_url=args.endpoint, api_key="EMPTY", max_retries=0
-    ) as client:
-        list_models = await client.models.list()
-        model_id = list_models.data[0].id
-        if args.model and args.model != model_id:
-            raise ValueError(
-                f"An explicit model name was passed ({args.model}) which doesn't match"
-                f" found model_id {model_id}."
-                "Please make sure --endpoint is set to the correct vllm instance."
-            )
-
-        with tqdm(total=len(to_process)) as pbar:
-            workers = [
-                asyncio.create_task(
-                    worker(
-                        client,
-                        model_id,
-                        queue,
-                        pbar,
-                        vllm_semaphore,
-                        write_semaphore,
-                        hidden_states_dir,
-                        args.validate_outputs,
-                        args.request_timeout,
-                        args.max_retries,
-                        args.fail_on_error,
-                        skipped_indices,
-                        cancel_event,
-                        failure_tracker,
-                    )
-                )
-                for _ in range(args.concurrency * 2)
-            ]
-
-            await _feed_queue(to_process, dataset, queue, cancel_event)
-            await _shutdown_workers(workers, queue, cancel_event)
-
-    num_saved = len(to_process) - len(skipped_indices)
-    logger.info(f"Saved {num_saved} new data points to {args.output}")
-    if skipped_indices:
-        logger.warning(
-            f"Skipped {len(skipped_indices)} samples due to errors: {skipped_indices}"
-        )
+    return await _offline_runner.run_generation(args, dataset, legacy=True, log=logger)
 
 
 def main():

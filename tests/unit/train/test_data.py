@@ -375,6 +375,116 @@ def test_remote_success_uses_same_training_tensor_layout_and_deletes(
     assert transfer.deleted == ["remote-handle"]
 
 
+@pytest.mark.parametrize("strict", [False, True])
+@pytest.mark.parametrize("external", [False, True])
+@pytest.mark.parametrize("recoverable", [False, True])
+def test_generated_states_are_validated_exactly_once(
+    tmp_path, monkeypatch, strict, external, recoverable
+):
+    from unittest.mock import Mock  # noqa: PLC0415
+
+    original = _valid_generated_sample()
+    transfer = _SequenceTransfer([original])
+    transfer.strict_errors = strict
+    dataset = _make_generation_dataset(
+        tmp_path,
+        transfer,
+        pretokenized_text_only=external,
+        generation_validation_retries=1 if recoverable else None,
+    )
+    monkeypatch.setattr(
+        data_module, "generate_hidden_states", lambda *_args, **_kwargs: "generated"
+    )
+    validator = "check_hidden_states" if external else "align_hidden_states"
+    check = Mock(wraps=getattr(data_module, validator))
+    monkeypatch.setattr(data_module, validator, check)
+    row = dataset[0]
+    assert check.call_count == 1
+    assert type(row) is dict
+    assert set(row) == {
+        "hidden_states",
+        "input_ids",
+        "verifier_last_hidden_states",
+        "loss_mask",
+        "lengths",
+        "position_ids",
+    }
+    assert torch.equal(
+        row["hidden_states"], original["hidden_states"][:, :-1].flatten(1)
+    )
+    assert transfer.deleted == ["generated"]
+
+
+@pytest.mark.parametrize("external", [False, True])
+def test_cached_states_checked_once_per_read_and_corruption_is_not_trusted(
+    tmp_path, monkeypatch, external
+):
+    from unittest.mock import Mock  # noqa: PLC0415
+
+    # Even a transfer returning an internal marker must not bypass cache checks.
+    payload = data_module._ValidatedHiddenStates(_valid_generated_sample())
+    transfer = _SequenceTransfer([])
+    transfer.get_cached = lambda _index: payload
+    dataset = _make_generation_dataset(
+        tmp_path, transfer, pretokenized_text_only=external
+    )
+    validator = "check_hidden_states" if external else "align_hidden_states"
+    check = Mock(wraps=getattr(data_module, validator))
+    monkeypatch.setattr(data_module, validator, check)
+    dataset[0]
+    dataset[0]
+    assert check.call_count == 2
+    payload["hidden_states"][0, 0, 0] = float("inf")
+    with pytest.raises(ValueError, match="non-finite"):
+        dataset[0]
+    assert check.call_count == 3
+    assert transfer.deleted == []
+
+
+@pytest.mark.parametrize("profile_every", [0, 1])
+def test_arrow_worker_profile_stages_do_not_leak_into_batch_or_consume_rng(
+    tmp_path, monkeypatch, capsys, profile_every
+):
+    import json  # noqa: PLC0415
+
+    from speculators_dsv4 import hs_profile  # noqa: PLC0415
+
+    monkeypatch.setenv("SPECULATORS_HS_PROFILE_EVERY", str(profile_every))
+    monkeypatch.setattr(hs_profile, "_STATE", None)
+    original = _valid_generated_sample()
+    transfer = _SequenceTransfer([original])
+    transfer.strict_errors = True
+    dataset = _make_generation_dataset(tmp_path, transfer)
+    monkeypatch.setattr(
+        data_module, "generate_hidden_states", lambda *_args, **_kwargs: "generated"
+    )
+    before = torch.get_rng_state()
+    row = dataset[0]
+    assert torch.equal(before, torch.get_rng_state())
+    assert type(row) is dict
+    assert not any("profile" in key or "bytes" in key or "_ms" in key for key in row)
+    records = [
+        json.loads(line)
+        for line in capsys.readouterr().err.splitlines()
+        if line.startswith('{"event":"hs_profile"')
+    ]
+    assert len(records) == profile_every
+    if profile_every:
+        stats = records[0]["stats"]
+        assert set(stats) == {
+            "cache_read_ms",
+            "request_ms",
+            "get_generated_ms",
+            "validate_ms",
+            "delete_ms",
+            "sample_total_ms",
+            "tensor_bytes",
+        }
+        assert stats["tensor_bytes"]["latest"] == sum(
+            tensor.numel() * tensor.element_size() for tensor in original.values()
+        )
+
+
 def test_arrow_dataset_retries_nonfinite_read_then_recovers(
     tmp_path, monkeypatch, caplog
 ):

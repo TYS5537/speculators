@@ -80,7 +80,7 @@ def _synchronize_device() -> None:
 class _StepTimer:
     # Each mark()/now() forces a device synchronize to capture true accelerator
     # time. This serialises the device pipeline, so profiled steps are slower;
-    # keep log_freq > 1 in perf-sensitive runs.
+    # enable them independently of metric logging, on sampled steps only.
     _PROFILE_MARKS = ("fetch", "fwd", "bwd", "opt")
 
     def __init__(self, enabled: bool = False):
@@ -107,6 +107,20 @@ class _StepTimer:
         _synchronize_device()
         return time.perf_counter()
 
+    def batches(self, iterator, enabled):
+        """Time only the next batch wait, excluding logging/checkpoint overhead."""
+        iterator = iter(iterator)
+        while True:
+            self.reset(enabled())
+            self.mark("start")
+            try:
+                batch = next(iterator)
+            except StopIteration:
+                return
+            if self.enabled:
+                self.mark_value("queue_ready", time.perf_counter())
+            yield batch
+
     def profile(self, num_tokens: int) -> dict[str, float] | None:
         if not self.enabled:
             return None
@@ -121,7 +135,7 @@ class _StepTimer:
         step_ms = (m["opt"] - m["start"]) * 1000 if has_start else 0.0
         tokens_per_s = num_tokens / (step_ms / 1000) if step_ms > 0 else 0.0
         fetch_frac = fetch_ms / step_ms if step_ms > 0 else 0.0
-        return {
+        result = {
             "fetch_ms": fetch_ms,
             "fwd_ms": fwd_ms,
             "bwd_ms": bwd_ms,
@@ -130,6 +144,33 @@ class _StepTimer:
             "tokens_per_s": tokens_per_s,
             "fetch_frac": fetch_frac,
         }
+        for key, start, end in (
+            ("queue_wait_ms", "start", "queue_ready"),
+            ("recovery_ms", "queue_ready", "recovery"),
+            ("h2d_ms", "recovery", "fetch"),
+            ("model_fwd_ms", "fetch", "model"),
+            ("supervision_ms", "model", "fwd"),
+        ):
+            if start in m and end in m:
+                result[key] = (m[end] - m[start]) * 1000
+        return result
+
+    @staticmethod
+    def rank_summary(profile, device):
+        """One sampled collective; keep local values and add rank tail statistics."""
+        keys = [key for key in profile if key.endswith("_ms")]
+        values = torch.tensor(
+            [profile[key] for key in keys], device=device, dtype=torch.float32
+        )
+        gathered = [torch.empty_like(values) for _ in range(dist.get_world_size())]
+        dist.all_gather(gathered, values)
+        samples = torch.stack(gathered).float().cpu()
+        quantiles = torch.quantile(samples, torch.tensor([0.5, 0.95, 1.0]), dim=0)
+        result = dict(profile)
+        for index, key in enumerate(keys):
+            for row, label in enumerate(("p50", "p95", "max")):
+                result[f"{key}_rank_{label}"] = quantiles[row, index].item()
+        return result
 
 
 warnings.filterwarnings("ignore", category=TqdmExperimentalWarning)
@@ -166,6 +207,8 @@ class TrainerConfig(NamedTuple):
     max_steps: int | None = None
     training_recipe: Literal["legacy", "upstream"] = "legacy"
     muon_parameter_policy: Literal["legacy", "upstream"] | None = None
+    profile_freq: int = 0
+    activation_checkpoint_layers: list[int] | None = None
 
 
 def _resolve_scheduler_steps(
@@ -220,6 +263,8 @@ class Trainer:
     ):
         self.model = model
         self.config = config
+        if config.profile_freq < 0:
+            raise ValueError("profile_freq must be nonnegative (0 disables profiling)")
         self.local_rank = get_local_rank()
         self.rank = get_rank()
         self.train_loader = train_loader
@@ -416,15 +461,20 @@ class Trainer:
             return pre_validation
         return capture_rng_states(self.device_type)
 
-    def setup_model(self):
-        # Verify model is compatible with training infrastructure
-        SpeculatorModel.verify_training_compatible(self.model)
+    def _setup_activation_checkpointing(self):
+        layers = self.config.activation_checkpoint_layers
+        if layers is not None and not (
+            self.config.activation_checkpointing or self.config.gradient_checkpointing
+        ):
+            raise ValueError("activation_checkpoint_layers requires checkpointing")
 
         if (
             self.config.gradient_checkpointing
             and not self.config.activation_checkpointing
             and not hasattr(self.model, "set_activation_checkpointing")
         ):
+            if layers is not None:
+                raise ValueError("Selective checkpointing requires the dense backbone")
             if not self.model.supports_gradient_checkpointing:
                 raise ValueError(
                     f"{type(self.model).__name__} does not support "
@@ -440,11 +490,18 @@ class Trainer:
                     "--activation-checkpointing is only supported by the "
                     "DFlash/DSpark dense backbone."
                 )
-            enable_checkpointing(True)
+            if layers is None:
+                enable_checkpointing(True)
+            else:
+                enable_checkpointing(True, layer_ids=layers)
             root_logger.info(
                 "Activation checkpointing enabled for draft decoder layers only "
                 "(non-reentrant); correction/other heads and loss are unchanged."
             )
+
+    def setup_model(self):
+        SpeculatorModel.verify_training_compatible(self.model)
+        self._setup_activation_checkpointing()
 
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
@@ -602,23 +659,16 @@ class Trainer:
             # Only skip once — clear after use.
             self._resume_local_step = 0
 
-        # Fast-skip: slice the sampler's pre-generated batch list so we never
+        # Fast-skip: offset the sampler's pre-generated batch list so we never
         # call __getitem__ (and thus never call vLLM) for skipped batches.
         sampler = self.train_loader.batch_sampler
-        has_fast_skip_api = hasattr(sampler, "_generate_batches") and hasattr(
-            sampler, "_cached_generated_batches"
-        )
+        set_start_batch = getattr(sampler, "set_start_batch", None)
+        has_fast_skip_api = callable(set_start_batch)
         self._fallback_skip_steps = skip_steps if not has_fast_skip_api else 0
         if skip_steps > 0 and has_fast_skip_api:
-            all_batches = sampler._generate_batches(epoch)  # type: ignore[union-attr]  # noqa: SLF001
-            remaining = all_batches[skip_steps:]
-            # Temporarily override the sampler cache with the sliced list.
-            sampler._cached_generated_batches = (  # type: ignore[union-attr]  # noqa: SLF001
-                epoch,
-                remaining,
-            )
+            set_start_batch(epoch, skip_steps)
             root_logger.info(
-                f"Fast-skipping {skip_steps} batches via sampler slice "
+                f"Fast-skipping {skip_steps} batches via sampler offset "
                 f"(no vLLM calls for skipped batches). "
                 f"epoch={epoch}, global_step={self.global_step}."
             )
@@ -639,6 +689,33 @@ class Trainer:
             pass
         self._restore_pending_rng()
         return iterator
+
+    def _log_training_step(self, epoch, metrics, active_ranks, current_lrs, profile):
+        if self.global_step % self.config.log_freq == 0:
+            if self.is_distributed:
+                metrics = _all_reduce_metrics(metrics)
+            metrics = normalize_counted_metrics(
+                {k: v.item() for k, v in metrics.items()}, active_ranks
+            )
+            lr_info = (
+                current_lrs
+                if len(current_lrs) > 1
+                else next(iter(current_lrs.values()))
+            )
+            event = {
+                "train": metrics,
+                "epoch": epoch,
+                "lr": lr_info,
+                "global_step": self.global_step,
+            }
+            if profile is not None:
+                event["profile"] = profile
+            metric_logger.info(event, extra={"step": self.global_step})
+        elif profile is not None:
+            metric_logger.info(
+                {"profile": profile, "epoch": epoch, "global_step": self.global_step},
+                extra={"step": self.global_step},
+            )
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -670,16 +747,20 @@ class Trainer:
             if self.config.checkpoint_freq < 1
             else None
         )
-        t_before_fetch = time.perf_counter()
         timer = _StepTimer()
         recovery = BatchRecoveryCoordinator("training")
-        for local_step_rel, batch in enumerate(train_loader, 1):
+        timed_batches = timer.batches(
+            train_loader,
+            lambda: (
+                self.config.profile_freq > 0
+                and self.global_step % self.config.profile_freq == 0
+            ),
+        )
+        for local_step_rel, batch in enumerate(timed_batches, 1):
             # local_step is 1-based index into the *full* epoch (not the slice).
             local_step = local_step_rel + skip_steps
-            timer.reset(self.global_step % self.config.log_freq == 0)
-
-            timer.mark_value("start", t_before_fetch)
             recovery.consume(batch, synchronize=True)
+            timer.mark("recovery")
             error_records = batch.pop("error_records", 0)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
@@ -709,6 +790,7 @@ class Trainer:
                     )
                 _draft_tokens, loss, metrics = self.model(**gpu_batch, **call_kwargs)
 
+            timer.mark("model")
             loss, metrics, active_ranks = self._prepare_supervised_loss(
                 loss, metrics, gpu_batch
             )
@@ -725,7 +807,6 @@ class Trainer:
                     epoch,
                     local_step,
                 )
-                t_before_fetch = time.perf_counter()
                 self._record_checkpoint_position(
                     epoch, local_step, complete=local_step == num_steps
                 )
@@ -746,32 +827,14 @@ class Trainer:
             }
             self._schedulers_step()
             timer.mark("opt")
-            t_before_fetch = timer.now() or time.perf_counter()
 
             profile = None
             if timer.enabled:
                 num_tokens = int((gpu_batch["document_ids"] != -1).sum().item())
                 profile = timer.profile(num_tokens)
-                if self.is_distributed:
-                    metrics = _all_reduce_metrics(metrics)
-
-                metrics = {k: v.item() for k, v in metrics.items()}
-                metrics = normalize_counted_metrics(metrics, active_ranks)
-                lr_info = (
-                    current_lrs
-                    if len(current_lrs) > 1
-                    else next(iter(current_lrs.values()))
-                )
-                metric_logger.info(
-                    {
-                        "train": metrics,
-                        "profile": profile,
-                        "epoch": epoch,
-                        "lr": lr_info,
-                        "global_step": self.global_step,
-                    },
-                    extra={"step": self.global_step},
-                )
+                if self.is_distributed and profile is not None:
+                    profile = timer.rank_summary(profile, loss.device)
+            self._log_training_step(epoch, metrics, active_ranks, current_lrs, profile)
             self.global_step += 1
             self._record_checkpoint_position(
                 epoch, local_step, complete=local_step == num_steps

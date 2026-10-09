@@ -1,4 +1,5 @@
 import logging
+from collections.abc import Sequence
 from typing import ClassVar
 
 import torch
@@ -127,6 +128,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         super().__init__(config=config)
         # Runtime-only training policy: never changes saved architecture or weights.
         self.activation_checkpointing = False
+        self.activation_checkpoint_layers: frozenset[int] | None = None
         self._init_vocab(config)
 
         tl_config = config.transformer_layer_config
@@ -457,9 +459,25 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         """Extension point for block-query conditioning; baseline is unchanged."""
         return noise_embedding
 
-    def set_activation_checkpointing(self, enabled: bool) -> None:
-        """Recompute decoder layers only; leave sampling, heads and loss unchanged."""
+    def set_activation_checkpointing(
+        self, enabled: bool, *, layer_ids: Sequence[int] | None = None
+    ) -> None:
+        """Select runtime-only decoder recomputation; ``None`` keeps all layers.
+
+        An explicit empty sequence selects no layers. Sampling, heads and loss
+        remain outside checkpointing, and model/checkpoint tensors are unchanged.
+        """
+        if layer_ids is not None and any(
+            type(index) is not int or not 0 <= index < len(self.layers)
+            for index in layer_ids
+        ):
+            raise ValueError(
+                f"Checkpoint layer IDs must be integers in [0, {len(self.layers) - 1}]"
+            )
         self.activation_checkpointing = enabled
+        self.activation_checkpoint_layers = (
+            None if layer_ids is None else frozenset(layer_ids)
+        )
 
     def _backbone_forward(
         self,
@@ -572,6 +590,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 self.activation_checkpointing
                 and self.training
                 and torch.is_grad_enabled()
+                and (
+                    self.activation_checkpoint_layers is None
+                    or layer_idx in self.activation_checkpoint_layers
+                )
             ):
                 # Bind the module and this call's inputs directly (no loop closure).
                 # Positional tensors let checkpoint detect NPU RNG/autocast state.

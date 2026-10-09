@@ -502,151 +502,7 @@ def _save_vllm_provenance(
             _warn(f"could not save {artifact}: {exc}")
 
 
-def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
-    """Build the Ascend bridge without applying CUDA vLLM render defaults."""
-    dsv4_manifest = None
-    dsv4_parallel = None
-    dsv4_runtime_quantization = None
-    if args.dsv4:
-        from importlib.metadata import entry_points  # noqa: PLC0415
-
-        from speculators_dsv4 import ARCHITECTURE, KV_CACHE_COMPAT_ENV  # noqa: PLC0415
-        from speculators_dsv4.contract import (  # noqa: PLC0415
-            DEFAULT_LAYERS,
-            ensure_manifest,
-            inspect_checkpoint,
-            make_manifest,
-            validate_layers,
-            wait_for_manifest,
-        )
-        from speculators_dsv4.execution import configure_execution_args  # noqa: PLC0415
-        from speculators_dsv4.parallel import (  # noqa: PLC0415
-            DP4_SIZE,
-            configure_parallel_args,
-        )
-
-        configure_execution_args(
-            vllm_args,
-            args.dsv4_execution_mode or "eager",
-            block_verify=args.dsv4_block_verify,
-        )
-        dsv4_parallel = configure_parallel_args(
-            vllm_args, os.environ, block_verify=args.dsv4_block_verify
-        )
-        if (
-            dsv4_parallel.data_parallel_size == DP4_SIZE
-            and args.hidden_states_backend == "file"
-            and not Path(args.hidden_states_path).is_absolute()
-        ):
-            raise ValueError(
-                "DSV4 multi-host HS export requires an absolute shared HS path."
-            )
-        report = inspect_checkpoint(args.model)
-        num_hidden_layers = report["config"]["num_hidden_layers"]
-        if (
-            args.hidden_states_backend not in {"file", "http", "mooncake"}
-            or not args.include_last_layer
-        ):
-            raise ValueError(
-                "DSV4 requires file/http/mooncake and --include-last-layer."
-            )
-        if args.dsv4_block_verify and args.hidden_states_backend != "file":
-            raise ValueError(
-                "DSV4 remote training backends cannot use block verification."
-            )
-        args.target_layer_ids = args.target_layer_ids or list(DEFAULT_LAYERS)
-        validate_layers(args.target_layer_ids)
-        dsv4_manifest = make_manifest(report, args.target_layer_ids)
-        quantization_parser = argparse.ArgumentParser(
-            add_help=False, allow_abbrev=False
-        )
-        quantization_parser.add_argument("--quantization", "-q")
-        quantization_args, _ = quantization_parser.parse_known_args(vllm_args)
-        dsv4_runtime_quantization = {"method": quantization_args.quantization}
-        if args.dsv4_block_verify:
-            sequence_parser = argparse.ArgumentParser(
-                add_help=False, allow_abbrev=False
-            )
-            sequence_parser.add_argument(
-                "--max-num-seqs", "--max_num_seqs", type=int, action="append"
-            )
-            sequence_args, _ = sequence_parser.parse_known_args(vllm_args)
-            if any(value < 1 for value in sequence_args.max_num_seqs or []):
-                raise ValueError(
-                    "DSV4 block verification requires positive max-num-seqs."
-                )
-            if sequence_args.max_num_seqs is None:
-                vllm_args.extend(["--max-num-seqs", "1"])
-        for arg in vllm_args:
-            if arg.split("=", 1)[0] in {
-                "--hf-overrides",
-                "--dtype",
-                "--speculative-config",
-                "--speculative_config",
-                "--kv-transfer-config",
-                "--kv_transfer_config",
-            }:
-                raise ValueError(
-                    "DSV4 HS bridge owns HF overrides and runtime dtype, "
-                    "speculative config and KV transfer config."
-                )
-        plugins = entry_points(group="vllm.general_plugins")
-        if not args.dry_run and not any(p.name == "speculators_dsv4" for p in plugins):
-            raise RuntimeError(
-                "Install this checkout in the vLLM environment: "
-                "pip install -e . --no-deps"
-            )
-        allowlist = os.environ.get("VLLM_PLUGINS")
-        if allowlist is not None and "speculators_dsv4" not in allowlist.split(","):
-            raise ValueError(
-                "Add speculators_dsv4 to VLLM_PLUGINS (preserve your Ascend plugins)."
-            )
-        vllm_args.extend(
-            [
-                "--hf-overrides",
-                json.dumps({"architectures": [ARCHITECTURE]}),
-                "--dtype",
-                "bfloat16",
-                "--no-enable-prefix-caching",
-            ]
-        )
-    else:
-        from transformers import AutoConfig  # noqa: PLC0415
-
-        config = AutoConfig.from_pretrained(args.model)
-        if hasattr(config, "text_config"):
-            config = config.text_config
-        num_hidden_layers = config.num_hidden_layers
-        if getattr(config, "model_type", None) == "deepseek_v4":
-            raise ValueError(
-                "Use --dsv4: native mean-only final HS is not a valid teacher."
-            )
-
-    if args.target_layer_ids:
-        target_layer_ids = args.target_layer_ids
-        if args.include_last_layer and num_hidden_layers not in target_layer_ids:
-            target_layer_ids.append(num_hidden_layers)
-        if dsv4_manifest is not None:
-            warnings.warn(
-                f"DSV4 export slots: {target_layer_ids}. Pass only auxiliary IDs "
-                f"{dsv4_manifest['auxiliary_hs_ids']} to training; "
-                "slot 43 is the separate teacher.",
-                stacklevel=2,
-            )
-        else:
-            warnings.warn(
-                f"Using custom target layer ids {target_layer_ids}. These "
-                "must also be explicitly passed into the training script.",
-                stacklevel=2,
-            )
-    else:
-        target_layer_ids = [
-            2,
-            num_hidden_layers // 2,
-            num_hidden_layers - 3,
-            num_hidden_layers,
-        ]
-
+def _build_extraction_cmd(model, target_layer_ids, kv_transfer_config, vllm_args):
     speculative_config = {
         "method": "extract_hidden_states",
         "num_speculative_tokens": 1,
@@ -654,9 +510,126 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
             "hf_config": {"eagle_aux_hidden_state_layer_ids": target_layer_ids}
         },
     }
+    return [
+        sys.executable,
+        "-m",
+        "vllm.entrypoints.cli.main",
+        "serve",
+        model,
+        "--speculative_config",
+        json.dumps(speculative_config),
+        "--kv_transfer_config",
+        json.dumps(kv_transfer_config),
+        *vllm_args,
+    ]
+
+
+def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
+    """Build the Ascend bridge without applying CUDA vLLM render defaults."""
+    from importlib.metadata import entry_points  # noqa: PLC0415
+
+    from speculators_dsv4 import ARCHITECTURE, KV_CACHE_COMPAT_ENV  # noqa: PLC0415
+    from speculators_dsv4.contract import (  # noqa: PLC0415
+        DEFAULT_LAYERS,
+        ensure_manifest,
+        inspect_checkpoint,
+        make_manifest,
+        validate_layers,
+        wait_for_manifest,
+    )
+    from speculators_dsv4.execution import configure_execution_args  # noqa: PLC0415
+    from speculators_dsv4.parallel import (  # noqa: PLC0415
+        DP4_SIZE,
+        configure_parallel_args,
+    )
+
+    configure_execution_args(
+        vllm_args,
+        args.dsv4_execution_mode or "eager",
+        block_verify=args.dsv4_block_verify,
+    )
+    dsv4_parallel = configure_parallel_args(
+        vllm_args, os.environ, block_verify=args.dsv4_block_verify
+    )
+    if (
+        dsv4_parallel.data_parallel_size == DP4_SIZE
+        and args.hidden_states_backend == "file"
+        and not Path(args.hidden_states_path).is_absolute()
+    ):
+        raise ValueError(
+            "DSV4 multi-host HS export requires an absolute shared HS path."
+        )
+    report = inspect_checkpoint(args.model)
+    num_hidden_layers = report["config"]["num_hidden_layers"]
+    if (
+        args.hidden_states_backend not in {"file", "http", "mooncake"}
+        or not args.include_last_layer
+    ):
+        raise ValueError("DSV4 requires file/http/mooncake and --include-last-layer.")
+    if args.dsv4_block_verify and args.hidden_states_backend != "file":
+        raise ValueError("DSV4 remote training backends cannot use block verification.")
+    args.target_layer_ids = args.target_layer_ids or list(DEFAULT_LAYERS)
+    validate_layers(args.target_layer_ids)
+    dsv4_manifest = make_manifest(report, args.target_layer_ids)
+    quantization_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+    quantization_parser.add_argument("--quantization", "-q")
+    quantization_args, _ = quantization_parser.parse_known_args(vllm_args)
+    dsv4_runtime_quantization = {"method": quantization_args.quantization}
+    if args.dsv4_block_verify:
+        sequence_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
+        sequence_parser.add_argument(
+            "--max-num-seqs", "--max_num_seqs", type=int, action="append"
+        )
+        sequence_args, _ = sequence_parser.parse_known_args(vllm_args)
+        if any(value < 1 for value in sequence_args.max_num_seqs or []):
+            raise ValueError("DSV4 block verification requires positive max-num-seqs.")
+        if sequence_args.max_num_seqs is None:
+            vllm_args.extend(["--max-num-seqs", "1"])
+    for arg in vllm_args:
+        if arg.split("=", 1)[0] in {
+            "--hf-overrides",
+            "--dtype",
+            "--speculative-config",
+            "--speculative_config",
+            "--kv-transfer-config",
+            "--kv_transfer_config",
+        }:
+            raise ValueError(
+                "DSV4 HS bridge owns HF overrides and runtime dtype, "
+                "speculative config and KV transfer config."
+            )
+    plugins = entry_points(group="vllm.general_plugins")
+    if not args.dry_run and not any(p.name == "speculators_dsv4" for p in plugins):
+        raise RuntimeError(
+            "Install this checkout in the vLLM environment: pip install -e . --no-deps"
+        )
+    allowlist = os.environ.get("VLLM_PLUGINS")
+    if allowlist is not None and "speculators_dsv4" not in allowlist.split(","):
+        raise ValueError(
+            "Add speculators_dsv4 to VLLM_PLUGINS (preserve your Ascend plugins)."
+        )
+    vllm_args.extend(
+        [
+            "--hf-overrides",
+            json.dumps({"architectures": [ARCHITECTURE]}),
+            "--dtype",
+            "bfloat16",
+            "--no-enable-prefix-caching",
+        ]
+    )
+
+    target_layer_ids = args.target_layer_ids
+    if num_hidden_layers not in target_layer_ids:
+        target_layer_ids.append(num_hidden_layers)
+    warnings.warn(
+        f"DSV4 export slots: {target_layer_ids}. Pass only auxiliary IDs "
+        f"{dsv4_manifest['auxiliary_hs_ids']} to training; "
+        "slot 43 is the separate teacher.",
+        stacklevel=2,
+    )
     backend_cls = _backend_registry[args.hidden_states_backend]
     kv_transfer_config = backend_cls.build_kv_transfer_config(args)
-    if dsv4_manifest is not None and args.hidden_states_backend == "mooncake":
+    if args.hidden_states_backend == "mooncake":
         from speculators_dsv4.mooncake_training import (  # noqa: PLC0415
             validate_namespace,
         )
@@ -700,54 +673,44 @@ def _build_dsv4_train_cmd(args, vllm_args):  # noqa: C901
             kv_transfer_config["kv_connector"] = REPLAY_CONNECTOR
             kv_transfer_config["kv_connector_module_path"] = REPLAY_CONNECTOR_MODULE
 
-    cmd = [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
-        args.model,
-        "--speculative_config",
-        json.dumps(speculative_config),
-        "--kv_transfer_config",
-        json.dumps(kv_transfer_config),
-        *vllm_args,
-    ]
+    cmd = _build_extraction_cmd(
+        args.model, target_layer_ids, kv_transfer_config, vllm_args
+    )
 
     disable_cp_arg = "--no-enable-chunked-prefill"
     if disable_cp_arg not in cmd:
         cmd.append(disable_cp_arg)
 
     def before_launch():
-        if dsv4_manifest is not None:
-            if args.hidden_states_backend == "mooncake":
-                # TP0 workers publish contracts into their live store after
-                # cache registration; neither host touches a shared HS path.
-                pass
-            elif (
-                args.hidden_states_backend == "file"
-                and dsv4_parallel.data_parallel_size == DP4_SIZE
-                and dsv4_parallel.headless
-            ):
-                print(
-                    "Waiting for the target head node's shared DSV4 HS manifest...",
-                    flush=True,
-                )
-                wait_for_manifest(
-                    args.hidden_states_path,
-                    dsv4_manifest,
-                    runtime_quantization=dsv4_runtime_quantization,
-                    timeout=args.dsv4_manifest_timeout or 300,
-                )
-            else:
-                ensure_manifest(
-                    args.hidden_states_path,
-                    dsv4_manifest,
-                    create=True,
-                    runtime_quantization=dsv4_runtime_quantization,
-                )
-            # Inherited by EngineCore/worker children. The general plugin must
-            # patch KV planning before initialization, not at model construction.
-            os.environ[KV_CACHE_COMPAT_ENV] = "1"
+        if args.hidden_states_backend == "mooncake":
+            # TP0 workers publish contracts into their live store after
+            # cache registration; neither host touches a shared HS path.
+            pass
+        elif (
+            args.hidden_states_backend == "file"
+            and dsv4_parallel.data_parallel_size == DP4_SIZE
+            and dsv4_parallel.headless
+        ):
+            print(
+                "Waiting for the target head node's shared DSV4 HS manifest...",
+                flush=True,
+            )
+            wait_for_manifest(
+                args.hidden_states_path,
+                dsv4_manifest,
+                runtime_quantization=dsv4_runtime_quantization,
+                timeout=args.dsv4_manifest_timeout or 300,
+            )
+        else:
+            ensure_manifest(
+                args.hidden_states_path,
+                dsv4_manifest,
+                create=True,
+                runtime_quantization=dsv4_runtime_quantization,
+            )
+        # Inherited by EngineCore/worker children. The general plugin must
+        # patch KV planning before initialization, not at model construction.
+        os.environ[KV_CACHE_COMPAT_ENV] = "1"
 
     return cmd, before_launch
 
@@ -791,28 +754,14 @@ def _build_train_cmd(args, vllm_args):
             f"distinct and within [0, {num_hidden_layers}]."
         )
 
-    speculative_config = {
-        "method": "extract_hidden_states",
-        "num_speculative_tokens": 1,
-        "draft_model_config": {
-            "hf_config": {"eagle_aux_hidden_state_layer_ids": target_layer_ids}
-        },
-    }
     backend_cls = _backend_registry[args.hidden_states_backend]
     kv_transfer_config = backend_cls.build_kv_transfer_config(args)
-
-    return [
-        sys.executable,
-        "-m",
-        "vllm.entrypoints.cli.main",
-        "serve",
+    return _build_extraction_cmd(
         args.model,
-        "--speculative_config",
-        json.dumps(speculative_config),
-        "--kv_transfer_config",
-        json.dumps(kv_transfer_config),
-        *_with_render_defaults(vllm_args),
-    ]
+        target_layer_ids,
+        kv_transfer_config,
+        _with_render_defaults(vllm_args),
+    )
 
 
 def _build_eval_cmd(args, vllm_args):
