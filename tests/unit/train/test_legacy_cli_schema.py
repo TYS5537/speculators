@@ -94,9 +94,7 @@ def test_checkpoint_frequency_invalid_values_fail_in_argparse(value, message, ca
     assert message in capsys.readouterr().err
 
 
-@pytest.mark.parametrize(
-    "name", ["sliding-window-non-causal", "activation-checkpointing"]
-)
+@pytest.mark.parametrize("name", ["activation-checkpointing"])
 def test_legacy_store_true_flags_do_not_gain_negative_spellings(name, capsys):
     parser = legacy_cli.build_train_parser()
     dest = name.replace("-", "_")
@@ -111,6 +109,17 @@ def test_legacy_store_true_flags_do_not_gain_negative_spellings(name, capsys):
     assert f"unrecognized arguments: --no-{name}" in capsys.readouterr().err
 
 
+def test_legacy_sliding_window_keeps_default_and_allows_explicit_causal_override():
+    parser = legacy_cli.build_train_parser()
+    assert parser.parse_args(_argv()).sliding_window_non_causal is False
+    assert parser.parse_args(
+        _argv("--sliding-window-non-causal")
+    ).sliding_window_non_causal
+    assert not parser.parse_args(
+        _argv("--no-sliding-window-non-causal")
+    ).sliding_window_non_causal
+
+
 @pytest.mark.parametrize(
     "flag",
     [
@@ -123,11 +132,6 @@ def test_legacy_store_true_flags_do_not_gain_negative_spellings(name, capsys):
         "--gradient-checkpointing",
         "--generation-validation-retries",
         "--max-consecutive-generation-failures",
-        "--conv-kernel-size",
-        "--conv-group-size",
-        "--selector-rank",
-        "--selector-top-k",
-        "--selector-loss-alpha",
     ],
 )
 def test_schema_only_flags_do_not_expand_legacy_cli(flag, capsys):

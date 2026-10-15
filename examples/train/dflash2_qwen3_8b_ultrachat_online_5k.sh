@@ -58,6 +58,7 @@ speculators prepare-data \
 echo "=== Step 2: Launching vLLM server ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
+    --provenance-dir "$OUTPUT_DIR/checkpoints" \
     -- --data-parallel-size 2 --port "$VLLM_PORT" &
 VLLM_PID=$!
 

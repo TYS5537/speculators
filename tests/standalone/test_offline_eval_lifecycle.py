@@ -304,6 +304,26 @@ class OfflineEvalLifecycleTests(unittest.TestCase):
                 self.assertEqual(self.evaluator.logger.warning.call_count, int(measure))
                 self.assert_dataset_contract(case)
 
+    def test_standalone_dflash2_loads_without_dspark_heads(self):
+        for backend in ("hf", "dsv4-vllm"):
+            with self.subTest(backend=backend), self.case(backend) as case:
+                case.config.speculators_model_type = "dflash2"
+                case.config.sample_from_anchor = False
+                del case.draft.correction_head
+                del case.draft.markov_head
+                case.draft.candidate_selector = object()
+
+                self.evaluator.run(case.args)
+
+                self.assertIs(case.event("draft_load")[1]["config"], case.config)
+                self.assertEqual(case.event("draft_load")[0], ("local-draft",))
+                log_args = self.evaluator.logger.info.call_args_list[0].args
+                self.assertEqual(log_args[1], "dflash2")
+                self.assertEqual(log_args[4], 2)
+                self.assertEqual(log_args[5], "none")
+                self.assertEqual(log_args[-2:], (True, True))
+                self.assert_dataset_contract(case)
+
     def test_dsv4_order_transport_arguments_and_client_lifetime(self):
         for mode, http in itertools.product(("reference", "block"), (False, True)):
             with (

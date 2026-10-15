@@ -1,6 +1,6 @@
-# Qwen3-4B: DSpark and bestarch MMuse
+# Qwen3-4B: DSpark, bestarch MMuse and DFlash2
 
-Four standalone scripts, matching the original "configuration at the top, command below" format. Edit each script directly. There is no `settings.sh`, `common.sh`, YAML dispatch or shared launch function. The upstream examples and Python trainer are unchanged.
+Five standalone scripts, matching the original "configuration at the top, command below" format. Edit each script directly. There is no `settings.sh`, `common.sh`, YAML dispatch or shared launch function.
 
 ## Configure and run
 
@@ -10,7 +10,7 @@ Run from the repository root. In `server.sh`, set `MODEL`, `VLLM_NPUS`, `VLLM_PO
 bash examples/train/qwen3_4b_bestarch/server.sh
 ```
 
-The defaults are Qwen3-4B, NPUs `0,1`, DP=2, port `8001`, and target layers `1 9 17 25 33`. All three trainers can reuse this one server: it does not need a draft checkpoint or optimizer setting. A compatible server already running does not need to be restarted. The script refuses an occupied endpoint, checks early exit/readiness timeout, records provenance, and stops its own server on exit.
+The defaults are Qwen3-4B, NPUs `0,1`, DP=2, port `8001`, and target layers `1 9 17 25 33`. All four trainers can reuse this one server: it does not need a draft checkpoint or optimizer setting. A compatible server already running does not need to be restarted. The script refuses an occupied endpoint, checks early exit/readiness timeout, records provenance, and stops its own server on exit.
 
 In the training script you want to run, set `MODEL`, `DATA_PATH`, `OUTPUT_DIR`, `VLLM_ENDPOINT`, `TRAIN_NPUS` and `NUM_TRAIN_NPUS`. Both model and target layers must match the server. The device count is explicit, just like the original script: when changing `TRAIN_NPUS`, change `NUM_TRAIN_NPUS` too. Choose **one**:
 
@@ -23,13 +23,16 @@ bash examples/train/qwen3_4b_bestarch/train_mmuse_legacy_optimizer.sh
 
 # MMuse bestarch, upstream Muon/AdamW grouping:
 bash examples/train/qwen3_4b_bestarch/train_mmuse_upstream_optimizer.sh
+
+# Standalone DFlash2, AdamW:
+bash examples/train/qwen3_4b_bestarch/train_dflash2.sh
 ```
 
 Each training script directly uses `nohup env ... torchrun ...` and prints the log path and PID; no extra `nohup` is needed. All default to NPUs `2,3,4,5,6,7` with six workers. Run them one at a time, waiting for the previous training process to finish. Printing a PID only means the background job was launched; check its log for errors.
 
 Logs, TensorBoard events and checkpoints are separated under `./output/qwen3_4b_bestarch/<variant>/`. For a repeat, edit `OUTPUT_DIR` to a new directory. Existing checkpoints or a training PID file cause refusal, not implicit resumption. In particular, the corrected AdamW DSpark recipe must not resume a previous Muon optimizer state. Training does not own or stop the server.
 
-Settings are literal assignments inside each script, not environment-variable overrides. To customize vocabulary size, add `--draft-vocab-size` directly to the training command if required; the supplied bestarch did not specify it. There are no launcher-specific `DRY_RUN` or `DUMP_CONFIG` modes.
+Settings are literal assignments inside each script, not environment-variable overrides. For DSpark/MMuse, add `--draft-vocab-size` directly to the training command if required; the supplied bestarch did not specify it. Standalone DFlash2 requires the full verifier vocabulary. There are no launcher-specific `DRY_RUN` or `DUMP_CONFIG` modes.
 
 ## Optimizers and architecture
 
@@ -38,6 +41,7 @@ Settings are literal assignments inside each script, not environment-variable ov
 | DSpark         | AdamW for all trainable parameters, including Markov | 6e-4 / 0                            | Cosine, 4% warmup                           |
 | MMuse legacy   | Muon + AdamW; Markov uses Muon                       | Muon 6e-4 / 0.1; AdamW 6e-5 / 0.01  | Original linear schedule, default 1% warmup |
 | MMuse upstream | Muon + AdamW; Markov uses AdamW                      | Same group settings as MMuse legacy | Same as MMuse legacy                        |
+| DFlash2        | AdamW for all trainable parameters, including selector | 6e-4 / 0                          | Cosine, 4% warmup                           |
 
 DSpark explicitly passes `--optimizer adamw` with no Muon flags. This follows the optimizer family in the [author's implementation](https://github.com/deepseek-ai/DeepSpec/blob/main/deepspec/utils/optim.py), with LR/decay/warmup from the [public Qwen3-4B recipe](https://github.com/deepseek-ai/DeepSpec/blob/main/config/dspark/dspark_qwen3_4b.py). It still uses the existing Speculators trainer and precision path, not DeepSpec's separate BF16/FP32-master optimizer wrapper. This is not a full reproduction of the paper's training setup.
 
@@ -47,7 +51,7 @@ The two MMuse commands differ only in `--muon-parameter-policy legacy/upstream` 
 
 ## Preserved local training budget
 
-All three retain `--training-recipe legacy`, `--loss-implementation legacy`, the original prepared 700k dataset, sequence length 3072, ten epochs, seed 42, six training devices, one update per packed batch (no gradient accumulation), 90% training / 10% validation, block size 7, at most 512 anchors, five draft layers, SDPA, rank-256 vanilla Markov, confidence head, CE/TV=0.1/0.9, noise std 0.05, and position weighting `exp(-position/7)`. All five draft layers use full attention.
+The DSpark and two MMuse trainers retain `--training-recipe legacy`, `--loss-implementation legacy`, the original prepared 700k dataset, sequence length 3072, ten epochs, seed 42, six training devices, one update per packed batch (no gradient accumulation), 90% training / 10% validation, block size 7, at most 512 anchors, five draft layers, SDPA, rank-256 vanilla Markov, confidence head, CE/TV=0.1/0.9, noise std 0.05, and position weighting `exp(-position/7)`. All five draft layers use full attention. DFlash2's matched budget and architecture differences are described below.
 
 There is no fixed global batch of 512 sequences. On six devices the packed text-token capacity is 6 * 3072 = 18,432 per update, including padding capacity but excluding synthetic draft anchor positions. The number of original samples depends on their lengths.
 
@@ -66,3 +70,25 @@ MMUSE_PROFILE_FORWARD=50 bash examples/train/qwen3_4b_bestarch/train_mmuse_upstr
 This prints a `MMuse forward profile` line on rank zero every 50 training forwards, beginning with call 0. The stages are `backbone`, `selector_conditioning`, `correction_markov`, `proposal_confidence`, `loss_metrics`, and `auxiliary`, each in milliseconds. The backbone stage includes verifier target-logit reconstruction and the initial draft LM-head projection; Correction includes its final projection and Markov collaboration. `call` is a process-local forward counter, not the saved global step; validation does not advance it. No TensorBoard writer or checkpoint field is added.
 
 Unset the variable or use `MMUSE_PROFILE_FORWARD=0` for normal training (the default). Profiling synchronizes the device between stages and can slow sampled steps; discard startup samples and compare steady-state end-to-end `fwd_ms` with profiling disabled. The stage total excludes the Trainer's post-forward supervision synchronization, so it is not identical to `fwd_ms`. Enabling profiling or changing source files does not update an already-running training process.
+
+## Standalone DFlash2 comparison
+
+`train_dflash2.sh` uses the same target server, 700k prepared dataset, six training NPUs, sequence length 3072, ten epochs and seed 42 as `train_dspark.sh`. It also matches AdamW (LR 6e-4, no weight decay), cosine scheduling with 4% warmup, five full-attention layers, SDPA, 512 anchors, noise 0.05 and unary CE/TV=0.1/0.9. The legacy recipe and loss implementation are explicit for Ascend runs.
+
+DFlash2 reserves slot 0 for the verified anchor, so block size 8 proposes seven tokens, matching DSpark's block-7 budget. Fixed exponential decay uses gamma 7 for the same prediction-position weights. Convolution uses kernel size 2 and group size 16; the rank-256 selector reranks 16 candidates, with selector loss weight 0.1. These are the standalone `--conv-*` / `--selector-*` options, not MMuse's `--dflash2-*` extensions.
+
+The run writes to `./output/qwen3_4b_bestarch/dflash2/` and refuses an existing checkpoint/PID directory. DFlash2 always uses the full verifier vocabulary and ignores pruning caches in the shared dataset directory. If DSpark or MMuse uses a pruned vocabulary, that remains an additional difference in the comparison. The selector objective is experimental; this is not a reproduction of an unpublished original training recipe.
+
+The script enables `--save-best`, which saves the best validation-loss checkpoint at `checkpoints/checkpoint_best`. For offline evaluation, use it with the shared evaluator's DFlash2 entry:
+
+```bash
+python scripts/evaluate/dflash2_offline_eval.py \
+    --verifier-model ../../Qwen3-4B \
+    --draft-model ./output/qwen3_4b_bestarch/dflash2/checkpoints/checkpoint_best \
+    --datasets-root /path/to/evaluation-jsonl \
+    --output-dir ./output/qwen3_4b_bestarch/dflash2/eval \
+    --device npu:0 --dtype bfloat16 --draft-attn-impl sdpa \
+    --temperature 0 --enable-thinking false
+```
+
+Use an available NPU after training has stopped, or adjust the device assignment. When publishing this run, include the shared server's `vllm_command.txt`, `vllm.patch` and `checkpoint_sha256.txt` from the directory printed/configured by `server.sh` alongside the training and evaluation provenance.

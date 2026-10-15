@@ -11,6 +11,7 @@ from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dflash2.config import DFlash2SpeculatorConfig
 from speculators.models.dflash2.metrics import (
     compute_metrics,
+    selector_greedy_path,
     selector_training_candidates,
 )
 from speculators.models.dflash2.model_definitions import (
@@ -85,6 +86,8 @@ class DFlash2DraftModel(DFlashDraftModel):
         **kwargs,
     ) -> "DFlash2DraftModel":
         """Create a DFlash2 model from the shared training arguments."""
+        if kwargs.get("sliding_window_non_causal") is None:
+            kwargs["sliding_window_non_causal"] = True
         config = DFlash2SpeculatorConfig(
             **cls._build_base_config_kwargs("dflash2", verifier_config, **kwargs),
             conv_kernel_size=kwargs.get("conv_kernel_size", 2),
@@ -114,6 +117,36 @@ class DFlash2DraftModel(DFlashDraftModel):
             "selector_loss_alpha": kwargs.get("selector_loss_alpha", 1.0),
         }
         return dict(shared), dict(shared)
+
+    def dflash2_select_candidates(
+        self,
+        logits: torch.Tensor,
+        hidden_states: torch.Tensor,
+        previous_token_ids: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Expose the standalone selector through the shared offline-eval API."""
+        return self.candidate_selector.select(logits, hidden_states, previous_token_ids)
+
+    def _prepare_missing_checkpoint_weights(self, loading_info: dict) -> None:
+        """Reject incomplete checkpoints instead of serving untrained modules."""
+        required_fragments = (
+            ".attention_conv.",
+            ".mlp_conv.",
+            "candidate_selector.",
+        )
+        missing_required = [
+            key
+            for key in loading_info.get("missing_keys", ())
+            if any(fragment in key for fragment in required_fragments)
+        ]
+        if missing_required:
+            preview_limit = 8
+            preview = ", ".join(missing_required[:preview_limit])
+            suffix = " ..." if len(missing_required) > preview_limit else ""
+            raise RuntimeError(
+                "DFlash2 checkpoint is missing trained convolution/selector "
+                f"weights: {preview}{suffix}"
+            )
 
     def _predecessor_ids(
         self,
@@ -181,6 +214,15 @@ class DFlash2DraftModel(DFlashDraftModel):
             predecessor_ids.reshape(1, -1),
             training_candidate_ids,
         )
+        greedy_path_ids = selector_greedy_path(
+            self.candidate_selector,
+            unary_logits,
+            hidden,
+            candidate_ids,
+            predecessor_ids[:, 0],
+            self.block_size,
+            sample_from_anchor=self.config.sample_from_anchor,
+        )
 
         loss, metrics = compute_metrics(
             unary_logits=unary_logits,
@@ -193,6 +235,8 @@ class DFlash2DraftModel(DFlashDraftModel):
             block_size=self.block_size,
             top_k=self.candidate_selector.top_k,
             sample_from_anchor=self.config.sample_from_anchor,
+            candidate_ids=candidate_ids,
+            greedy_path_ids=greedy_path_ids,
             loss_config=loss_config or _DEFAULT_LOSS_CONFIG,
             tv_loss_fn=tv_loss_fn,
             gamma=gamma,

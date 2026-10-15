@@ -1,5 +1,5 @@
 #!/bin/bash
-# Shared Qwen3-4B target server for all three training scripts.
+# Shared Qwen3-4B target server for DSpark, MMuse and standalone DFlash2.
 # Run from the repository root. Edit this file directly; no shared settings.
 set -euo pipefail
 

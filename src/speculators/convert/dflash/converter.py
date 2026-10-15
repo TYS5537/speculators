@@ -53,6 +53,8 @@ class DFlashConverter:
     verifier norm from the verifier model so the saved checkpoint is self-contained.
     """
 
+    model_class = DFlashDraftModel
+
     def convert(
         self,
         input_path: str | Path,
@@ -215,7 +217,7 @@ class DFlashConverter:
         weights: dict[str, torch.Tensor],
         output_path: str | Path,
     ) -> Path:
-        model = DFlashDraftModel(config=config)
+        model = self.model_class(config=config)
 
         body = {k: v for k, v in weights.items() if k not in ("t2d", "d2t")}
         body = self._remap_weights(body, config, model)
@@ -223,7 +225,7 @@ class DFlashConverter:
         if unexpected:
             raise ValueError(
                 "Unexpected keys in checkpoint -- the structure does not match "
-                f"DFlashDraftModel. Unexpected keys: {unexpected}"
+                f"{self.model_class.__name__}. Unexpected keys: {unexpected}"
             )
         critical_missing = [k for k in missing if k not in _VERIFIER_FILLED_KEYS]
         if critical_missing:
@@ -241,7 +243,7 @@ class DFlashConverter:
     def _validate(self, output_path: Path) -> None:
         logger.info("Validating converted DFlash checkpoint...")
         try:
-            model = DFlashDraftModel.from_pretrained(str(output_path))
+            model = self.model_class.from_pretrained(str(output_path))
         except (OSError, ValueError, RuntimeError) as exc:
             logger.error(f"Validation failed: {exc}")
             raise

@@ -6,7 +6,7 @@ analytical TV-overlap estimate over the unary logits.
 
 from collections.abc import Callable
 from functools import partial
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import functional
@@ -21,11 +21,51 @@ from speculators.losses import (
 from speculators.models.dspark.metrics import compute_metrics as compute_unary_metrics
 from speculators.models.metrics import compute_accepted_length_counts
 
+if TYPE_CHECKING:
+    from speculators.models.dflash2.model_definitions import CandidateSelector
+
 __all__ = [
     "compute_metrics",
     "compute_selector_loss",
+    "selector_greedy_path",
     "selector_training_candidates",
 ]
+
+
+@torch.no_grad()
+def selector_greedy_path(
+    selector: "CandidateSelector",
+    unary_logits: torch.Tensor,  # [1, num_anchors*block_size, vocab_size]
+    hidden_states: torch.Tensor,  # [1, num_anchors*block_size, hidden_size]
+    candidate_ids: torch.Tensor,  # [1, num_anchors*block_size, top_k]
+    anchor_token_ids: torch.Tensor,  # [num_anchors]
+    block_size: int,
+    *,
+    sample_from_anchor: bool = False,
+) -> torch.Tensor:
+    """Walk strict unary top-K candidates, feeding back each selected token.
+
+    Each block starts from its verified anchor. Recorded sequence predecessors
+    may differ from the selected path, especially on sampled training data, so
+    teacher-forced selector scores cannot be reused for this metric.
+    """
+    unary_blocks = unary_logits.reshape(-1, block_size, unary_logits.shape[-1])
+    hidden_blocks = hidden_states.reshape(-1, block_size, hidden_states.shape[-1])
+    candidate_blocks = candidate_ids.reshape(-1, block_size, candidate_ids.shape[-1])
+    previous_ids = anchor_token_ids.reshape(-1)
+    path_ids = previous_ids[:, None].expand(-1, block_size).clone()
+    start_pos = 0 if sample_from_anchor else 1
+    for position in range(start_pos, block_size):
+        candidates = candidate_blocks[:, position]
+        scores = selector.score_candidates(
+            unary_blocks[:, position],
+            hidden_blocks[:, position],
+            previous_ids,
+            candidates,
+        )
+        previous_ids = candidates.gather(-1, scores.argmax(dim=-1, keepdim=True))[:, 0]
+        path_ids[:, position] = previous_ids
+    return path_ids.reshape(unary_logits.shape[:-1])
 
 
 def selector_training_candidates(
@@ -124,6 +164,8 @@ def compute_metrics(
     top_k: int,
     sample_from_anchor: bool = False,
     *,
+    candidate_ids: torch.Tensor,  # strict unary top-K, before target injection
+    greedy_path_ids: torch.Tensor,  # self-conditioned selector predictions
     loss_config: LossConfig,
     tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
     gamma: float = 4.0,
@@ -169,7 +211,9 @@ def compute_metrics(
     with torch.no_grad():
         target_ids = targets.argmax(dim=-1)
         valid = loss_mask.to(torch.bool)
-        valid_float = valid.to(unary_logits.dtype)
+        # BF16 cannot represent every integer count in large anchored batches.
+        # Keep diagnostic numerators/denominators exact at normal batch sizes.
+        valid_float = valid.to(torch.float32)
         valid_total = valid_float.sum()
 
         metrics[f"unary_candidate_recall_at_{top_k}_sum"] = (
@@ -178,7 +222,7 @@ def compute_metrics(
         metrics[f"unary_candidate_recall_at_{top_k}_total"] = valid_total
 
         target_log_normalizer = torch.logsumexp(targets.float(), dim=-1)
-        candidate_target_logits = targets.gather(-1, training_candidate_ids).float()
+        candidate_target_logits = targets.gather(-1, candidate_ids).float()
         candidate_mass = torch.exp(
             torch.logsumexp(candidate_target_logits, dim=-1) - target_log_normalizer
         )
@@ -201,11 +245,10 @@ def compute_metrics(
         contains_target_blocks = contains_target.view(num_blocks, block_size)
         valid_blocks = valid.view(num_blocks, block_size)
 
-        # Teacher-forced predecessor tokens are exact while the greedy path is
-        # alive. Gate on the original unary candidate set because training may
-        # inject a missing target that would not be available during serving.
+        # Only the self-conditioned path uses the same predecessor tokens as
+        # serving. Training scores above remain teacher-forced for the loss.
         start_pos = 0 if sample_from_anchor else 1
-        selector_correct = teacher_forced_ids.eq(target_ids) & contains_target
+        selector_correct = greedy_path_ids.eq(target_ids) & contains_target
         eal_sum, eal_total = compute_accepted_length_counts(
             selector_correct.view(num_blocks, block_size)[:, start_pos:],
             valid_blocks[:, start_pos:],
@@ -213,24 +256,10 @@ def compute_metrics(
         metrics["eal_sum"] = eal_sum
         metrics["eal_total"] = eal_total
 
-        oracle_alive = torch.ones(
-            num_blocks, dtype=torch.bool, device=unary_logits.device
+        oracle_sum, oracle_total = compute_accepted_length_counts(
+            contains_target_blocks[:, start_pos:], valid_blocks[:, start_pos:]
         )
-        oracle_accepted_length = torch.ones(
-            num_blocks, dtype=torch.float32, device=unary_logits.device
-        )
-        for position in range(1, block_size):
-            oracle_alive = (
-                oracle_alive
-                & valid_blocks[:, position]
-                & contains_target_blocks[:, position]
-            )
-            oracle_accepted_length += oracle_alive.to(oracle_accepted_length.dtype)
-        block_valid = valid_blocks[:, 1:].any(dim=-1)
-        block_total = block_valid.sum().to(torch.float32)
-        metrics[f"unary_top_{top_k}_oracle_accepted_length_sum"] = (
-            oracle_accepted_length * block_valid
-        ).sum()
-        metrics[f"unary_top_{top_k}_oracle_accepted_length_total"] = block_total
+        metrics[f"unary_top_{top_k}_oracle_accepted_length_sum"] = oracle_sum
+        metrics[f"unary_top_{top_k}_oracle_accepted_length_total"] = oracle_total
 
     return loss, metrics

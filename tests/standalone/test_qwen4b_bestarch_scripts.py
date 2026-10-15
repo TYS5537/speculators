@@ -25,6 +25,8 @@ TRAINERS = (
     "train_mmuse_legacy_optimizer.sh",
     "train_mmuse_upstream_optimizer.sh",
 )
+DFLASH2_TRAINER = "train_dflash2.sh"
+ALL_TRAINERS = (*TRAINERS, DFLASH2_TRAINER)
 LAUNCH_MARKER = "# ============ Launch ============"
 
 
@@ -86,7 +88,7 @@ def preview_command(name, **settings):
     configuration, launch = recipe_source(name, settings).split(LAUNCH_MARKER, 1)
     pattern = (
         r'^nohup (env .*?) \\\n    > "\$LOG_FILE" 2>&1 &$'
-        if name in TRAINERS
+        if name in ALL_TRAINERS
         else r"^(env ASCEND_RT_VISIBLE_DEVICES=.*?) &\nVLLM_PID="
     )
     match = re.search(pattern, launch, flags=re.MULTILINE | re.DOTALL)
@@ -109,12 +111,12 @@ def training_arguments(name, **settings):
 
 @unittest.skipUnless(BASH, "Bash is required for shell wiring tests")
 class Qwen4BBestarchScriptTests(unittest.TestCase):
-    def test_four_standalone_scripts_without_shared_configuration(self):
+    def test_standalone_scripts_without_shared_configuration(self):
         self.assertEqual(
             {path.name for path in RECIPES.glob("*.sh")},
-            {*TRAINERS, "server.sh"},
+            {*ALL_TRAINERS, "server.sh"},
         )
-        for name in (*TRAINERS, "server.sh"):
+        for name in (*ALL_TRAINERS, "server.sh"):
             source = recipe_source(name)
             self.assertNotRegex(source, r"(?m)^\s*(?:source|\.)\s")
             self.assertNotIn("run_qwen4b_training", source)
@@ -161,7 +163,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         self.assertNotIn("--dflash-gated-layer-fusion", baseline)
 
     def test_all_trainers_use_full_attention_with_sdpa(self):
-        for name in TRAINERS:
+        for name in ALL_TRAINERS:
             with self.subTest(trainer=name):
                 args = training_arguments(name)
                 layers = int(args[args.index("--num-layers") + 1])
@@ -309,13 +311,13 @@ sleep() { command sleep 0.01; }
                 "DATA_PATH": str(root / "absent"),
                 "OUTPUT_DIR": output.as_posix(),
             }
-            for name in TRAINERS:
+            for name in ALL_TRAINERS:
                 missing = run_recipe(name, settings=settings)
                 self.assertEqual(missing.returncode, 2)
                 self.assertIn("Arrow data not found", missing.stderr)
             (output / "checkpoints").mkdir(parents=True)
             settings["DATA_PATH"] = data.as_posix()
-            for name in TRAINERS:
+            for name in ALL_TRAINERS:
                 existing = run_recipe(name, settings=settings)
                 self.assertEqual(existing.returncode, 2)
                 self.assertIn("already used", existing.stderr)
@@ -325,7 +327,7 @@ sleep() { command sleep 0.01; }
             root = Path(temporary)
             data = root / "prepared data"
             data.mkdir()
-            for name in TRAINERS:
+            for name in ALL_TRAINERS:
                 output = root / name
                 settings = {
                     "DATA_PATH": data.as_posix(),

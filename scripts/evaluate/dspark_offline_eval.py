@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline DSpark evaluation on JSONL datasets.
+"""Offline DSpark, MMuse, and standalone DFlash2 evaluation on JSONL datasets.
 
 This evaluator intentionally mirrors the training-time DSpark alignment in this
 repository.  In particular, DSpark defaults to ``sample_from_anchor=True``:
@@ -725,13 +725,13 @@ def generate_base_model_sample(
 
 
 def _load_draft_config(model_path):
-    """Resolve baseline DSpark and MMuse (including legacy enhanced DSpark)."""
+    """Resolve standalone DFlash2, DSpark, and MMuse checkpoint identities."""
     from speculators.config import SpeculatorModelConfig  # noqa: PLC0415
 
     config = SpeculatorModelConfig.from_pretrained(model_path)
-    if config.speculators_model_type not in ("dspark", "mmuse"):
+    if config.speculators_model_type not in ("dspark", "mmuse", "dflash2"):
         raise ValueError(
-            "This evaluator supports DSpark and MMuse checkpoints; "
+            "This evaluator supports DSpark, MMuse, and DFlash2 checkpoints; "
             f"received {config.speculators_model_type!r}."
         )
     return config
@@ -763,7 +763,7 @@ class DSparkOfflineRunner:
             "hidden",
         )
         self.uses_initial_correction_logits = bool(
-            draft_model.correction_head is not None
+            getattr(draft_model, "correction_head", None) is not None
             and not self.sample_from_anchor
             and correction_output_mode == "logits"
         )
@@ -858,7 +858,7 @@ class DSparkOfflineRunner:
         block = int(draft.block_size)
         if hidden_states.shape[1] != start:
             raise ValueError(
-                "DSpark context states must contain exactly the prefix before the "
+                "Draft context states must contain exactly the prefix before the "
                 f"current anchor; got length {hidden_states.shape[1]} and "
                 f"start={start}."
             )
@@ -966,7 +966,7 @@ class DSparkOfflineRunner:
         base_logits = (
             None
             if (
-                draft.correction_head is not None
+                getattr(draft, "correction_head", None) is not None
                 and getattr(draft, "candidate_selector", None) is None
                 and not reuse_base_logits
             )
@@ -1020,7 +1020,10 @@ class DSparkOfflineRunner:
         initial_previous_logits=None,
     ):
         draft = self.draft_model
-        if draft.correction_head is not None:
+        correction_head = getattr(draft, "correction_head", None)
+        candidate_selector = getattr(draft, "candidate_selector", None)
+        markov_head = getattr(draft, "markov_head", None)
+        if correction_head is not None:
             return self._sample_correction_tokens(
                 base_logits,
                 hidden_states,
@@ -1029,17 +1032,14 @@ class DSparkOfflineRunner:
             )
 
         if base_logits is None:
-            raise RuntimeError("Markov/plain DSpark evaluation requires base logits")
+            raise RuntimeError("Sequential/plain draft evaluation requires base logits")
         selector_search_mode = getattr(
             getattr(draft, "config", None),
             "dflash2_selector_search_mode",
             "greedy",
         )
-        if (
-            getattr(draft, "candidate_selector", None) is not None
-            and selector_search_mode == "global"
-        ):
-            if draft.markov_head is not None:
+        if candidate_selector is not None and selector_search_mode == "global":
+            if markov_head is not None:
                 raise RuntimeError(
                     "Global DFlash2 path search is not compatible with a standalone "
                     "predecessor-dependent Markov head; use Correction collaboration"
@@ -1077,24 +1077,24 @@ class DSparkOfflineRunner:
         for token_idx in range(self.max_proposal_tokens):
             slot = self.first_draft_slot + token_idx
             logits = base_logits[:, slot : slot + 1, :]
-            if draft.markov_head is not None:
-                if getattr(draft.markov_head, "head_type", None) == "rnn":
+            if markov_head is not None:
+                if getattr(markov_head, "head_type", None) == "rnn":
                     markov_previous_ids = torch.cat(
                         [markov_previous_ids, prev_token], dim=1
                     )
                     # Blocks are short: recompute the known prefix to retain RNN
                     # state without changing the training head or its weights.
-                    markov_bias = draft.markov_head.block_bias(
+                    markov_bias = markov_head.block_bias(
                         prev_token_ids=markov_previous_ids,
                         hidden_states=hidden_states[:, : slot + 1, :],
                     )[:, -1:, :]
                 else:
-                    markov_bias = draft.markov_head.block_bias(
+                    markov_bias = markov_head.block_bias(
                         prev_token_ids=prev_token,
                         hidden_states=hidden_states[:, slot : slot + 1, :],
                     )
                 logits = logits + markov_bias
-            if getattr(draft, "candidate_selector", None) is not None:
+            if candidate_selector is not None:
                 candidate_ids, candidate_logits = draft.dflash2_select_candidates(
                     logits,
                     hidden_states[:, slot : slot + 1, :],
@@ -1639,7 +1639,9 @@ def _load_dsv4_target(
 
 def _log_loaded_draft(draft_model, draft_config) -> None:
     """Validate the sequential head and report the loaded architecture."""
-    if draft_model.correction_head is not None:
+    correction_head = getattr(draft_model, "correction_head", None)
+    markov_head = getattr(draft_model, "markov_head", None)
+    if correction_head is not None:
         if not _is_preprojection_correction(draft_model):
             raise RuntimeError(
                 "Loaded checkpoint does not use the native causal CorrectionHead"
@@ -1647,10 +1649,10 @@ def _log_loaded_draft(draft_model, draft_config) -> None:
         sequential_head = (
             f"correction:{draft_config.correction_output_mode}"
             f"+markov:{draft_config.markov_head_type}"
-            if draft_model.markov_head is not None
+            if markov_head is not None
             else f"correction:{draft_config.correction_output_mode}"
         )
-    elif draft_model.markov_head is not None:
+    elif markov_head is not None:
         sequential_head = f"markov:{draft_config.markov_head_type}"
     else:
         sequential_head = "none"
@@ -1664,8 +1666,11 @@ def _log_loaded_draft(draft_model, draft_config) -> None:
         speculative_slots_for_draft(draft_model),
         sequential_head,
         bool(getattr(draft_config, "correction_lm_head_fusion", False)),
-        bool(getattr(draft_config, "dflash2_dynamic_conv", False)),
-        bool(getattr(draft_config, "dflash2_candidate_selector", False)),
+        bool(
+            draft_config.speculators_model_type == "dflash2"
+            or getattr(draft_config, "dflash2_dynamic_conv", False)
+        ),
+        getattr(draft_model, "candidate_selector", None) is not None,
     )
     logger.info(
         "Draft implementation: %s",

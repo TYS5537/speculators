@@ -39,6 +39,10 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
         "--dflash2-selector-greedy/--dflash2-selector-global"
     ),
     "dflash2_selector_loss_weight": "--dflash2-selector-loss-weight",
+    "conv_kernel_size": "--conv-kernel-size",
+    "conv_group_size": "--conv-group-size",
+    "selector_rank": "--selector-rank",
+    "selector_top_k": "--selector-top-k",
     "markov_rank": "--markov-rank",
     "markov_head_type": "--markov-head-type",
     "enable_correction_head": "--enable-correction-head",

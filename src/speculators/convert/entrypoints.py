@@ -7,6 +7,7 @@ research repositories:
 - EAGLE3
 - MTP
 - DFlash
+- DFlash2
 
 Functions:
     convert_model: Converts a model checkpoint to the Speculators format.
@@ -20,6 +21,7 @@ from loguru import logger
 from transformers import PretrainedConfig
 
 from speculators.convert.dflash.converter import DFlashConverter
+from speculators.convert.dflash2.converter import DFlash2Converter, is_dflash2_config
 from speculators.convert.eagle.eagle3_converter import Eagle3Converter
 from speculators.convert.mtp.converter import MTPConverter
 
@@ -29,7 +31,7 @@ __all__ = ["convert_model", "maybe_convert_external_checkpoint"]
 def convert_model(
     model: str,
     verifier: str,
-    algorithm: Literal["eagle3", "mtp", "dflash"],
+    algorithm: Literal["eagle3", "mtp", "dflash", "dflash2"],
     output_path: str = "converted",
     validate_device: str | None = None,
     **kwargs,
@@ -79,13 +81,13 @@ def convert_model(
     :param verifier: Verifier model checkpoint or Hugging Face model ID
         to attach as the verification/base model for speculative decoding
     :param algorithm: The conversion algorithm to use:
-        "eagle3", "mtp", or "dflash".
+        "eagle3", "mtp", "dflash", or "dflash2".
     :param output_path: Directory path where the converted model will be saved.
     :param kwargs: Additional keyword arguments for the conversion algorithm.
         Options for Eagle3: {"norm_before_residual": true,
         "eagle_aux_hidden_state_layer_ids": [1,23,44]}.
         Options for MTP: {"num_speculative_steps": 3}.
-        Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.
+        Options for DFlash/DFlash2: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.
     """
 
     if algorithm == "eagle3":
@@ -104,8 +106,9 @@ def convert_model(
             validate=validate_device is not None,
             **kwargs,
         )
-    elif algorithm == "dflash":
-        DFlashConverter().convert(
+    elif algorithm in ("dflash", "dflash2"):
+        converter = DFlash2Converter() if algorithm == "dflash2" else DFlashConverter()
+        converter.convert(
             model,
             output_path,
             verifier,
@@ -137,13 +140,17 @@ def maybe_convert_external_checkpoint(
         return str(model)
 
     architectures = config_dict.get("architectures") or []
-    algorithm: Literal["dflash"] = "dflash"
+    algorithm: Literal["dflash", "dflash2"] = (
+        "dflash2" if is_dflash2_config(config_dict) else "dflash"
+    )
     if not (
-        "dflash_config" in config_dict or any("DFlash" in a for a in architectures)
+        algorithm == "dflash2"
+        or "dflash_config" in config_dict
+        or any("DFlash" in a for a in architectures)
     ):
         raise NotImplementedError(
             f"Cannot auto-convert checkpoint '{model}': unrecognized external "
-            "format. Supported auto-conversion: DFlash."
+            "format. Supported auto-conversion: DFlash, DFlash2."
         )
 
     if verifier is None:

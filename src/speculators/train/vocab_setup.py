@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from speculators.config import SpeculatorModelConfig
 from speculators.models.utils import get_verifier_config
 from speculators.train.distributed import get_rank, is_distributed
 from speculators.train.vocab_mapping import (
@@ -57,10 +58,41 @@ def _save_vocab_mapping_atomically(path: Path, values: np.ndarray) -> None:
             temporary_path.unlink(missing_ok=True)
 
 
+def _full_dflash2_vocab_size(args: argparse.Namespace) -> int | None:
+    """Resolve DFlash2's unpruned vocabulary before consulting dataset caches."""
+    speculator_type = getattr(args, "speculator_type", None)
+    if getattr(args, "from_pretrained", None):
+        # Saved model type is authoritative even when --speculator-type was
+        # omitted or left at another algorithm's parser default.
+        saved = SpeculatorModelConfig.from_pretrained(args.from_pretrained)
+        speculator_type = saved.speculators_model_type
+    if speculator_type != "dflash2":
+        return None
+    if args.draft_vocab_size is not None or args.d2t_path or args.t2d_path:
+        raise ValueError(
+            "Standalone DFlash2 requires the full verifier vocabulary; omit "
+            "--draft-vocab-size, --d2t-path, and --t2d-path."
+        )
+    verifier_config = get_verifier_config(
+        args.verifier_name_or_path,
+        **(
+            {"trust_remote_code": True}
+            if getattr(args, "trust_remote_code", False)
+            else {}
+        ),
+    )
+    return verifier_config.vocab_size
+
+
 def _parse_vocab_mappings_local(
     args: argparse.Namespace, *, logger: logging.Logger | None = None
 ):
     logger = _LOGGER if logger is None else logger
+    full_vocab_size = _full_dflash2_vocab_size(args)
+    if full_vocab_size is not None:
+        # Data directories can be shared with pruned DSpark runs. Never pick up
+        # their cached mappings: DFlash2 selects candidates in target-vocab space.
+        return None, None, full_vocab_size
     if args.d2t_path or args.t2d_path:
         if not (args.d2t_path and args.t2d_path):
             raise ValueError(

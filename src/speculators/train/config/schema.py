@@ -517,17 +517,22 @@ class DFlash2Args(_Group):
     """DFlash2-exclusive local-convolution and candidate-selector knobs."""
 
     conv_kernel_size: int = Field(
-        default=2, description="DFlash2: local convolution kernel size."
+        default=2, ge=1, description="DFlash2: local convolution kernel size."
     )
     conv_group_size: int = Field(
-        default=16, description="DFlash2: channel group size for local convolution."
+        default=16,
+        ge=1,
+        description="DFlash2: channel group size for local convolution.",
     )
     selector_rank: int = Field(
         default=256,
+        ge=1,
         description="DFlash2: low-rank dimension of the candidate selector.",
     )
     selector_top_k: int = Field(
-        default=16, description="DFlash2: number of candidates retained per position."
+        default=16,
+        ge=1,
+        description="DFlash2: number of candidates retained per position.",
     )
     selector_loss_alpha: float = Field(
         default=1.0,
@@ -802,7 +807,7 @@ class TrainConfig(BaseSettings):
             if self.loss.loss_fn is None:
                 self.loss.loss_fn = "kl_div"
             if self.draft.num_layers is None:
-                self.draft.num_layers = 1
+                self.draft.num_layers = 5 if self.speculator_type == "dflash2" else 1
         if self.speculator_type in {"dspark", "mmuse"}:
             self._apply_legacy_dspark_defaults()
 

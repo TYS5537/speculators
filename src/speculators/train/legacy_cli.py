@@ -55,7 +55,9 @@ _LEGACY_FIELDS = """
     ttt_step_loss_decay loss_fn step_weight_beta seed hidden_states_dtype
     deterministic_cuda norm_before_residual embed_requires_grad norm_before_fc
     fc_norm norm_output block_size sample_from_anchor max_anchors dflash_decay_gamma
-    per_position_loss_weight dpace_alpha markov_rank markov_head_type
+    per_position_loss_weight dpace_alpha
+    conv_kernel_size conv_group_size selector_rank selector_top_k selector_loss_alpha
+    markov_rank markov_head_type
     enable_confidence_head confidence_head_with_markov confidence_detach_features
     confidence_head_alpha confidence_length_alpha confidence_loss_weighting
     first_error_focal_alpha adaptive_loss ssal_curriculum ssal_curriculum_start
@@ -83,7 +85,8 @@ _LEGACY_DEFAULTS = {
 }
 _LEGACY_HELP = {
     "speculator_type": "Type of speculator model to train "
-    "(eagle3, dflash, dspark, mmuse, peagle, mtp); muse is a legacy alias for mmuse",
+    "(eagle3, dflash, dflash2, dspark, mmuse, peagle, mtp); "
+    "muse is a legacy alias for mmuse",
     "epochs": "Training epochs (default: 20; DSpark paper default: 10).",
     "num_layers": "Draft decoder layers (default: 1; DSpark paper default: 5).",
     "block_size": "Draft block size (default: 8; DSpark paper default: 7).",
@@ -101,7 +104,7 @@ _LEGACY_HELP = {
     "(default: fixed-exp-decay).",
     "sliding_window_non_causal": "Use non-causal (bidirectional) masking within "
     "draft blocks for sliding window attention layers. Full attention layers are "
-    "always bidirectional. Note: vLLM currently doesn't support these models.",
+    "always bidirectional. Enabled by default for DFlash2; disabled otherwise.",
     "target_layer_ids": "(Optional) A (space separated) list of integer layer ids. "
     "Defaults to [2, num_hidden_layers // 2, num_hidden_layers - 3, "
     "num_hidden_layers]. "
@@ -145,7 +148,7 @@ def build_train_parser() -> argparse.ArgumentParser:
         "on_generate": {"type": None},
         "target_hidden_state_format": {"type": None},
         "per_position_loss_weight": {"type": None},
-        "sliding_window_non_causal": {"action": "store_true"},
+        "sliding_window_non_causal": {"action": argparse.BooleanOptionalAction},
         "activation_checkpointing": {"action": "store_true"},
         "checkpoint_freq": {"type": _checkpoint_freq},
     }
@@ -196,6 +199,13 @@ def _apply_training_defaults(args: argparse.Namespace, provided: set[str]) -> No
     """Apply the selected algorithm defaults without replacing explicit options."""
     if args.speculator_type in ("dspark", "mmuse"):
         _apply_dspark_paper_defaults(args, provided)
+    elif args.speculator_type == "dflash2":
+        if "num_layers" not in provided:
+            args.num_layers = 5
+        if "sliding_window_non_causal" not in provided:
+            args.sliding_window_non_causal = True
+        if args.sample_from_anchor is None:
+            args.sample_from_anchor = False
 
     is_eagle3 = args.speculator_type == "eagle3"
     if args.draft_arch is None:
@@ -208,12 +218,29 @@ def _apply_training_defaults(args: argparse.Namespace, provided: set[str]) -> No
         args.muon_lr = 10 * args.lr
 
 
+def _validate_dflash2_args(
+    parser: argparse.ArgumentParser, args: argparse.Namespace
+) -> None:
+    for field in (
+        "conv_kernel_size",
+        "conv_group_size",
+        "selector_rank",
+        "selector_top_k",
+    ):
+        if getattr(args, field) <= 0:
+            parser.error(f"--{field.replace('_', '-')} must be > 0")
+    if args.selector_loss_alpha < 0:
+        parser.error("--selector-loss-alpha must be >= 0")
+
+
 def _validate_training_args(
     parser: argparse.ArgumentParser, args: argparse.Namespace, provided: set[str]
 ) -> None:
     """Validate initialized arguments in the established CLI error order."""
     validate_draft_init_args(parser, args, provided)
     resolve_loss_config(args.loss_fn)
+    if args.speculator_type == "dflash2":
+        _validate_dflash2_args(parser, args)
 
     try:
         if args.from_pretrained:
@@ -281,6 +308,7 @@ def finalize_train_args(
         "epochs",
         "loss_fn",
         "num_layers",
+        "sliding_window_non_causal",
     }
     dspark_provided = explicitly_provided_dests(parser, dspark_default_dests, argv=argv)
     _apply_training_defaults(args, dspark_provided)

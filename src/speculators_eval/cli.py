@@ -6,7 +6,7 @@ from pathlib import Path
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Offline DSpark/MMuse evaluation on JSONL data.",
+        description="Offline DSpark/MMuse/DFlash2 evaluation on JSONL data.",
     )
     parser.add_argument("--verifier-model", required=True)
     parser.add_argument("--draft-model", required=True)
@@ -102,7 +102,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Also run verifier-only autoregressive decoding and report measured "
-            "DSpark output-throughput speedup."
+            "speculative output-throughput speedup."
         ),
     )
     parser.add_argument(

@@ -13,6 +13,7 @@ class AlgorithmChoice(str, Enum):
     eagle3 = "eagle3"
     mtp = "mtp"
     dflash = "dflash"
+    dflash2 = "dflash2"
 
 
 def convert(
@@ -60,7 +61,8 @@ def convert(
                 'Options for Eagle3: {"norm_before_residual": true, '
                 '"eagle_aux_hidden_state_layer_ids": [1,23,44]}. '
                 'Options for MTP: {"num_speculative_steps": 3}. '
-                'Options for DFlash: {"aux_hidden_state_layer_ids": [2,10,18,26,34]}.'
+                "Options for DFlash/DFlash2: "
+                '{"aux_hidden_state_layer_ids": [2,10,18,26,34]}.'
             ),
         ),
     ] = None,

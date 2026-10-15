@@ -31,7 +31,9 @@ The public DFlash2 implementation specifies inference but does not publish its t
 
 `--selector-loss-alpha` controls the second term. Both terms use the configured fixed exponential or D-PACE position weighting. The selector is never trained against a full-vocabulary corrected distribution, matching the candidate set it can rerank at serving time.
 
-Validation reports clearly separated unary candidate recall and target mass, teacher-forced selector accuracy, and an actual greedy self-conditioned path. The path begins at the verified anchor and feeds each selected token to the next edge score. Its per-position accuracy is conditioned on the earlier path being correct. The accepted-length metrics include the verified anchor and report both the realized selector path and the oracle unary-top-K path.
+Validation reports unary candidate recall and target mass, teacher-forced selector accuracy, and the accepted prefix of a greedy self-conditioned path. The path begins at the verified anchor and feeds each selected token to the next edge score. Accepted-length metrics include one verified/bonus token and report both the realized selector path and the oracle unary-top-K path. `accept_len` remains the analytical TV-overlap estimate from unary logits; `eal` uses the selector path.
+
+These training/validation path metrics use verifier logits and hidden states from the recorded sample prefixes. On sampled or off-policy data they remain proxies for serving acceptance; use offline evaluation for end-to-end acceptance. Candidate target mass is measured on the original unary top-K, without training-time target injection.
 
 DFlash2 currently requires the full verifier vocabulary. Pruned draft vocabularies are rejected because current serving implementations select candidates before any draft-to-target vocabulary mapping.
 
@@ -51,9 +53,46 @@ All [DFlash](dflash.md) backbone parameters also apply. DFlash2 defaults to five
 
 To train your own, see `examples/train/dflash2_qwen3_8b_ultrachat_online_5k.sh`.
 
+For the local Qwen3-4B Ascend comparison, use
+`examples/train/qwen3_4b_bestarch/server.sh` and
+`examples/train/qwen3_4b_bestarch/train_dflash2.sh`. The recipe uses six training
+devices, the existing 700k prepared dataset and sequence length 3072; see that
+directory's README for the complete DSpark comparison settings. Shared pruned
+vocabulary caches are ignored for standalone DFlash2. Both the typed training
+entrypoint and the legacy script accept standalone convolution/selector flags.
+
+## Checkpoint loading and offline evaluation
+
+Saved Speculators DFlash2 checkpoints load through `SpeculatorModel.from_pretrained`.
+Missing trained convolution or selector tensors are errors. When resuming, explicit
+convolution and selector shape options must match the checkpoint; omitted options
+inherit its saved values.
+
+External full-attention Qwen3-style DFlash2 checkpoints can be converted with:
+
+```bash
+speculators convert /path/to/external-dflash2 \
+    --verifier /path/to/verifier --algorithm dflash2 --output-path ./converted-dflash2
+```
+
+The converter accepts raw codebooks and Embedding-style `.weight` keys, reads
+draft options from either `dflash_config` or the top level, and preserves the
+source's target-layer selection. It rejects source sliding-window masks, causal
+full attention and non-default embedding/logit scaling, whose semantics the
+local backbone cannot currently reproduce. Convert external checkpoints before
+passing them to the training CLI.
+
+`scripts/evaluate/dflash2_offline_eval.py` reuses the shared offline evaluator for
+greedy or sampled verification. It evaluates the standalone selector without
+requiring DSpark's Markov or MMuse's Correction heads. Run it with `--help` for
+model, dataset and device options.
+
 ## Serving
 
-Checkpoints emitted here follow the public Z Lab weight contract but use a speculators config. They can be served in vLLM using `vllm serve ./checkpoint`.
+Checkpoints use the public DFlash2 weight names with a Speculators configuration.
+This repository supports training, checkpoint loading, conversion, and offline
+evaluation. Deployment in vLLM requires a compatible DFlash2 runtime and
+configuration loader; this adaptation has not validated vLLM serving compatibility.
 
 ## Research and Implementation Reference
 

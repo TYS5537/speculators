@@ -1,6 +1,6 @@
 """Public module boundaries and legacy entrypoint contracts without model imports."""
 
-# ruff: noqa: PT009 -- Keep this suite runnable with stdlib unittest.
+# ruff: noqa: PT009, PT027 -- Keep this suite runnable with stdlib unittest.
 
 import importlib.util
 import json
@@ -10,7 +10,8 @@ import tempfile
 import textwrap
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import ModuleType, SimpleNamespace
+from unittest.mock import Mock, patch
 
 from speculators_eval import cli, data, loading, parallel, reporting
 
@@ -108,6 +109,47 @@ class OfflineEvalModuleTests(unittest.TestCase):
         with patch.object(parallel, "run_ascend_data_parallel") as run:
             self.module.run_ascend_data_parallel(args)
         run.assert_called_once_with(args, entrypoint=EVALUATOR)
+
+    def test_config_loader_accepts_dflash2_without_weakening_other_type_checks(self):
+        package = ModuleType("speculators")
+        package.__path__ = []
+        config_module = ModuleType("speculators.config")
+        for model_type in ("dflash2", "dspark", "mmuse", "eagle3"):
+            config = SimpleNamespace(speculators_model_type=model_type)
+            config_module.SpeculatorModelConfig = SimpleNamespace(
+                from_pretrained=Mock(return_value=config)
+            )
+            with (
+                self.subTest(model_type=model_type),
+                patch.dict(
+                    sys.modules,
+                    {"speculators": package, "speculators.config": config_module},
+                ),
+            ):
+                if model_type == "eagle3":
+                    with self.assertRaisesRegex(ValueError, "received 'eagle3'"):
+                        self.module._load_draft_config("checkpoint")
+                else:
+                    self.assertIs(self.module._load_draft_config("checkpoint"), config)
+
+    def test_dflash2_entrypoint_help_uses_shared_parser(self):
+        result = subprocess.run(  # noqa: S603 -- Fixed entrypoint and interpreter.
+            [
+                sys.executable,
+                str(EVALUATOR.with_name("dflash2_offline_eval.py")),
+                "--help",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        self.assertIn("DSpark/MMuse/DFlash2", result.stdout)
+        for flag in (
+            "--draft-kv-reuse",
+            "--dsv4-verification-mode",
+            "--ascend-devices",
+        ):
+            self.assertIn(flag, result.stdout)
 
     def test_draft_cache_switch_reaches_hf_and_dsv4_workers(self):
         args = self.args()
