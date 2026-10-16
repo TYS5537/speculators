@@ -162,6 +162,21 @@ candidate passes validation. Failed overrides leave the original config and
 parsed arguments unchanged. Explicitly disabling a MMuse option still counts as
 an override and cannot add MMuse options to a baseline checkpoint.
 
+## FSDP compatibility
+
+`--fsdp-shard` can be combined with `--activation-checkpointing` without
+reducing `--block-size` or `--max-anchors`. FSDP shards model/optimizer state;
+activation checkpointing recomputes decoder layers. Neither option bounds the
+full-vocabulary logits or Correction/loss activation peak.
+
+The three learned scalar gates (`layer_fusion_gate`, `context_hidden_gate`,
+`correction_markov_scale`) are stored as one-element vectors because FSDP2
+rejects zero-dimensional parameters. Computation uses scalar views to retain
+the original mixed-precision type promotion and gradients. Old scalar gate
+weights and Adam moments are reshaped automatically when loading a model or
+resuming a training checkpoint; scalar optimizer step counters are unchanged.
+Unrelated checkpoint shape mismatches remain errors.
+
 ## Correction execution boundaries
 
 `CausalCorrectionHead.forward` validates embeddings/positions and cache length,

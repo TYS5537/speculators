@@ -681,7 +681,9 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         )
         dtype = float_dtype or raw_model.dtype
         for opt, state_dict in zip(optimizers, loaded_list, strict=True):
-            opt.load_state_dict(convert_optimizer_state_dtype(state_dict, dtype))
+            prepare = getattr(raw_model, "_prepare_optimizer_state_dict", None)
+            prepared = prepare(state_dict, optimizer=opt) if prepare else state_dict
+            opt.load_state_dict(convert_optimizer_state_dtype(prepared, dtype))
 
     @_rank0_only
     def save_checkpoint(
@@ -719,6 +721,9 @@ class DistributedCheckpointer(BaseCheckpointer):
         full_state_dict = convert_float_dtype(
             full_state_dict, float_dtype or model.dtype
         )
+        prepare = getattr(model, "_prepare_checkpoint_state_dict", None)
+        if prepare is not None:
+            full_state_dict = prepare(full_state_dict)
 
         # Note: `strict=False` because we don't load the verifier weights
         set_model_state_dict(
@@ -746,6 +751,9 @@ class DistributedCheckpointer(BaseCheckpointer):
         full_state_dict = convert_optimizer_state_dtype(
             full_state_dict, float_dtype or model.dtype
         )
+        prepare = getattr(model, "_prepare_optimizer_state_dict", None)
+        if prepare is not None:
+            full_state_dict = prepare(full_state_dict)
 
         set_optimizer_state_dict(
             model,

@@ -11,6 +11,7 @@ from speculators.models.dspark.model_definitions import (
 )
 from speculators.models.metrics import LossConfig, resolve_loss_config
 from speculators.models.mmuse.backbone import MMuseBackboneMixin
+from speculators.models.mmuse.checkpoint_compat import MMuseCheckpointMixin
 from speculators.models.mmuse.config import (
     MMuseSpeculatorConfig,
     validate_mmuse_options,
@@ -56,7 +57,7 @@ __all__ = [
 
 
 @SpeculatorModel.register("mmuse")
-class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
+class MMuseDraftModel(MMuseCheckpointMixin, MMuseBackboneMixin, DSparkDraftModel):
     """MMUSE: enhanced DFlash backbone with causal Correction and confidence.
 
     The legacy Markov path refines base logits. The causal Correction path can
@@ -107,7 +108,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
                 self.correction_markov_gate = torch.nn.Linear(
                     config.correction_hidden_size, 1
                 )
-                self.correction_markov_scale = torch.nn.Parameter(torch.zeros(()))
+                self.correction_markov_scale = torch.nn.Parameter(torch.zeros(1))
                 torch.nn.init.zeros_(self.correction_markov_gate.weight)
                 torch.nn.init.constant_(
                     self.correction_markov_gate.bias,
@@ -329,7 +330,7 @@ class MMuseDraftModel(MMuseBackboneMixin, DSparkDraftModel):
         local_gate = torch.sigmoid(
             self.correction_markov_gate(correction_states.to(gate_dtype))
         )
-        gate = torch.tanh(self.correction_markov_scale) * local_gate
+        gate = torch.tanh(self.correction_markov_scale.squeeze(0)) * local_gate
         collaborative_logits = correction_logits + (
             gate.to(markov_bias.dtype) * markov_bias
         )

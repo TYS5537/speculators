@@ -78,14 +78,15 @@ class MMuseBackboneMixin(MMuseSelectorMixin):
             )
             self.layer_fusion_score = nn.Linear(hidden_size, 1, bias=False)
             self.layer_fusion_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.layer_fusion_gate = nn.Parameter(torch.zeros(()))
+            # FSDP2 requires parameters to have at least one dimension.
+            self.layer_fusion_gate = nn.Parameter(torch.zeros(1))
 
     def _init_query_features(self, config, hidden_size: int) -> None:
         self.context_hidden_proj: nn.Linear | None = None
         self.context_hidden_gate: nn.Parameter | None = None
         if config.dflash_context_residual:
             self.context_hidden_proj = nn.Linear(hidden_size, hidden_size, bias=False)
-            self.context_hidden_gate = nn.Parameter(torch.zeros(()))
+            self.context_hidden_gate = nn.Parameter(torch.zeros(1))
 
         self.block_position_embedding: nn.Embedding | None = None
         if config.dflash_block_position_embedding:
@@ -171,7 +172,7 @@ class MMuseBackboneMixin(MMuseSelectorMixin):
         fused = (normalized * weights.unsqueeze(-1)).sum(dim=-2)
         fusion_residual = self.layer_fusion_proj(fused)
         projected = baseline_projection + (
-            torch.tanh(self.layer_fusion_gate) * fusion_residual
+            torch.tanh(self.layer_fusion_gate.squeeze(0)) * fusion_residual
         )
         return projected, layer_states
 
@@ -236,7 +237,7 @@ class MMuseBackboneMixin(MMuseSelectorMixin):
             ).unsqueeze(-1)
             residual = residual * valid_context.to(residual.dtype)
             noise_embedding = noise_embedding + (
-                torch.tanh(self.context_hidden_gate)
+                torch.tanh(self.context_hidden_gate.squeeze(0))
                 * residual.to(noise_embedding.dtype)
             )
 
