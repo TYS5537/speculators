@@ -55,9 +55,13 @@ To train your own, see `examples/train/dflash2_qwen3_8b_ultrachat_online_5k.sh`.
 
 For the local Qwen3-4B Ascend comparison, use
 `examples/train/qwen3_4b_bestarch/server.sh` and
-`examples/train/qwen3_4b_bestarch/train_dflash2.sh`. The recipe uses six training
-devices, the existing 700k prepared dataset and sequence length 3072; see that
-directory's README for the complete DSpark comparison settings. Shared pruned
+`examples/train/qwen3_4b_bestarch/train_dflash2.sh`. It retains DSpark's training
+budget: ten epochs, seven predicted tokens (DFlash2 block size 8), AdamW at
+6e-4, cosine scheduling with 4% warmup, sequence length 3072, 512 anchors,
+six training devices and the existing 700k prepared dataset. The unary loss
+uses DFlash-style CE, with gamma 7 position weighting and the experimental
+selector CE at weight 0.1. See that directory's README for the complete
+comparison settings. Shared pruned
 vocabulary caches are ignored for standalone DFlash2. Both the typed training
 entrypoint and the legacy script accept standalone convolution/selector flags.
 

@@ -1,5 +1,7 @@
 #!/bin/bash
 # Standalone DFlash2: the same data, devices and AdamW budget as train_dspark.sh.
+# Unary CE follows DFlash; selector loss remains a local DFlash2 choice.
+# Reference: https://arxiv.org/html/2602.06036v1
 # Run from the repository root. Edit this file directly; reuse server.sh.
 set -euo pipefail
 
@@ -41,8 +43,9 @@ CONV_KERNEL_SIZE=2
 CONV_GROUP_SIZE=16
 SELECTOR_RANK=256
 SELECTOR_TOP_K=16
+# DFlash has no selector. Retain this implementation's experimental K-way CE.
 SELECTOR_LOSS_ALPHA=0.1
-LOSS_FN='{"ce": 0.1, "tv": 0.9}'
+LOSS_FN='ce'
 # Match the seven prediction positions' weighting in the DSpark comparison.
 DECAY_GAMMA=7.0
 NOISE_STD=0.05

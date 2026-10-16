@@ -24,7 +24,7 @@ bash examples/train/qwen3_4b_bestarch/train_mmuse_legacy_optimizer.sh
 # MMuse bestarch, upstream Muon/AdamW grouping:
 bash examples/train/qwen3_4b_bestarch/train_mmuse_upstream_optimizer.sh
 
-# Standalone DFlash2, AdamW:
+# Standalone DFlash2, DSpark training budget with DFlash unary CE:
 bash examples/train/qwen3_4b_bestarch/train_dflash2.sh
 ```
 
@@ -51,7 +51,7 @@ The two MMuse commands differ only in `--muon-parameter-policy legacy/upstream` 
 
 ## Preserved local training budget
 
-The DSpark and two MMuse trainers retain `--training-recipe legacy`, `--loss-implementation legacy`, the original prepared 700k dataset, sequence length 3072, ten epochs, seed 42, six training devices, one update per packed batch (no gradient accumulation), 90% training / 10% validation, block size 7, at most 512 anchors, five draft layers, SDPA, rank-256 vanilla Markov, confidence head, CE/TV=0.1/0.9, noise std 0.05, and position weighting `exp(-position/7)`. All five draft layers use full attention. DFlash2's matched budget and architecture differences are described below.
+The DSpark and two MMuse trainers retain `--training-recipe legacy`, `--loss-implementation legacy`, the original prepared 700k dataset, sequence length 3072, ten epochs, seed 42, six training devices, one update per packed batch (no gradient accumulation), 90% training / 10% validation, block size 7, at most 512 anchors, five draft layers, SDPA, rank-256 vanilla Markov, confidence head, CE/TV=0.1/0.9, noise std 0.05, and position weighting `exp(-position/7)`. All five draft layers use full attention. DFlash2's matched budget, CE loss and architecture differences are described below.
 
 There is no fixed global batch of 512 sequences. On six devices the packed text-token capacity is 6 * 3072 = 18,432 per update, including padding capacity but excluding synthetic draft anchor positions. The number of original samples depends on their lengths.
 
@@ -71,11 +71,13 @@ This prints a `MMuse forward profile` line on rank zero every 50 training forwar
 
 Unset the variable or use `MMUSE_PROFILE_FORWARD=0` for normal training (the default). Profiling synchronizes the device between stages and can slow sampled steps; discard startup samples and compare steady-state end-to-end `fwd_ms` with profiling disabled. The stage total excludes the Trainer's post-forward supervision synchronization, so it is not identical to `fwd_ms`. Enabling profiling or changing source files does not update an already-running training process.
 
-## Standalone DFlash2 comparison
+## Standalone DFlash2 with DSpark training budget and DFlash CE
 
-`train_dflash2.sh` uses the same target server, 700k prepared dataset, six training NPUs, sequence length 3072, ten epochs and seed 42 as `train_dspark.sh`. It also matches AdamW (LR 6e-4, no weight decay), cosine scheduling with 4% warmup, five full-attention layers, SDPA, 512 anchors, noise 0.05 and unary CE/TV=0.1/0.9. The legacy recipe and loss implementation are explicit for Ascend runs.
+`train_dflash2.sh` matches `train_dspark.sh` in target server, prepared 700k dataset, six training NPUs, sequence length 3072, ten epochs and seed 42. It also matches AdamW (LR 6e-4, weight decay 0), cosine scheduling with 4% warmup, five full-attention layers, SDPA, 512 anchors and noise std 0.05. The existing trainer clips gradients at 1.0. The legacy recipe and loss implementation remain explicit for Ascend runs.
 
-DFlash2 reserves slot 0 for the verified anchor, so block size 8 proposes seven tokens, matching DSpark's block-7 budget. Fixed exponential decay uses gamma 7 for the same prediction-position weights. Convolution uses kernel size 2 and group size 16; the rank-256 selector reranks 16 candidates, with selector loss weight 0.1. These are the standalone `--conv-*` / `--selector-*` options, not MMuse's `--dflash2-*` extensions.
+DFlash2 reserves slot 0 for the verified anchor, so block size 8 proposes seven tokens, matching DSpark's block-7 budget. Fixed exponential decay keeps gamma 7 for the same prediction-position weights. Only the unary objective changes from CE/TV=0.1/0.9 to CE, following the [DFlash paper, Section 4.2](https://arxiv.org/html/2602.06036v1). The paper's six-epoch, block-16 Qwen3 training setup is not adopted here.
+
+The model remains DFlash2: convolution uses kernel size 2 and group size 16, and the rank-256 selector reranks 16 candidates. Its additional K-way CE loss keeps the local weight 0.1. The total training loss is unary CE plus 0.1 times selector CE, with position weighting; TV is no longer a training-loss term. TV-based acceptance diagnostics may still be reported. DFlash has no selector, and DFlash2's public article does not specify its training loss, so selector CE/weight 0.1 remain experimental. These are the standalone `--conv-*` / `--selector-*` options, not MMuse's `--dflash2-*` extensions.
 
 The run writes to `./output/qwen3_4b_bestarch/dflash2/` and refuses an existing checkpoint/PID directory. DFlash2 always uses the full verifier vocabulary and ignores pruning caches in the shared dataset directory. If DSpark or MMuse uses a pruned vocabulary, that remains an additional difference in the comparison. The selector objective is experimental; this is not a reproduction of an unpublished original training recipe.
 
