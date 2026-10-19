@@ -16,11 +16,12 @@ RUN_NAME="mmuse_legacy_http_2x6_bs15"
 TARGET_HOST="127.0.0.1"  # Each host uses its own local server_http.sh instance.
 VLLM_PORT=8001
 HS_HTTP_PORT=8002
+HTTP_TOKEN="ff7b93b9f2e5be1e3eb1c5448b37bb15d158b7b31c1c64a2ae2e6dd5244f9083"  # Shared with the server; keep the same value on both hosts.
 VLLM_ENDPOINT="http://${TARGET_HOST}:${VLLM_PORT}/v1"
 HS_HTTP_ENDPOINTS=("http://80.5.5.101:${HS_HTTP_PORT}" "http://80.5.5.137:${HS_HTTP_PORT}")
 HS_HTTP_TIMEOUT=120
 REQUEST_TIMEOUT=600
-# Credential only: export the same SPECULATORS_HS_HTTP_TOKEN on both machines.
+# The shared HTTP_TOKEN is exported to child processes during launch.
 export NO_PROXY="localhost,127.0.0.1,${TARGET_HOST}"
 export no_proxy="$NO_PROXY"
 TRAIN_NPUS="2,3,4,5,6,7"
@@ -71,11 +72,11 @@ if [[ "$TARGET_HOST" == "CHANGE_ME" || -z "$TARGET_HOST" ]]; then
     echo "Set TARGET_HOST to the target machine's private IP/DNS." >&2
     exit 2
 fi
-HTTP_TOKEN="${SPECULATORS_HS_HTTP_TOKEN:-}"
 if [[ ${#HTTP_TOKEN} -lt 32 ]]; then
-    echo "Export the shared SPECULATORS_HS_HTTP_TOKEN (at least 32 characters)." >&2
+    echo "Set the same HTTP_TOKEN in both HTTP scripts (at least 32 characters)." >&2
     exit 2
 fi
+export SPECULATORS_HS_HTTP_TOKEN="$HTTP_TOKEN"
 if [[ ! "$NUM_TRAIN_NODES" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_TRAIN_NODES must be positive." >&2
     exit 2

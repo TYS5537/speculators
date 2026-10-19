@@ -32,7 +32,7 @@ Each training script directly uses `nohup env ... torchrun ...` and prints the l
 
 Logs, TensorBoard events and checkpoints are separated under `./output/qwen3_4b_bestarch/<variant>/`. For a repeat, edit `OUTPUT_DIR` to a new directory. Existing checkpoints or a training PID file cause refusal, not implicit resumption. In particular, the corrected AdamW DSpark recipe must not resume a previous Muon optimizer state. Training does not own or stop the server.
 
-Settings are literal assignments inside each script, not environment-variable overrides. The HTTP pair reads its shared credential from `SPECULATORS_HS_HTTP_TOKEN`. For DSpark/MMuse, add `--draft-vocab-size` directly to the training command if required; the supplied bestarch did not specify it. Standalone DFlash2 requires the full verifier vocabulary. There are no launcher-specific `DRY_RUN` or `DUMP_CONFIG` modes.
+Settings are literal assignments inside each script, not environment-variable overrides. The HTTP pair includes the same prefilled `HTTP_TOKEN` and exports it internally as `SPECULATORS_HS_HTTP_TOKEN`. For DSpark/MMuse, add `--draft-vocab-size` directly to the training command if required; the supplied bestarch did not specify it. Standalone DFlash2 requires the full verifier vocabulary. There are no launcher-specific `DRY_RUN` or `DUMP_CONFIG` modes.
 
 ## MMuse legacy across two machines over HTTP
 
@@ -42,13 +42,7 @@ On each machine, check `MODEL` in both scripts and `DATA_PATH`/`OUTPUT_DIR` in t
 
 Both machines need local, unquantized Qwen3-4B checkpoint copies with identical config/index/weight bytes. Their directory paths can differ. The trainer still needs local embeddings, LM head and tokenizer. Startup computes a full checkpoint SHA256 on each host and checks the ordered auxiliary layers, teacher layer, geometry and BF16 contract before training; allow time for reading all weight shards. Copy the same prepared 700k dataset and vocabulary mappings to **both** machines.
 
-Generate one secret and export the **same value** in the server and training terminals on both machines. The secret must have at least 32 printable ASCII characters; it is not passed in command arguments or written into provenance:
-
-```bash
-# Run once, then copy this value securely to both machines:
-python -c "import secrets; print(secrets.token_hex(32))"
-export SPECULATORS_HS_HTTP_TOKEN='<paste that same generated value on both machines>'
-```
+The same generated 64-character `HTTP_TOKEN` is already filled into both HTTP scripts. Use the same script revision on both machines; no separate credential file or manual `export` is needed. The scripts export their configured value to the HTTP service and trainer internally, overriding any previous `SPECULATORS_HS_HTTP_TOKEN`. To change the token, update `HTTP_TOKEN` in both scripts on both machines and restart the services and trainers. This credential is part of the committed scripts.
 
 Run from the repository root on each machine:
 

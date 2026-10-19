@@ -14,6 +14,7 @@ export GLOO_SOCKET_IFNAME=lo
 MODEL="../../Qwen3-4B"  # Target-local copy; trainer copy must have identical bytes.
 VLLM_PORT=8001
 HS_HTTP_PORT=8002
+HTTP_TOKEN="ff7b93b9f2e5be1e3eb1c5448b37bb15d158b7b31c1c64a2ae2e6dd5244f9083"  # Shared with the trainer; keep the same value on both hosts.
 BIND_HOST="0.0.0.0"  # Use on a trusted LAN/VPN; both ports must reach the trainer.
 TARGET_LAYER_IDS=(1 9 17 25 33)
 VLLM_NPUS="0,1"
@@ -23,11 +24,11 @@ SERVER_PROVENANCE_DIR="./output/qwen3_4b_bestarch/server_http/$(date +%Y%m%d_%H%
 HS_PATH="$SERVER_PROVENANCE_DIR/hidden_states"
 
 # ============ Launch ============
-HTTP_TOKEN="${SPECULATORS_HS_HTTP_TOKEN:-}"
 if [[ ${#HTTP_TOKEN} -lt 32 ]]; then
-    echo "Export the shared SPECULATORS_HS_HTTP_TOKEN (at least 32 characters)." >&2
+    echo "Set the same HTTP_TOKEN in both HTTP scripts (at least 32 characters)." >&2
     exit 2
 fi
+export SPECULATORS_HS_HTTP_TOKEN="$HTTP_TOKEN"
 if [[ ! "$SERVER_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
     echo "SERVER_READY_TIMEOUT must be a positive number of seconds." >&2
     exit 2

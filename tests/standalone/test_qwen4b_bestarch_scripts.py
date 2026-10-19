@@ -240,13 +240,12 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         result = run_recipe(HTTP_TRAINER, settings={"TARGET_HOST": "CHANGE_ME"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("TARGET_HOST", result.stderr)
-        result = run_recipe(
-            HTTP_TRAINER,
-            settings={"TARGET_HOST": "192.0.2.10"},
-            prelude="unset SPECULATORS_HS_HTTP_TOKEN",
-        )
-        self.assertEqual(result.returncode, 2)
-        self.assertIn("SPECULATORS_HS_HTTP_TOKEN", result.stderr)
+        for name in (HTTP_SERVER, HTTP_TRAINER):
+            for token in ("", "short"):
+                with self.subTest(script=name, token=token):
+                    result = run_recipe(name, settings={"HTTP_TOKEN": token})
+                    self.assertEqual(result.returncode, 2)
+                    self.assertIn("HTTP_TOKEN", result.stderr)
 
     def test_http_two_nodes_join_one_job_with_six_workers_each(self):
         endpoints = ["http://192.0.2.10:8002", "http://192.0.2.11:8002"]
