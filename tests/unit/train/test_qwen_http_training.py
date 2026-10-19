@@ -269,3 +269,39 @@ def test_existing_directory_cannot_be_relabelled(target):
     changed["auxiliary_hs_ids"] = [1, 2]
     with pytest.raises(ValueError, match="another model/layer"):
         save_contract(target[0].directory, changed)
+
+
+@pytest.mark.parametrize("matching", [True, False])
+def test_two_target_hosts_must_match_before_local_download(target, tmp_path, matching):
+    peer_path = tmp_path / "peer-hs"
+    peer_contract = copy.deepcopy(target[1])
+    if not matching:
+        peer_contract["checkpoint_sha256"] = "a" * 64
+    save_contract(peer_path, peer_contract)
+    with QwenHiddenStatesServer(
+        ("127.0.0.1", 0), peer_path, TOKEN, training=True
+    ) as peer:
+        thread = threading.Thread(
+            target=peer.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        )
+        thread.start()
+        try:
+            transfer = QwenHttpTrainingTransfer(
+                [target[2], f"http://127.0.0.1:{peer.server_port}"],
+                TOKEN,
+                tmp_path / "downloads",
+                expected_contract=target[1],
+            )
+            if matching:
+                path, sample = publish(transfer, target[0])
+                loaded = transfer.get_generated(str(path))
+                assert torch.equal(loaded["hidden_states"], sample["hidden_states"])
+                transfer.delete(str(path))
+                assert not path.exists()
+                assert not list(peer_path.glob("*.safetensors"))
+            else:
+                with pytest.raises(ValueError, match="contract mismatch"):
+                    transfer.request_kwargs()
+        finally:
+            peer.shutdown()
+            thread.join(timeout=2)

@@ -36,7 +36,7 @@ Settings are literal assignments inside each script, not environment-variable ov
 
 ## MMuse legacy across two machines over HTTP
 
-Use `server_http.sh` on the target machine and `train_mmuse_legacy_optimizer_http.sh` on the training machine. This moves target inference and hidden-state extraction to the other machine; distributed draft training remains on the six devices of the training machine. Both machines need this revision of `speculators` and `hs_connectors` installed, with the existing Ascend/vLLM environment on the target. They do not need a shared filesystem.
+Use `server_http.sh` on the target machine and `train_mmuse_legacy_optimizer_http.sh` on the training machine. By default (`NUM_TRAIN_NODES=1`), target inference runs on the other machine and draft training uses six local devices. The next section configures both machines to run target inference and jointly train one draft. Both machines need this revision of `speculators` and `hs_connectors` installed, with the existing Ascend/vLLM environment on each target. They do not need a shared filesystem.
 
 On the target, edit `MODEL`, `VLLM_NPUS`, `VLLM_EXTRA_ARGS`, `BIND_HOST`, and the two ports in `server_http.sh`. On the trainer, edit `MODEL`, `DATA_PATH`, `OUTPUT_DIR`, `TARGET_HOST`, `TRAIN_NPUS`, and `NUM_TRAIN_NPUS`. `TARGET_HOST` must be the target machine's reachable IP/DNS. The trainer defaults to six devices `2,3,4,5,6,7`; these device IDs are local to that machine and may be changed independently of the target's devices. Keep the ports and `TARGET_LAYER_IDS` consistent between scripts.
 
@@ -67,6 +67,35 @@ Transport preserves BF16 hidden states and integer token IDs in safetensors; it 
 This new trainer defaults to **block size 15, 512 anchors, sequence length 3072, six training devices**, with `--fsdp-shard`, `--activation-checkpointing` and `TASK_QUEUE_ENABLE=1`. It retains the local MMuse legacy architecture, Muon/AdamW grouping, learning rates (6e-4/6e-5), weight decays (0.1/0.01), CE/TV loss and training budget. The four local trainers keep their existing block sizes. Moving the target to another machine does not bound the draft model's full-vocabulary loss/Correction memory; block-15 OOM can still require the diagnostics below.
 
 The target prints a unique provenance directory containing `vllm_command.txt`, `vllm.patch`, `checkpoint_sha256.txt` and `qwen3_hs_http.json`. The trainer saves its verified `qwen3_hs_http.json` in `OUTPUT_DIR/hs_downloads`, with the usual training command and patch under `OUTPUT_DIR/checkpoints`. Preserve both hosts' provenance together when publishing the run. Use a fresh output directory for each run.
+
+### Two 8-NPU machines: 4 target NPUs + 12 training NPUs
+
+Run **both** HTTP scripts on **each** machine: `server_http.sh` uses local NPUs `0,1` with DP=2, and the trainer uses local NPUs `2,3,4,5,6,7`. The two trainers join one 12-rank FSDP group. Each trainer requests hidden states from its own local vLLM server. This keeps bulk hidden-state traffic local; FSDP collectives still communicate across machines through HCCL.
+
+Edit these settings in `train_mmuse_legacy_optimizer_http.sh` on both machines. Replace documentation addresses `192.0.2.10`/`192.0.2.11` and `eth0` with real training-network addresses/interfaces:
+
+| Setting | Machine A | Machine B |
+| --- | --- | --- |
+| `NUM_TRAIN_NODES` | `2` | `2` |
+| `NUM_TRAIN_NPUS` | `6` (per machine) | `6` (per machine) |
+| `TRAIN_NPUS` | `"2,3,4,5,6,7"` | `"2,3,4,5,6,7"` |
+| `TRAIN_NODE_RANK` | `0` | `1` |
+| `TRAIN_MASTER_ADDR` | `"192.0.2.10"` | `"192.0.2.10"` |
+| `TRAIN_MASTER_PORT` | `34655` | `34655` |
+| `TRAIN_LOCAL_IP` | `"192.0.2.10"` | `"192.0.2.11"` |
+| `TRAIN_IFNAME` | A's Host NIC, e.g. `"eth0"` | B's Host NIC, e.g. `"eth0"` |
+| `TARGET_HOST` | `"127.0.0.1"` | `"127.0.0.1"` |
+| `HS_HTTP_ENDPOINTS` | `("http://192.0.2.10:8002" "http://192.0.2.11:8002")` | Same two endpoints |
+
+Both scripts must use the same `RUN_NAME`, master address/port, training hyperparameters, code/environment, complete prepared dataset (same row order/masks), and vocabulary mappings. The two HS endpoints let **each** machine verify **both** targets' checkpoint hashes/layers before joining training; a mismatched target is rejected. Local filesystem paths may differ. Use a fresh local `OUTPUT_DIR` on each machine.
+
+Start the target server on both machines and wait until both report ready. Then start the training script once on A and once on B; the first launcher waits for its peer. `NUM_TRAIN_NPUS` remains **6**, never 12: global workers are `NUM_TRAIN_NODES * NUM_TRAIN_NPUS`. The launcher supplies fixed node ranks to `torchrun` and disables automatic worker restarts. It rejects loopback training addresses/interfaces in multi-node mode. The HCCL device network must already be configured; HTTP reachability alone does not establish cross-machine training connectivity. Both HS ports, the rendezvous port and HCCL communication must be reachable on the trusted training network. See [torchrun](https://docs.pytorch.org/docs/2.9/elastic/run.html) and [Ascend Host interface selection](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/hcclug/hcclenvref_07_0022.html).
+
+Per-node logs, PIDs and `topology.txt` are under `OUTPUT_DIR/logs/node0` and `OUTPUT_DIR/logs/node1` on their respective hosts. Fresh-run model/optimizer checkpoints and training provenance are written on **A (global rank 0)**; both hosts participate in the save collectives. The script still refuses an existing run and uses `--no-resume-from-checkpoint`. To configure a later resume, first synchronize the **complete** checkpoint tree to both training hosts: current restore code reads model, optimizer, scheduler and progress files locally on every rank. Preserve both servers' provenance and both launchers' topology/logs.
+
+With sequence length 3072, input-token capacity per update changes from `6 * 3072 = 18,432` to `12 * 3072 = 36,864` (including padding; excluding synthetic draft positions). Updates per epoch generally decrease, so this is a different global batch budget from the six-card run. Learning rates are left at Muon `6e-4` / AdamW `6e-5`; no automatic scaling is applied. FSDP can shard model state across more ranks, but each rank still computes up to 512 block-15 anchors, so activation/loss memory does not halve automatically.
+
+The symmetric `2 target + 6 training` layout is preferred here over `4 target + 4 training` on A and `8 training` on B: it uses equal local worker counts and avoids pulling all of B's hidden states across the network. The asymmetric layout needs separate launch/topology validation; it is not what this recipe implements. Neither choice establishes a measured throughput advantage without a real NPU run.
 
 ## Optimizers and architecture
 

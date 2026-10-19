@@ -33,14 +33,19 @@ LAUNCH_MARKER = "# ============ Launch ============"
 
 
 def recipe_source(name, settings=None):
-    """Simulate editing scalar settings at the top, without modifying repo files."""
+    """Simulate editing settings at the top, without modifying repo files."""
     configuration, launch = (
         (RECIPES / name).read_text(encoding="utf-8").split(LAUNCH_MARKER, 1)
     )
     for key, value in (settings or {}).items():
+        quoted = (
+            "(" + " ".join(shlex.quote(item) for item in value) + ")"
+            if isinstance(value, (list, tuple))
+            else shlex.quote(value)
+        )
         configuration, count = re.subn(
             rf"^{re.escape(key)}=.*$",
-            lambda match, key=key, value=value: f"{key}={shlex.quote(value)}",
+            lambda match, key=key, quoted=quoted: f"{key}={quoted}",
             configuration,
             flags=re.MULTILINE,
         )
@@ -242,6 +247,125 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         )
         self.assertEqual(result.returncode, 2)
         self.assertIn("SPECULATORS_HS_HTTP_TOKEN", result.stderr)
+
+    def test_http_two_nodes_join_one_job_with_six_workers_each(self):
+        endpoints = ["http://192.0.2.10:8002", "http://192.0.2.11:8002"]
+        for node in (0, 1):
+            command = preview_command(
+                HTTP_TRAINER,
+                TARGET_HOST="127.0.0.1",
+                NUM_TRAIN_NODES="2",
+                TRAIN_NODE_RANK=str(node),
+                TRAIN_MASTER_ADDR="192.0.2.10",
+                HS_HTTP_ENDPOINTS=endpoints,
+            )
+            for flag, value in {
+                "--nnodes": "2",
+                "--node_rank": str(node),
+                "--nproc_per_node": "6",
+                "--master_addr": "192.0.2.10",
+                "--master_port": "34655",
+                "--max_restarts": "0",
+                "--vllm-endpoint": "http://127.0.0.1:8001/v1",
+            }.items():
+                self.assertEqual(command[command.index(flag) + 1], value)
+            self.assertNotIn("--standalone", command)
+            self.assertIn("ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7", command)
+            start = command.index("--hs-http-endpoints") + 1
+            self.assertEqual(command[start : start + 2], endpoints)
+            self.assertEqual(
+                command[command.index("--rdzv_id") + 1],
+                command[command.index("--run-name") + 1],
+            )
+
+    def test_http_multinode_rejects_invalid_topology_before_contacting_servers(self):
+        settings = {
+            "TARGET_HOST": "127.0.0.1",
+            "NUM_TRAIN_NODES": "2",
+            "TRAIN_NODE_RANK": "1",
+            "TRAIN_MASTER_ADDR": "192.0.2.10",
+            "TRAIN_LOCAL_IP": "192.0.2.11",
+            "TRAIN_IFNAME": "eth0",
+            "HS_HTTP_ENDPOINTS": [
+                "http://192.0.2.10:8002",
+                "http://192.0.2.11:8002",
+            ],
+        }
+        for invalid, message in (
+            ({"NUM_TRAIN_NODES": "0"}, "NUM_TRAIN_NODES"),
+            ({"TRAIN_NODE_RANK": "2"}, "TRAIN_NODE_RANK"),
+            ({"TRAIN_NODE_RANK": "-1"}, "TRAIN_NODE_RANK"),
+            ({"TRAIN_MASTER_ADDR": "127.0.0.1"}, "TRAIN_MASTER_ADDR"),
+            ({"TRAIN_LOCAL_IP": "CHANGE_ME"}, "TRAIN_LOCAL_IP"),
+            ({"TRAIN_IFNAME": "lo"}, "TRAIN_IFNAME"),
+            ({"HS_HTTP_ENDPOINTS": ["http://192.0.2.10:8002"]}, "HS_HTTP_ENDPOINTS"),
+            ({"TRAIN_MASTER_PORT": "65536"}, "TRAIN_MASTER_PORT"),
+        ):
+            with self.subTest(invalid=invalid):
+                result = run_recipe(
+                    HTTP_TRAINER,
+                    settings={**settings, **invalid},
+                    prelude=(
+                        "export SPECULATORS_HS_HTTP_TOKEN="
+                        "fixture-only-0123456789abcdef0123456789"
+                    ),
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_http_multinode_launch_records_local_network_and_both_targets(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            data = root / "data"
+            data.mkdir()
+            for node in (0, 1):
+                output = root / f"node{node}"
+                settings = {
+                    "TARGET_HOST": "127.0.0.1",
+                    "NUM_TRAIN_NODES": "2",
+                    "TRAIN_NODE_RANK": str(node),
+                    "TRAIN_MASTER_ADDR": "192.0.2.10",
+                    "TRAIN_LOCAL_IP": f"192.0.2.{10 + node}",
+                    "TRAIN_IFNAME": "eth0",
+                    "HS_HTTP_ENDPOINTS": [
+                        "http://192.0.2.10:8002",
+                        "http://192.0.2.11:8002",
+                    ],
+                    "DATA_PATH": data.as_posix(),
+                    "OUTPUT_DIR": output.as_posix(),
+                }
+                prelude = r"""
+export SPECULATORS_HS_HTTP_TOKEN=fixture-only-0123456789abcdef0123456789
+curl() { return 0; }
+python() { mkdir -p "$OUTPUT_DIR"; printf '%s\0' "$@" > "$OUTPUT_DIR/preflight.argv"; }
+nohup() {
+    printf '%s\n' "$GLOO_SOCKET_IFNAME" "$HCCL_SOCKET_IFNAME" "$HCCL_IF_IP" \
+        > "$LOG_DIR/network.txt"
+    printf '%s\0' "$@"
+}
+"""
+                result = run_recipe(
+                    HTTP_TRAINER, settings=settings, prelude=prelude, trailer="wait"
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn("Global training workers: 12", result.stdout)
+                logdir = output / "logs" / f"node{node}"
+                log = next(logdir.glob("train_*.log"))
+                self.assertEqual(
+                    log.read_text().rstrip("\0").split("\0"),
+                    preview_command(HTTP_TRAINER, **settings),
+                )
+                self.assertEqual(
+                    (logdir / "network.txt").read_text().splitlines(),
+                    ["eth0", "=eth0", settings["TRAIN_LOCAL_IP"]],
+                )
+                preflight = (output / "preflight.argv").read_text().split("\0")
+                for endpoint in settings["HS_HTTP_ENDPOINTS"]:
+                    self.assertIn(endpoint, preflight)
+                self.assertNotIn("fixture-only", (logdir / "topology.txt").read_text())
+                repeated = run_recipe(HTTP_TRAINER, settings=settings, prelude=prelude)
+                self.assertEqual(repeated.returncode, 2)
+                self.assertIn("already used", repeated.stderr)
 
     def test_server_matches_training_target_and_writes_provenance(self):
         server = preview_command("server.sh")
