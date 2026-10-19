@@ -324,7 +324,7 @@ class FP8Backend(HiddenStatesBackend):
 
 @HiddenStatesBackend.register("http")
 class HttpBackend(HiddenStatesBackend):
-    """DSV4 local target files served by the authenticated training sidecar."""
+    """Qwen3/DSV4 target files served by an authenticated training sidecar."""
 
     @staticmethod
     def add_train_args(parser: argparse.ArgumentParser) -> None:
@@ -366,7 +366,28 @@ class HttpBackend(HiddenStatesBackend):
         )
 
         if getattr(args, "target_hidden_state_format", None) != HS_FORMAT:
-            raise ValueError("The HTTP training backend currently requires DSV4.")
+            from speculators.remote_http import (  # noqa: PLC0415
+                QwenHttpTrainingTransfer,
+                checkpoint_contract,
+            )
+
+            if not args.hs_http_endpoints or not args.hidden_states_path:
+                raise ValueError(
+                    "HTTP HS requires --hs-http-endpoints and a trainer-local "
+                    "--hidden-states-path download directory."
+                )
+            if getattr(args, "on_generate", "delete") != "delete":
+                raise ValueError("Qwen HTTP HS requires --on-generate delete")
+            return QwenHttpTrainingTransfer(
+                args.hs_http_endpoints,
+                os.environ.get("SPECULATORS_HS_HTTP_TOKEN"),
+                args.hidden_states_path,
+                timeout=args.hs_http_timeout,
+                max_file_bytes=args.hs_http_max_file_bytes,
+                expected_contract=checkpoint_contract(
+                    args.verifier_name_or_path, args.target_layer_ids
+                ),
+            )
         if not args.hs_http_endpoints or not args.hidden_states_path:
             raise ValueError(
                 "HTTP HS requires --hs-http-endpoints and a trainer-local "

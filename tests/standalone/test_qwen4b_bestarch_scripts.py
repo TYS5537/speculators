@@ -27,6 +27,8 @@ TRAINERS = (
 )
 DFLASH2_TRAINER = "train_dflash2.sh"
 ALL_TRAINERS = (*TRAINERS, DFLASH2_TRAINER)
+HTTP_TRAINER = "train_mmuse_legacy_optimizer_http.sh"
+HTTP_SERVER = "server_http.sh"
 LAUNCH_MARKER = "# ============ Launch ============"
 
 
@@ -88,7 +90,7 @@ def preview_command(name, **settings):
     configuration, launch = recipe_source(name, settings).split(LAUNCH_MARKER, 1)
     pattern = (
         r'^nohup (env .*?) \\\n    > "\$LOG_FILE" 2>&1 &$'
-        if name in ALL_TRAINERS
+        if name in (*ALL_TRAINERS, HTTP_TRAINER)
         else r"^(env ASCEND_RT_VISIBLE_DEVICES=.*?) &\nVLLM_PID="
     )
     match = re.search(pattern, launch, flags=re.MULTILINE | re.DOTALL)
@@ -114,7 +116,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
     def test_standalone_scripts_without_shared_configuration(self):
         self.assertEqual(
             {path.name for path in RECIPES.glob("*.sh")},
-            {*ALL_TRAINERS, "server.sh"},
+            {*ALL_TRAINERS, "server.sh", HTTP_TRAINER, HTTP_SERVER},
         )
         for name in (*ALL_TRAINERS, "server.sh"):
             source = recipe_source(name)
@@ -188,6 +190,58 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         )
         self.assertEqual(old[old.index("--muon-parameter-policy") + 1], "legacy")
         self.assertEqual(new[new.index("--muon-parameter-policy") + 1], "upstream")
+
+    def test_http_trainer_preserves_legacy_objective_and_connects_both_services(self):
+        args = training_arguments(HTTP_TRAINER, TARGET_HOST="192.0.2.10")
+        original = training_arguments(TRAINERS[1])
+        for flag in (
+            "--optimizer",
+            "--muon-parameter-policy",
+            "--lr",
+            "--muon-lr",
+            "--weight-decay",
+            "--muon-weight-decay",
+            "--loss-fn",
+        ):
+            self.assertEqual(
+                args[args.index(flag) + 1], original[original.index(flag) + 1]
+            )
+        for flag, value in {
+            "--hidden-states-backend": "http",
+            "--vllm-endpoint": "http://192.0.2.10:8001/v1",
+            "--hs-http-endpoints": "http://192.0.2.10:8002",
+            "--block-size": "15",
+            "--max-anchors": "512",
+            "--on-generate": "delete",
+        }.items():
+            self.assertEqual(args[args.index(flag) + 1], value)
+        self.assertIn("--fsdp-shard", args)
+        self.assertIn("--activation-checkpointing", args)
+        self.assertNotIn("--target-hidden-state-format", args)
+
+    def test_http_server_uses_local_connector_explicit_bf16_and_teacher_slot(self):
+        args = preview_command(HTTP_SERVER)
+        for flag in ("--include-last-layer", "--provenance-dir"):
+            self.assertIn(flag, args)
+        for flag, value in {
+            "--hidden-states-backend": "file",
+            "--dtype": "bfloat16",
+            "--host": "0.0.0.0",  # noqa: S104 -- Expected LAN bind in a fixture.
+            "--served-model-name": "qwen3-4b-http",
+        }.items():
+            self.assertEqual(args[args.index(flag) + 1], value)
+
+    def test_http_missing_host_or_credential_fails_before_launch(self):
+        result = run_recipe(HTTP_TRAINER)
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("TARGET_HOST", result.stderr)
+        result = run_recipe(
+            HTTP_TRAINER,
+            settings={"TARGET_HOST": "192.0.2.10"},
+            prelude="unset SPECULATORS_HS_HTTP_TOKEN",
+        )
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("SPECULATORS_HS_HTTP_TOKEN", result.stderr)
 
     def test_server_matches_training_target_and_writes_provenance(self):
         server = preview_command("server.sh")

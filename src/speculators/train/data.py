@@ -340,7 +340,8 @@ class ArrowDataset(BaseDataset):
         remote_identity = getattr(self.transfer, "allow_model_name_relocation", False)
         if remote_identity:
             # The remote contract proves the weight identity despite host-local
-            # checkpoint paths or served-model aliases. Do not relax file/Qwen.
+            # checkpoint paths or served-model aliases. File transfers still
+            # require the explicit model name to match.
             self.transfer.setup()
         if self.model and self.model != model_id and not remote_identity:
             raise ValueError(
@@ -499,7 +500,7 @@ class ArrowDataset(BaseDataset):
 
     def _maybe_generate_hs(self, index: int) -> dict[str, torch.Tensor] | None:
         if getattr(self.transfer, "strict_errors", False):
-            # Remote DSV4 transports must never turn timeout/corruption into a
+            # Strict remote transports must never turn timeout/corruption into a
             # dropped training row or regenerate a sample behind the user's back.
             dataset_item = self._get_dataset_item(index)
             client_item = build_client_item(dataset_item, legacy_final_message=True)

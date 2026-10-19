@@ -1,6 +1,6 @@
 # Qwen3-4B: DSpark, bestarch MMuse and DFlash2
 
-Five standalone scripts, matching the original "configuration at the top, command below" format. Edit each script directly. There is no `settings.sh`, `common.sh`, YAML dispatch or shared launch function.
+Seven standalone scripts: four local trainers and their server, plus an MMuse legacy trainer/server pair for HTTP across machines. Each follows the original "configuration at the top, command below" format. Edit each script directly. There is no `settings.sh`, `common.sh`, YAML dispatch or shared launch function.
 
 ## Configure and run
 
@@ -32,7 +32,41 @@ Each training script directly uses `nohup env ... torchrun ...` and prints the l
 
 Logs, TensorBoard events and checkpoints are separated under `./output/qwen3_4b_bestarch/<variant>/`. For a repeat, edit `OUTPUT_DIR` to a new directory. Existing checkpoints or a training PID file cause refusal, not implicit resumption. In particular, the corrected AdamW DSpark recipe must not resume a previous Muon optimizer state. Training does not own or stop the server.
 
-Settings are literal assignments inside each script, not environment-variable overrides. For DSpark/MMuse, add `--draft-vocab-size` directly to the training command if required; the supplied bestarch did not specify it. Standalone DFlash2 requires the full verifier vocabulary. There are no launcher-specific `DRY_RUN` or `DUMP_CONFIG` modes.
+Settings are literal assignments inside each script, not environment-variable overrides. The HTTP pair reads its shared credential from `SPECULATORS_HS_HTTP_TOKEN`. For DSpark/MMuse, add `--draft-vocab-size` directly to the training command if required; the supplied bestarch did not specify it. Standalone DFlash2 requires the full verifier vocabulary. There are no launcher-specific `DRY_RUN` or `DUMP_CONFIG` modes.
+
+## MMuse legacy across two machines over HTTP
+
+Use `server_http.sh` on the target machine and `train_mmuse_legacy_optimizer_http.sh` on the training machine. This moves target inference and hidden-state extraction to the other machine; distributed draft training remains on the six devices of the training machine. Both machines need this revision of `speculators` and `hs_connectors` installed, with the existing Ascend/vLLM environment on the target. They do not need a shared filesystem.
+
+On the target, edit `MODEL`, `VLLM_NPUS`, `VLLM_EXTRA_ARGS`, `BIND_HOST`, and the two ports in `server_http.sh`. On the trainer, edit `MODEL`, `DATA_PATH`, `OUTPUT_DIR`, `TARGET_HOST`, `TRAIN_NPUS`, and `NUM_TRAIN_NPUS`. `TARGET_HOST` must be the target machine's reachable IP/DNS. The trainer defaults to six devices `2,3,4,5,6,7`; these device IDs are local to that machine and may be changed independently of the target's devices. Keep the ports and `TARGET_LAYER_IDS` consistent between scripts.
+
+Both machines need local, unquantized Qwen3-4B checkpoint copies with identical config/index/weight bytes. Their directory paths can differ. The trainer still needs local embeddings, LM head and tokenizer. Startup computes a full checkpoint SHA256 on each host and checks the ordered auxiliary layers, teacher layer, geometry and BF16 contract before training; allow time for reading all weight shards. Copy the same prepared 700k dataset and vocabulary mappings to the **training** machine.
+
+Generate one secret and export the **same value** in both terminals. The secret must have at least 32 printable ASCII characters; it is not passed in command arguments or written into provenance:
+
+```bash
+# Run once, then copy this value securely to both machines:
+python -c "import secrets; print(secrets.token_hex(32))"
+export SPECULATORS_HS_HTTP_TOKEN='<paste that same generated value on both machines>'
+```
+
+Run from the repository root on each machine:
+
+```bash
+# Target machine, foreground; leave this terminal running:
+bash examples/train/qwen3_4b_bestarch/server_http.sh
+
+# Training machine, after the target reports ready:
+bash examples/train/qwen3_4b_bestarch/train_mmuse_legacy_optimizer_http.sh
+```
+
+The target exposes vLLM on port **8001** and authenticated hidden-state downloads on port **8002**. Both must be reachable from the trainer. Use a trusted LAN/VPN: the supplied endpoints use plain HTTP and the vLLM port has no API-key authentication. `server_http.sh` starts the ordinary file connector plus a separate HTTP service, and stops its own two services on exit. Hidden-state files stay on the target until the trainer successfully downloads, validates and consumes them. Failed artifacts are retained for diagnosis. The trainer's `hs_downloads` is a local temporary download directory, not a mount of the target directory.
+
+Transport preserves BF16 hidden states and integer token IDs in safetensors; it adds no quantization or lossy compression. File SHA256/length and payload shape/dtype are checked. Auxiliary slots are `1 9 17 25 33`, followed by the final teacher slot (`36` for Qwen3-4B). Verified model identity allows the server name `qwen3-4b-http` to differ from the trainer's local checkpoint path.
+
+This new trainer defaults to **block size 15, 512 anchors, sequence length 3072, six training devices**, with `--fsdp-shard`, `--activation-checkpointing` and `TASK_QUEUE_ENABLE=1`. It retains the local MMuse legacy architecture, Muon/AdamW grouping, learning rates (6e-4/6e-5), weight decays (0.1/0.01), CE/TV loss and training budget. The four local trainers keep their existing block sizes. Moving the target to another machine does not bound the draft model's full-vocabulary loss/Correction memory; block-15 OOM can still require the diagnostics below.
+
+The target prints a unique provenance directory containing `vllm_command.txt`, `vllm.patch`, `checkpoint_sha256.txt` and `qwen3_hs_http.json`. The trainer saves its verified `qwen3_hs_http.json` in `OUTPUT_DIR/hs_downloads`, with the usual training command and patch under `OUTPUT_DIR/checkpoints`. Preserve both hosts' provenance together when publishing the run. Use a fresh output directory for each run.
 
 ## Optimizers and architecture
 

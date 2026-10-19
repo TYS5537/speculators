@@ -43,6 +43,7 @@ class HttpTrainingTransfer:
     strict_errors = True
     preserve_failed_artifacts = True
     allow_model_name_relocation = True
+    _validate_contract = staticmethod(validate_training_contract)
 
     def __init__(
         self,
@@ -64,7 +65,7 @@ class HttpTrainingTransfer:
         self.timeout = timeout
         self.max_file_bytes = max_file_bytes
         self.expected_contract = (
-            validate_training_contract(expected_contract)
+            self._validate_contract(expected_contract)
             if expected_contract is not None
             else None
         )
@@ -97,7 +98,7 @@ class HttpTrainingTransfer:
             for endpoint in self.endpoints
         ]
         contracts = [
-            validate_training_contract(client.read_manifest()) for client in clients
+            self._validate_contract(client.read_manifest()) for client in clients
         ]
         first = contracts[0]
         for contract in contracts[1:]:
@@ -122,7 +123,7 @@ class HttpTrainingTransfer:
 
     def read_contract(self):
         self.setup()
-        return validate_training_contract(self._contract)
+        return self._validate_contract(self._contract)
 
     def request_kwargs(self):
         self.setup()
