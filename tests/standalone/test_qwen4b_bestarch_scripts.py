@@ -197,7 +197,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         self.assertEqual(new[new.index("--muon-parameter-policy") + 1], "upstream")
 
     def test_http_trainer_preserves_legacy_objective_and_connects_both_services(self):
-        args = training_arguments(HTTP_TRAINER, TARGET_HOST="192.0.2.10")
+        args = training_arguments(HTTP_TRAINER)
         original = training_arguments(TRAINERS[1])
         for flag in (
             "--optimizer",
@@ -213,8 +213,8 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
             )
         for flag, value in {
             "--hidden-states-backend": "http",
-            "--vllm-endpoint": "http://192.0.2.10:8001/v1",
-            "--hs-http-endpoints": "http://192.0.2.10:8002",
+            "--vllm-endpoint": "http://127.0.0.1:8001/v1",
+            "--hs-http-endpoints": "http://80.5.5.101:8002",
             "--block-size": "15",
             "--max-anchors": "512",
             "--on-generate": "delete",
@@ -237,7 +237,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
             self.assertEqual(args[args.index(flag) + 1], value)
 
     def test_http_missing_host_or_credential_fails_before_launch(self):
-        result = run_recipe(HTTP_TRAINER)
+        result = run_recipe(HTTP_TRAINER, settings={"TARGET_HOST": "CHANGE_ME"})
         self.assertEqual(result.returncode, 2)
         self.assertIn("TARGET_HOST", result.stderr)
         result = run_recipe(
@@ -313,28 +313,79 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
 
-    def test_http_multinode_launch_records_local_network_and_both_targets(self):
+    def test_http_auto_node_detection_rejects_missing_or_ambiguous_addresses(self):
+        for addresses, expected_count in (
+            ("1: lo inet 127.0.0.1/8 scope host lo", 0),
+            (
+                "2: bond0 inet 80.5.5.101/24 scope global bond0\n"
+                "3: bond1 inet 80.5.5.137/24 scope global bond1",
+                2,
+            ),
+        ):
+            with self.subTest(addresses=addresses):
+                result = run_recipe(
+                    HTTP_TRAINER,
+                    prelude=(
+                        "export SPECULATORS_HS_HTTP_TOKEN="
+                        "fixture-only-0123456789abcdef0123456789\n"
+                        f"ip() {{ printf '%s\\n' {shlex.quote(addresses)}; }}"
+                    ),
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(
+                    f"exactly one local TRAIN_NODE_IPS address; found {expected_count}",
+                    result.stderr,
+                )
+
+    def test_http_auto_node_detection_rejects_failed_query_and_conflicting_settings(
+        self,
+    ):
+        credential = (
+            "export SPECULATORS_HS_HTTP_TOKEN=fixture-only-0123456789abcdef0123456789\n"
+        )
+        result = run_recipe(HTTP_TRAINER, prelude=credential + "ip() { return 1; }")
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("Cannot read local IPv4 interfaces", result.stderr)
+        for settings, message in (
+            ({"TRAIN_NODE_RANK": "0"}, "conflict with the detected local node"),
+            ({"TRAIN_LOCAL_IP": "80.5.5.101"}, "conflict with the detected local node"),
+            ({"TRAIN_IFNAME": "eth0"}, "conflict with the detected local node"),
+            ({"TRAIN_NODE_IPS": ["80.5.5.137"]}, "one ordered IP per training node"),
+        ):
+            with self.subTest(settings=settings):
+                result = run_recipe(
+                    HTTP_TRAINER,
+                    settings=settings,
+                    prelude=credential
+                    + (
+                        "ip() { printf '%s\\n' "
+                        "'2: bond0 inet 80.5.5.137/24 scope global bond0'; }"
+                    ),
+                )
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn(message, result.stderr)
+
+    def test_http_multinode_launch_detects_local_network_and_checks_both_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             data = root / "data"
             data.mkdir()
-            for node in (0, 1):
+            hosts = (("80.5.5.101", "bond0"), ("80.5.5.137", "enp1s0@if7"))
+            for node, (local_ip, address_interface) in enumerate(hosts):
+                interface = address_interface.split("@")[0]
                 output = root / f"node{node}"
                 settings = {
-                    "TARGET_HOST": "127.0.0.1",
-                    "NUM_TRAIN_NODES": "2",
-                    "TRAIN_NODE_RANK": str(node),
-                    "TRAIN_MASTER_ADDR": "192.0.2.10",
-                    "TRAIN_LOCAL_IP": f"192.0.2.{10 + node}",
-                    "TRAIN_IFNAME": "eth0",
-                    "HS_HTTP_ENDPOINTS": [
-                        "http://192.0.2.10:8002",
-                        "http://192.0.2.11:8002",
-                    ],
                     "DATA_PATH": data.as_posix(),
                     "OUTPUT_DIR": output.as_posix(),
                 }
-                prelude = r"""
+                addresses = (
+                    "1: lo inet 127.0.0.1/8 scope host lo\n"
+                    f"2: {address_interface} inet {local_ip}/24 "
+                    f"scope global {interface}"
+                )
+                prelude = (
+                    f"ip() {{ printf '%s\\n' {shlex.quote(addresses)}; }}\n"
+                    r"""
 export SPECULATORS_HS_HTTP_TOKEN=fixture-only-0123456789abcdef0123456789
 curl() { return 0; }
 python() { mkdir -p "$OUTPUT_DIR"; printf '%s\0' "$@" > "$OUTPUT_DIR/preflight.argv"; }
@@ -344,24 +395,32 @@ nohup() {
     printf '%s\0' "$@"
 }
 """
+                )
                 result = run_recipe(
                     HTTP_TRAINER, settings=settings, prelude=prelude, trailer="wait"
                 )
                 self.assertEqual(result.returncode, 0, result.stderr)
                 self.assertIn("Global training workers: 12", result.stdout)
+                self.assertIn(
+                    f"Training node {node}: {local_ip} on {interface}; "
+                    "master 80.5.5.101:34655",
+                    result.stdout,
+                )
                 logdir = output / "logs" / f"node{node}"
                 log = next(logdir.glob("train_*.log"))
                 self.assertEqual(
                     log.read_text().rstrip("\0").split("\0"),
-                    preview_command(HTTP_TRAINER, **settings),
+                    preview_command(
+                        HTTP_TRAINER, **settings, TRAIN_NODE_RANK=str(node)
+                    ),
                 )
                 self.assertEqual(
                     (logdir / "network.txt").read_text().splitlines(),
-                    ["eth0", "=eth0", settings["TRAIN_LOCAL_IP"]],
+                    [interface, f"={interface}", local_ip],
                 )
                 preflight = (output / "preflight.argv").read_text().split("\0")
-                for endpoint in settings["HS_HTTP_ENDPOINTS"]:
-                    self.assertIn(endpoint, preflight)
+                for host_ip, _ in hosts:
+                    self.assertIn(f"http://{host_ip}:8002", preflight)
                 self.assertNotIn("fixture-only", (logdir / "topology.txt").read_text())
                 repeated = run_recipe(HTTP_TRAINER, settings=settings, prelude=prelude)
                 self.assertEqual(repeated.returncode, 2)

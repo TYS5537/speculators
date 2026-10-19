@@ -1,5 +1,5 @@
 #!/bin/bash
-# MMuse Qwen3-4B, block 15: legacy optimizer with a remote HTTP target.
+# MMuse Qwen3-4B, block 15: two hosts, each with 2 target + 6 training NPUs.
 # Run from the repository root. Edit this file directly; no shared settings.
 set -euo pipefail
 
@@ -11,15 +11,13 @@ export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUN
 # ============ Configuration ============
 MODEL="../../Qwen3-4B"
 DATA_PATH="../../datasets/open_perfectblend_qwen3_4b_700k"
-OUTPUT_DIR="./output/qwen3_4b_bestarch/mmuse_legacy_http_bs15"
-RUN_NAME="mmuse_legacy_http_bs15"
-TARGET_HOST="CHANGE_ME"  # Private IP/DNS of the machine running server_http.sh.
+OUTPUT_DIR="./output/qwen3_4b_bestarch/mmuse_legacy_http_2x6_bs15"
+RUN_NAME="mmuse_legacy_http_2x6_bs15"
+TARGET_HOST="127.0.0.1"  # Each host uses its own local server_http.sh instance.
 VLLM_PORT=8001
 HS_HTTP_PORT=8002
 VLLM_ENDPOINT="http://${TARGET_HOST}:${VLLM_PORT}/v1"
-HS_HTTP_ENDPOINTS=("http://${TARGET_HOST}:${HS_HTTP_PORT}")
-# For two machines with 2 target + 6 training NPUs each, list BOTH HS services:
-# HS_HTTP_ENDPOINTS=("http://192.0.2.10:8002" "http://192.0.2.11:8002")
+HS_HTTP_ENDPOINTS=("http://80.5.5.101:${HS_HTTP_PORT}" "http://80.5.5.137:${HS_HTTP_PORT}")
 HS_HTTP_TIMEOUT=120
 REQUEST_TIMEOUT=600
 # Credential only: export the same SPECULATORS_HS_HTTP_TOKEN on both machines.
@@ -27,12 +25,13 @@ export NO_PROXY="localhost,127.0.0.1,${TARGET_HOST}"
 export no_proxy="$NO_PROXY"
 TRAIN_NPUS="2,3,4,5,6,7"
 NUM_TRAIN_NPUS=6  # LOCAL device count on each machine, not the global total.
-NUM_TRAIN_NODES=1  # Set 2 on both machines for 4 target + 12 training NPUs.
-TRAIN_NODE_RANK=0  # Set 0 on machine A and 1 on machine B.
-TRAIN_MASTER_ADDR="127.0.0.1"  # Both machines use A's reachable training IP.
+NUM_TRAIN_NODES=2
+TRAIN_NODE_IPS=("80.5.5.101" "80.5.5.137")  # Ordered: rank 0, rank 1.
+TRAIN_NODE_RANK="auto"  # Resolve from a locally assigned address in TRAIN_NODE_IPS.
+TRAIN_MASTER_ADDR="80.5.5.101"
 TRAIN_MASTER_PORT=34655
-TRAIN_IFNAME="lo"  # Multi-node: this machine's real Host communication NIC.
-TRAIN_LOCAL_IP="127.0.0.1"  # Multi-node: this machine's IP on TRAIN_IFNAME.
+TRAIN_IFNAME="auto"  # Resolve the interface owning that exact local IP.
+TRAIN_LOCAL_IP="auto"  # Resolve to .101 on the main host, .137 on the second.
 
 SEQ_LENGTH=3072
 EPOCHS=10
@@ -77,10 +76,46 @@ if [[ ${#HTTP_TOKEN} -lt 32 ]]; then
     echo "Export the shared SPECULATORS_HS_HTTP_TOKEN (at least 32 characters)." >&2
     exit 2
 fi
-if [[ ! "$NUM_TRAIN_NODES" =~ ^[1-9][0-9]*$ ||
-      ! "$TRAIN_NODE_RANK" =~ ^(0|[1-9][0-9]*)$ ]] ||
+if [[ ! "$NUM_TRAIN_NODES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_TRAIN_NODES must be positive." >&2
+    exit 2
+fi
+if [[ "$TRAIN_NODE_RANK" == "auto" || "$TRAIN_LOCAL_IP" == "auto" || "$TRAIN_IFNAME" == "auto" ]]; then
+    if (( ${#TRAIN_NODE_IPS[@]} != NUM_TRAIN_NODES )); then
+        echo "TRAIN_NODE_IPS must contain one ordered IP per training node." >&2
+        exit 2
+    fi
+    if ! command -v ip >/dev/null 2>&1 || ! HOST_IPV4="$(ip -o -4 addr show)"; then
+        echo "Cannot read local IPv4 interfaces; install iproute2 or set all TRAIN_NODE_RANK/TRAIN_LOCAL_IP/TRAIN_IFNAME explicitly." >&2
+        exit 2
+    fi
+    LOCAL_MATCHES=()
+    while read -r ADDR_INDEX ADDR_IFNAME ADDR_FAMILY ADDR_PREFIX ADDR_DETAILS; do
+        [[ "$ADDR_FAMILY" == "inet" ]] || continue
+        for NODE_INDEX in "${!TRAIN_NODE_IPS[@]}"; do
+            if [[ "${ADDR_PREFIX%/*}" == "${TRAIN_NODE_IPS[$NODE_INDEX]}" ]]; then
+                LOCAL_MATCHES+=("$NODE_INDEX|${ADDR_PREFIX%/*}|${ADDR_IFNAME%%@*}")
+            fi
+        done
+    done <<< "$HOST_IPV4"
+    if (( ${#LOCAL_MATCHES[@]} != 1 )); then
+        echo "Expected exactly one local TRAIN_NODE_IPS address; found ${#LOCAL_MATCHES[@]}. Check the host/container network." >&2
+        exit 2
+    fi
+    IFS='|' read -r DETECTED_RANK DETECTED_IP DETECTED_IFNAME <<< "${LOCAL_MATCHES[0]}"
+    if [[ "$TRAIN_NODE_RANK" != "auto" && "$TRAIN_NODE_RANK" != "$DETECTED_RANK" ]] ||
+       [[ "$TRAIN_LOCAL_IP" != "auto" && "$TRAIN_LOCAL_IP" != "$DETECTED_IP" ]] ||
+       [[ "$TRAIN_IFNAME" != "auto" && "$TRAIN_IFNAME" != "$DETECTED_IFNAME" ]]; then
+        echo "TRAIN_NODE_RANK/TRAIN_LOCAL_IP/TRAIN_IFNAME conflict with the detected local node ($DETECTED_RANK, $DETECTED_IP, $DETECTED_IFNAME)." >&2
+        exit 2
+    fi
+    TRAIN_NODE_RANK="$DETECTED_RANK"
+    TRAIN_LOCAL_IP="$DETECTED_IP"
+    TRAIN_IFNAME="$DETECTED_IFNAME"
+fi
+if [[ ! "$TRAIN_NODE_RANK" =~ ^(0|[1-9][0-9]*)$ ]] ||
    (( TRAIN_NODE_RANK >= NUM_TRAIN_NODES )); then
-    echo "NUM_TRAIN_NODES must be positive; TRAIN_NODE_RANK must be in [0, nodes)." >&2
+    echo "TRAIN_NODE_RANK must be in [0, NUM_TRAIN_NODES)." >&2
     exit 2
 fi
 if [[ ! "$TRAIN_MASTER_PORT" =~ ^[1-9][0-9]*$ ]] ||
@@ -109,6 +144,7 @@ if (( NUM_TRAIN_NODES > 1 )); then
     export HCCL_IF_IP="$TRAIN_LOCAL_IP"
 fi
 export GLOO_SOCKET_IFNAME="$TRAIN_IFNAME"
+echo "Training node $TRAIN_NODE_RANK: $TRAIN_LOCAL_IP on $TRAIN_IFNAME; master $TRAIN_MASTER_ADDR:$TRAIN_MASTER_PORT"
 # Fresh-run comparisons: never resume a different optimizer's state.
 if [[ ! "$TRAIN_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ||
       ! "$NUM_TRAIN_NPUS" =~ ^[1-9][0-9]*$ ||
