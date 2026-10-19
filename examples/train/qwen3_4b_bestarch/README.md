@@ -57,6 +57,32 @@ There is no fixed global batch of 512 sequences. On six devices the packed text-
 
 These scripts reuse prepared data and existing vocabulary mappings; they do not regenerate datasets. Without explicit vocabulary sizing, existing `d2t.npy`/`t2d.npy` are reused, otherwise the full target vocabulary is used. Preserve the original tokenizer/template/thinking masks and use identical data/mapping files for MMuse comparisons. DSpark versus MMuse is not an architecture-only ablation because optimizer/LR/decay/schedule differ. No pre-refactor bitwise parity is promised.
 
+## MMuse NPU memory troubleshooting
+
+Both MMuse scripts use `TASK_QUEUE_ENABLE=1`. Ascend's level-2 queue mode can
+increase peak memory through concurrent workspace use; see the
+[Ascend pipeline documentation](https://www.hiascend.com/doc_center/source/en/mindstudio/830/practicalcases/GeneralPerformanceIssue/toolsample6_054.html).
+Changing this setting affects scheduling and throughput, not the training
+objective, anchor count, optimizer settings or requested precision.
+
+For block size 15 with 512 anchors, add both `--fsdp-shard` and
+`--activation-checkpointing` to the training command. They reduce model-state
+and decoder-activation memory, but do not bound full-vocabulary loss or
+Correction intermediates. With the full 151936-token vocabulary, a single
+`[512 * 15, 151936]` FP32 tensor occupies about 4.35 GiB. This is a tensor-size
+estimate, not a measurement of an operator's workspace or total peak memory.
+
+If a run reports `NPUWorkspaceAllocator` OOM with asynchronous-stack warnings,
+first change `TASK_QUEUE_ENABLE=2` to `1` **inside the script** and restart in a
+fresh output directory. An environment prefix outside the script is overwritten
+by its literal assignments. Keep block size, anchors, losses and learning rates
+unchanged for this retry. If it still fails, set `ASCEND_LAUNCH_BLOCKING=1` inside
+the script for a short diagnostic run to locate the failing operator, then return
+it to `0` for normal training. Blocking changes execution timing and can hide a
+concurrency-related peak; completing that diagnostic run alone does not validate
+normal asynchronous training. A traceback surfacing in FSDP allocation or event
+handling does not establish that FSDP's communication buffer caused the OOM.
+
 ## Optional MMuse forward profiling
 
 The normal training path skips the unused greedy Selector walk in `corrected` teacher forcing and does not compute base diagnostics that would be discarded by the compact logger. Static Selector conditioning, standalone Selector proposals, actual inference rollout, losses and checkpoint parameter names/shapes are unchanged. Full base diagnostics remain available during validation with `--correction-base-diagnostics`. DSpark's implementation is unchanged.

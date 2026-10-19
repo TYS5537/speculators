@@ -5,7 +5,8 @@ set -euo pipefail
 
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
-export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
+# Level 2 can raise NPU workspace memory peaks during large-block backward.
+export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
 export NO_PROXY=localhost,127.0.0.1,80.5.5.45,80.5.5.44,80.5.5.54
 export no_proxy="$NO_PROXY"
 export MASTER_ADDR=127.0.0.1
