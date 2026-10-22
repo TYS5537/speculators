@@ -21,6 +21,8 @@ test-mmuse:
 		tests/unit/test_model.py \
 		tests/unit/convert/test_entrypoints.py \
 		tests/unit/models/test_checkpoint_key_ownership.py \
+		tests/unit/models/test_checkpoint_identity.py \
+		tests/unit/models/test_mmuse_config_normalization.py \
 		$(MMUSE_MODEL_TESTS) \
 		tests/unit/models/test_activation_checkpointing.py \
 		$(MMUSE_TRAIN_TESTS) \

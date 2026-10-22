@@ -21,7 +21,7 @@ class DSparkSpeculatorConfig(DFlashSpeculatorConfig):
 
     speculators_model_type: Literal["dspark"] = "dspark"  # type: ignore[assignment]
     architectures: list[str] = Field(
-        default_factory=lambda: ["DSparkSpeculator"],
+        default_factory=lambda: ["DSparkDraftModel"],
         description="Model architectures that can load these weights",
     )
 

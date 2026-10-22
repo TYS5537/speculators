@@ -23,7 +23,7 @@ from importlib.metadata import version
 from typing import Any, ClassVar
 
 import torch
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from transformers import PretrainedConfig
 
 from speculators.proposals import TokenProposalConfig
@@ -35,6 +35,16 @@ __all__ = [
     "VerifierConfig",
     "reload_schemas",
 ]
+
+_LEGACY_ARCHITECTURES = {
+    "DFlashSpeculator": "DFlashDraftModel",
+    "DSparkSpeculator": "DSparkDraftModel",
+    "MMuseSpeculator": "MMuseDraftModel",
+    "MuseSpeculator": "MMuseDraftModel",
+    "MuseDraftModel": "MMuseDraftModel",
+    "Eagle3Speculator": "Eagle3DraftModel",
+    "PEagleSpeculator": "PEagleDraftModel",
+}
 
 
 class VerifierConfig(BaseModel):
@@ -277,7 +287,9 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
     base_model_ep_plan: ClassVar[dict[str, Any] | None] = None  # type: ignore[misc]
     has_no_defaults_at_init: ClassVar[bool] = False  # type: ignore[misc]
     keys_to_ignore_at_inference: ClassVar[list[str]] = []  # type: ignore[misc]
-    _auto_class: ClassVar[str | None] = ""  # type: ignore[misc]
+    # Loading uses our registry. An empty string triggers Transformers' custom-code
+    # exporter and produces an invalid auto_map entry with an empty key.
+    _auto_class: ClassVar[str | None] = None  # type: ignore[misc]
 
     # Speculator model instance attributes
     speculators_model_type: str = Field(
@@ -295,6 +307,23 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
             "Contains information about the algorithm, proposal methods, and verifier."
         ),
     )
+
+    @field_validator("architectures", mode="before", check_fields=False)
+    @classmethod
+    def canonicalize_legacy_architectures(cls, value):
+        """Accept historical class labels only for the same registered model."""
+        field = cls.model_fields.get("architectures")
+        if field is None or not isinstance(value, list):
+            return value
+        defaults = field.get_default(call_default_factory=True)
+        if not isinstance(defaults, list):
+            return value
+        return [
+            _LEGACY_ARCHITECTURES[name]
+            if isinstance(name, str) and _LEGACY_ARCHITECTURES.get(name) in defaults
+            else name
+            for name in value
+        ]
 
     def __init__(self, **kwargs):
         # initialize the Pydantic arguments first to set all valid fields
@@ -344,6 +373,16 @@ class SpeculatorModelConfig(PydanticClassRegistryMixin, PretrainedConfig):
             "_auto_class",
         ):
             config_dict.pop(key, None)
+
+        # Older saves emitted {"": "config.<ConfigClass>"}. Keep real external
+        # AutoConfig/AutoModel mappings, but do not propagate the invalid entry.
+        auto_map = config_dict.get("auto_map")
+        if isinstance(auto_map, dict) and "" in auto_map:
+            auto_map = {key: value for key, value in auto_map.items() if key != ""}
+            if auto_map:
+                config_dict["auto_map"] = auto_map
+            else:
+                config_dict.pop("auto_map")
 
         return config_dict
 

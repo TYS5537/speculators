@@ -23,7 +23,7 @@ class PEagleSpeculatorConfig(Eagle3SpeculatorConfig):
 
     speculators_model_type: Literal["peagle"] = "peagle"  # type: ignore[assignment]
     architectures: list[str] = Field(
-        default_factory=lambda: ["PEagleSpeculator"],
+        default_factory=lambda: ["PEagleDraftModel"],
         description="Model architectures that can load these weights",
     )
 

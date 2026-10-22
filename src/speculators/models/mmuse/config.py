@@ -258,4 +258,4 @@ class MMuseSpeculatorConfig(MMuseOptions, DSparkSpeculatorConfig):
     """
 
     speculators_model_type: Literal["mmuse"] = "mmuse"  # type: ignore[assignment]
-    architectures: list[str] = Field(default_factory=lambda: ["MMuseSpeculator"])
+    architectures: list[str] = Field(default_factory=lambda: ["MMuseDraftModel"])

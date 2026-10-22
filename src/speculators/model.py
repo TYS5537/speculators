@@ -435,6 +435,14 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
                 **kwargs,
             )
 
+        if type(config) is not cls.config_class:
+            raise ValueError(
+                f"{cls.__name__} cannot load checkpoint type "
+                f"{config.speculators_model_type!r} with config type "
+                f"{type(config).__name__}. Use SpeculatorModel.from_pretrained "
+                "to resolve the matching model class."
+            )
+
         requested_loading_info = bool(kwargs.pop("output_loading_info", False))
         loaded = super().from_pretrained(  # type: ignore[misc]
             pretrained_model_name_or_path,

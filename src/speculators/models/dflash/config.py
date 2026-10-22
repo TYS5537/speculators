@@ -27,7 +27,7 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
 
     speculators_model_type: Literal["dflash"] = "dflash"
     architectures: list[str] = Field(
-        default_factory=lambda: ["DFlashSpeculator"],
+        default_factory=lambda: ["DFlashDraftModel"],
         description="Model architectures that can load these weights",
     )
 

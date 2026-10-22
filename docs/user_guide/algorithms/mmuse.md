@@ -283,6 +283,52 @@ and two-rank CPU Gloo success and failure when that backend is available.
 
 Generic `SpeculatorModelConfig.from_pretrained` and
 `SpeculatorModel.from_pretrained` resolve the model type from the saved config.
+An explicitly selected model class must match that config; for example, loading
+a DFlash2 checkpoint with `DFlashDraftModel` is rejected before reading weights.
+The supported legacy enhanced-DSpark-to-MMuse dispatch remains available.
+
+The three identity fields for new checkpoints are consistent whether saving just
+the config or the full model:
+
+| Model | `speculators_model_type` / `speculators_config.algorithm` | `architectures` |
+| --- | --- | --- |
+| DSpark | `dspark` | `["DSparkDraftModel"]` |
+| MMuse | `mmuse` | `["MMuseDraftModel"]` |
+| DFlash2 | `dflash2` | `["DFlash2DraftModel"]` |
+
+`MMuseSpeculatorConfig` is the Python configuration class, not the model class.
+Historical `*Speculator` architecture labels are accepted and normalized for the
+same model. The config classes still reuse DSpark/DFlash base classes and the
+existing tensor keys; those names do not select the algorithm.
+
+Ordinary saves use the installed Speculators registry and no longer generate
+`auto_map: {"": "config.MMuseSpeculatorConfig"}` or copy a redundant `config.py`.
+The empty AutoClass key was invalid export metadata. Loading and resaving an old
+config drops that entry while retaining valid explicit AutoClass mappings.
+Explicit Hugging Face AutoClass registration still exports its config code.
+Existing checkpoint files are not edited in place by loading them.
+
+To normalize existing Qwen or DSV4 MMuse checkpoint configs without loading any
+weights, use the following commands from an installed checkout:
+
+```bash
+# Preview the normalized JSON without changing the checkpoint.
+python scripts/normalize_mmuse_config.py /path/to/checkpoint
+# Update only config.json, keeping its original bytes in a backup.
+python scripts/normalize_mmuse_config.py /path/to/checkpoint --in-place
+# Or write a separate config file for inspection.
+python scripts/normalize_mmuse_config.py /path/to/checkpoint --output normalized.json
+```
+
+The tool normalizes the three MMuse identity fields, removes empty AutoClass
+mappings, adds the legacy default `markov_init_std: null` when missing, and uses
+consistent JSON indentation and key ordering. It preserves decoder settings
+(including explicit `head_dim`), all feature switches, target contracts, unknown
+fields, and original library-version metadata. It rejects baseline DSpark and
+other algorithms. In-place updates create `config.json.before-normalize.bak`;
+existing backups or output files are never overwritten. Weight and provenance
+files are untouched. This metadata migration does not add a vLLM MMuse runtime.
+
 Model loading keeps three separate responsibilities in `src/speculators/model.py`:
 `_resolve_pretrained_config` handles upstream external-checkpoint conversion and
 legacy model identity migration; `from_pretrained` dispatches the concrete model

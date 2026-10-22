@@ -26,7 +26,7 @@ class Eagle3SpeculatorConfig(SpeculatorModelConfig):
 
     speculators_model_type: Literal["eagle3"] = "eagle3"
     architectures: list[str] = Field(
-        default_factory=lambda: ["Eagle3Speculator"],
+        default_factory=lambda: ["Eagle3DraftModel"],
         description="Model architectures that can load these weights",
     )
 

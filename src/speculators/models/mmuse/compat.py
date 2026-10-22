@@ -1,6 +1,7 @@
 """Migration of pre-MMuse config identities without renaming checkpoint tensors."""
 
 import warnings
+from copy import deepcopy
 from typing import Any
 
 MMUSE_ENABLED_FLAGS = (
@@ -47,7 +48,7 @@ def migrate_legacy_model_config(config: dict[str, Any]) -> dict[str, Any]:
         )
     migrated = dict(config)
     migrated["speculators_model_type"] = "mmuse"
-    migrated["architectures"] = ["MMuseSpeculator"]
+    migrated["architectures"] = ["MMuseDraftModel"]
     if isinstance(config.get("speculators_config"), dict):
         migrated["speculators_config"] = dict(config["speculators_config"])
         migrated["speculators_config"]["algorithm"] = "mmuse"
@@ -60,3 +61,38 @@ def migrate_legacy_model_config(config: dict[str, Any]) -> dict[str, Any]:
         stacklevel=3,
     )
     return migrated
+
+
+def normalize_mmuse_checkpoint_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Standardize saved MMuse metadata without reconstructing model configs.
+
+    Keep explicit decoder settings, extension flags, unknown fields and original
+    version/provenance metadata verbatim. Rebuilding through Transformers here
+    could rewrite defaults using the converter's installed library version.
+    """
+    if not isinstance(config, dict):
+        raise ValueError("Expected a checkpoint config JSON object.")
+    speculators_config = config.get("speculators_config")
+    if not isinstance(speculators_config, dict) or not isinstance(
+        config.get("transformer_layer_config"), dict
+    ):
+        raise ValueError("Expected a full Speculators checkpoint config.")
+    if speculators_config.get("algorithm") not in {"mmuse", "muse", "dspark"}:
+        raise ValueError("Expected a MMuse or legacy enhanced-DSpark algorithm.")
+
+    normalized = deepcopy(migrate_legacy_model_config(config))
+    if normalized.get("speculators_model_type") != "mmuse":
+        raise ValueError("Baseline DSpark and other algorithms cannot become MMuse.")
+    normalized["architectures"] = ["MMuseDraftModel"]
+    normalized["speculators_config"]["algorithm"] = "mmuse"
+
+    auto_map = normalized.get("auto_map")
+    if isinstance(auto_map, dict):
+        auto_map.pop("", None)
+        if not auto_map:
+            normalized.pop("auto_map")
+
+    # This optional initialization setting was absent in older checkpoints.
+    # None is the legacy default and does not change saved weights or inference.
+    normalized.setdefault("markov_init_std", None)
+    return normalized
