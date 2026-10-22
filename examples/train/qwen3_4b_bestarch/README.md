@@ -36,62 +36,84 @@ Settings are literal assignments inside each script, not environment-variable ov
 
 ## MMuse legacy across two machines over HTTP
 
-Run both `server_http.sh` and `train_mmuse_legacy_optimizer_http.sh` on each of the two machines. The default topology is main node `80.5.5.101` and secondary node `80.5.5.137`, each with two target-inference NPUs and six draft-training NPUs. The trainers jointly train one draft across 12 ranks. Both machines need this revision of `speculators` and `hs_connectors` installed, with the existing Ascend/vLLM environment on each target. They do not need a shared filesystem.
+The preset runs one MMuse Qwen3-4B training job on `80.5.5.135` and `80.5.5.137`, with **2 target NPUs + 6 training NPUs on each host**. `.135` is the main node. Run both `server_http.sh` and `train_mmuse_legacy_optimizer_http.sh` on each machine; the two trainers join one **12-rank FSDP group**.
 
-On each machine, check `MODEL` in both scripts and `DATA_PATH`/`OUTPUT_DIR` in the trainer. The defaults reserve local devices `0,1` for the server and `2,3,4,5,6,7` for training. `TARGET_HOST="127.0.0.1"` routes each trainer's requests to its local target server. The training node rank, local IP and Host interface are detected automatically as described below. Keep the ports and `TARGET_LAYER_IDS` consistent between scripts.
+### Prepare the two hosts
 
-Both machines need local, unquantized Qwen3-4B checkpoint copies with identical config/index/weight bytes. Their directory paths can differ. The trainer still needs local embeddings, LM head and tokenizer. Startup computes a full checkpoint SHA256 on each host and checks the ordered auxiliary layers, teacher layer, geometry and BF16 contract before training; allow time for reading all weight shards. Copy the same prepared 700k dataset and vocabulary mappings to **both** machines.
+Use the same repository revision and compatible PyTorch/torch_npu/CANN/vLLM environments on all hosts. Check `MODEL` in both scripts and `DATA_PATH`/`OUTPUT_DIR` in the trainer. Each host needs a local Qwen3-4B checkpoint with identical weight/config bytes and the complete prepared 700k dataset, including identical row order, masks and vocabulary mappings. Local filesystem paths may differ. The trainer needs the local checkpoint for embeddings, LM head and tokenizer even though target inference uses HTTP.
 
-The same generated 64-character `HTTP_TOKEN` is already filled into both HTTP scripts. Use the same script revision on both machines; no separate credential file or manual `export` is needed. The scripts export their configured value to the HTTP service and trainer internally, overriding any previous `SPECULATORS_HS_HTTP_TOKEN`. To change the token, update `HTTP_TOKEN` in both scripts on both machines and restart the services and trainers. This credential is part of the committed scripts.
+Settings are literal assignments at the top of each script; shell environment variables do not override them. The same prefilled `HTTP_TOKEN` is used by the server and trainer scripts and exported internally as `SPECULATORS_HS_HTTP_TOKEN`; no separate credential file is required. Keep this value consistent across all hosts. If changing it, update both scripts on every host and restart the services and trainers. The credential is part of the committed scripts.
 
-Run from the repository root on each machine:
+The two-host preset is:
+
+| Setting | Main: `80.5.5.135` | Peer: `80.5.5.137` |
+| --- | --- | --- |
+| `NUM_TRAIN_NODES` | `2` | `2` |
+| `NUM_TRAIN_NPUS` | `6` | `6` |
+| `TRAIN_NPUS` | `"2,3,4,5,6,7"` | `"2,3,4,5,6,7"` |
+| `TRAIN_NODE_RANK` | `"auto"` resolves to `0` | `"auto"` resolves to `1` |
+| `TRAIN_MASTER_ADDR` | `"80.5.5.135"` | `"80.5.5.135"` |
+| `TRAIN_MASTER_PORT` | `34655` | `34655` |
+| `TRAIN_LOCAL_IP` | `"auto"` resolves to `.135` | `"auto"` resolves to `.137` |
+| `TRAIN_IFNAME` | Host interface owning `.135` | Host interface owning `.137` |
+| `TARGET_HOST` | `"127.0.0.1"` | `"127.0.0.1"` |
+
+All trainers use the same ordered node list and HS endpoints:
 
 ```bash
-# On BOTH machines, foreground; leave each server terminal running:
+TRAIN_NODE_IPS=("80.5.5.135" "80.5.5.137")
+HS_HTTP_ENDPOINTS=("http://80.5.5.135:8002" "http://80.5.5.137:8002")
+```
+
+Automatic detection uses `ip -o -4 addr show` and requires `iproute2` and exactly one configured node IP assigned inside the current host/container network namespace. It detects the local node rank, IP and Host interface without changing network settings. Missing or ambiguous matches fail before launching workers. If detection is unavailable, edit **all three** of `TRAIN_NODE_RANK`, `TRAIN_LOCAL_IP` and `TRAIN_IFNAME` to their explicit local values. Use the real local Host interface name, not a guessed `eth0` or the NPU/RoCE device name.
+
+Keep `RUN_NAME`, master address/port and training hyperparameters identical on the two trainers. Use a fresh local `OUTPUT_DIR` on every host. For a different topology, edit the node count, ordered IP list, master address and HS endpoints together, and choose a fresh output directory/run name on both hosts. Keep six local workers per host; `NUM_TRAIN_NPUS` is never the global count. See the [torchrun launch requirements](https://docs.pytorch.org/docs/stable/elastic/run).
+
+### Check Host and NPU networks separately
+
+Each trainer calls its **local** vLLM server at `127.0.0.1:8001`; the server uses devices `0,1` with DP=2. Both authenticated HS services on port `8002` must also be reachable from every trainer, because startup verifies every target's checkpoint SHA256, ordered auxiliary layers, teacher layer, geometry and BF16 contract. Allow time to read all weight shards. Bulk hidden-state downloads normally stay on the local host; the HTTP endpoint list is not a gradient synchronization mechanism.
+
+The Host network must support rendezvous at `.135:34655` and HCCL Host communication between `.135` and `.137`. The training NPUs on both hosts must separately have a working HCCL device network before starting the job. Setting `HCCL_IF_IP`/`HCCL_SOCKET_IFNAME`, making HTTP reachable, or using Ray does not configure the NPU network for this FSDP job. Containers must expose the required Host/device networks and Ascend devices/tools.
+
+On each host, inspect the physical training devices before launching:
+
+```bash
+ip -o -4 addr show
+for device in 2 3 4 5 6 7; do
+    /usr/local/Ascend/driver/tools/hccn_tool -i "$device" -ip -g
+    /usr/local/Ascend/driver/tools/hccn_tool -i "$device" -link -g
+done
+```
+
+Verify device-to-device reachability using the actual peer **NPU IPs**, not the `80.5.5.*` Host addresses, and run a small HCCL collective check across all 12 training devices before the full training run. Device IPs and links alone do not prove collective connectivity. The [Ascend network diagnostics](https://www.hiascend.com/doc_center/source/zh/mindcluster/70rc1/faultdiag/faultdiagug/mindxdlFDUG021.html) describe these read-only queries. Atlas A2 supports this symmetric six-device-per-host layout; other Ascend generations can have different grouping restrictions, so match the hardware and CANN version to the [HCCL system constraints](https://www.hiascend.com/document/detail/zh/canncommercial/900/API/hcclug/hcclcpp_07_0040.html).
+
+### Start the job
+
+Run from the repository root on **each of the two hosts**:
+
+```bash
+# First terminal: start the local target and keep this terminal running.
 bash examples/train/qwen3_4b_bestarch/server_http.sh
 
-# On BOTH machines, in a second terminal after BOTH targets report ready:
+# Second terminal: only after BOTH target servers report ready.
 bash examples/train/qwen3_4b_bestarch/train_mmuse_legacy_optimizer_http.sh
 ```
 
-The target exposes vLLM on port **8001** and authenticated hidden-state downloads on port **8002**. Both must be reachable from the trainer. Use a trusted LAN/VPN: the supplied endpoints use plain HTTP and the vLLM port has no API-key authentication. `server_http.sh` starts the ordinary file connector plus a separate HTTP service, and stops its own two services on exit. Hidden-state files stay on the target until the trainer successfully downloads, validates and consumes them. Failed artifacts are retained for diagnosis. The trainer's `hs_downloads` is a local temporary download directory, not a mount of the target directory.
+Start the `.135` trainer, then start the `.137` trainer promptly. Exact simultaneous launch is unnecessary; the first launcher waits for the other nodes within the rendezvous timeout. The scripts start training in the background themselves. All launchers must print the same master and `Global training workers: 12`, with node ranks `0` and `1`. A printed PID only confirms process launch; check every node's log for successful distributed initialization and training steps.
 
-Transport preserves BF16 hidden states and integer token IDs in safetensors; it adds no quantization or lossy compression. File SHA256/length and payload shape/dtype are checked. Auxiliary slots are `1 9 17 25 33`, followed by the final teacher slot (`36` for Qwen3-4B). Verified model identity allows the server name `qwen3-4b-http` to differ from the trainer's local checkpoint path.
+The HTTP server binds to `0.0.0.0`, exposes vLLM on port **8001** and authenticated HS downloads on port **8002**, and stops its own two services on exit. Use the trusted training LAN/VPN: the endpoints use plain HTTP and the vLLM port has no API-key authentication. Target services run independently of trainers.
 
-This new trainer defaults to **block size 15, 512 anchors, sequence length 3072, six training devices per host (12 total)**, with `--fsdp-shard`, `--activation-checkpointing` and `TASK_QUEUE_ENABLE=1`. It retains the local MMuse legacy architecture, Muon/AdamW grouping, learning rates (6e-4/6e-5), weight decays (0.1/0.01), CE/TV loss and ten epochs. Doubling the training ranks changes the global batch budget as explained below. The four local trainers keep their existing block sizes. The larger FSDP group does not bound the draft model's full-vocabulary loss/Correction memory; block-15 OOM can still require the diagnostics below.
+Hidden states are transferred as BF16 safetensors with integer token IDs, without quantization or lossy compression. File SHA256/length and payload shape/dtype are checked. Auxiliary slots are `1 9 17 25 33`, followed by the final teacher slot (`36` for Qwen3-4B). Verified model identity allows the server name `qwen3-4b-http` to differ from the local checkpoint path. Files remain on the target until downloaded, validated and consumed; failed artifacts remain for diagnosis. `OUTPUT_DIR/hs_downloads` is a temporary local download directory, not a shared mount.
 
-The target prints a unique provenance directory containing `vllm_command.txt`, `vllm.patch`, `checkpoint_sha256.txt` and `qwen3_hs_http.json`. The trainer saves its verified `qwen3_hs_http.json` in `OUTPUT_DIR/hs_downloads`, with the usual training command and patch under `OUTPUT_DIR/checkpoints`. Preserve both hosts' provenance together when publishing the run. Use a fresh output directory for each run.
+### Outputs and training budget
 
-### Two 8-NPU machines: 4 target NPUs + 12 training NPUs
+The default output directory is `./output/qwen3_4b_bestarch/mmuse_legacy_http_2x6_135_137_bs15`. Each host writes its own logs, PID and `topology.txt` under `OUTPUT_DIR/logs/node0` or `OUTPUT_DIR/logs/node1`. Fresh-run model/optimizer checkpoints, training provenance and TensorBoard events are written on **`.135` (global rank 0)**, under `OUTPUT_DIR/checkpoints` and `OUTPUT_DIR/tensorboard`; all hosts participate in checkpoint collectives. Existing runs are refused and `--no-resume-from-checkpoint` remains enabled. Before configuring a later resume, synchronize the complete checkpoint tree to both hosts because each rank reads local restore files.
 
-Run **both** HTTP scripts on **each** machine: `server_http.sh` uses local NPUs `0,1` with DP=2, and the trainer uses local NPUs `2,3,4,5,6,7`. The two trainers join one 12-rank FSDP group. Each trainer requests hidden states from its own local vLLM server. This keeps bulk hidden-state traffic local; FSDP collectives still communicate across machines through HCCL.
+Each target prints a unique provenance directory containing `vllm_command.txt`, `vllm.patch`, `checkpoint_sha256.txt` and `qwen3_hs_http.json`. Trainers save the verified contract under `OUTPUT_DIR/hs_downloads`, plus the usual training command and patch under `OUTPUT_DIR/checkpoints` on rank 0. Preserve both servers' provenance and both launchers' topology/logs with the run.
 
-The same `train_mmuse_legacy_optimizer_http.sh` works on both machines with these presets. `TRAIN_NODE_IPS=("80.5.5.101" "80.5.5.137")` defines the node order. At launch, the script reads local IPv4 addresses with `ip -o -4 addr show`, selects the matching node and its interface, and prints the resolved topology:
+The preset retains **block size 15, 512 anchors, sequence length 3072, ten epochs**, legacy Muon/AdamW grouping, learning rates `6e-4`/`6e-5`, weight decays `0.1`/`0.01`, and CE/TV loss. `--fsdp-shard`, `--activation-checkpointing` and `TASK_QUEUE_ENABLE=1` remain enabled. Increasing the number of hosts does not change the requested model precision or automatically scale learning rates.
 
-| Setting | Main node: `80.5.5.101` | Secondary node: `80.5.5.137` |
-| --- | --- | --- |
-| `NUM_TRAIN_NODES` | `2` | `2` |
-| `NUM_TRAIN_NPUS` | `6` (per machine) | `6` (per machine) |
-| `TRAIN_NPUS` | `"2,3,4,5,6,7"` | `"2,3,4,5,6,7"` |
-| `TRAIN_NODE_RANK` | `"auto"` resolves to `0` | `"auto"` resolves to `1` |
-| `TRAIN_MASTER_ADDR` | `"80.5.5.101"` | `"80.5.5.101"` |
-| `TRAIN_MASTER_PORT` | `34655` | `34655` |
-| `TRAIN_LOCAL_IP` | `"auto"` resolves to `"80.5.5.101"` | `"auto"` resolves to `"80.5.5.137"` |
-| `TRAIN_IFNAME` | `"auto"`: interface owning `.101` | `"auto"`: interface owning `.137` |
-| `TARGET_HOST` | `"127.0.0.1"` | `"127.0.0.1"` |
-| `HS_HTTP_ENDPOINTS` | `("http://80.5.5.101:8002" "http://80.5.5.137:8002")` | Same two endpoints |
-
-Automatic detection requires `iproute2` and exactly one of the configured node IPs to be assigned inside the current host/container network namespace. Missing or ambiguous matches stop before launching workers. It reads interface information without changing network settings. For a different network layout, edit the ordered IP list, master address and HS endpoints together. To disable detection, set all three of `TRAIN_NODE_RANK`, `TRAIN_LOCAL_IP` and `TRAIN_IFNAME` explicitly to the correct local values.
-
-Both scripts must use the same `RUN_NAME`, master address/port, training hyperparameters, code/environment, complete prepared dataset (same row order/masks), and vocabulary mappings. The two HS endpoints let **each** machine verify **both** targets' checkpoint hashes/layers before joining training; a mismatched target is rejected. Local filesystem paths may differ. Use a fresh local `OUTPUT_DIR` on each machine.
-
-Start the target server on both machines and wait until both report ready. Then start the training script once on `.101` and once on `.137`; the first launcher waits for its peer. `NUM_TRAIN_NPUS` remains **6**, never 12: global workers are `NUM_TRAIN_NODES * NUM_TRAIN_NPUS`. The launcher supplies fixed node ranks to `torchrun` and disables automatic worker restarts. It rejects loopback training addresses/interfaces in multi-node mode. The HCCL device network must already be configured; HTTP reachability alone does not establish cross-machine training connectivity. Both HS ports, the rendezvous port and HCCL communication must be reachable on the trusted training network. See [torchrun](https://docs.pytorch.org/docs/2.9/elastic/run.html) and [Ascend Host interface selection](https://www.hiascend.com/doc_center/source/zh/canncommercial/900/API/hcclug/hcclenvref_07_0022.html).
-
-The default output directory is `./output/qwen3_4b_bestarch/mmuse_legacy_http_2x6_bs15`. Per-node logs, PIDs and `topology.txt` are under `OUTPUT_DIR/logs/node0` and `OUTPUT_DIR/logs/node1` on their respective hosts. Fresh-run model/optimizer checkpoints and training provenance are written on **`.101` (global rank 0)**; both hosts participate in the save collectives. The script still refuses an existing run and uses `--no-resume-from-checkpoint`. To configure a later resume, first synchronize the **complete** checkpoint tree to both training hosts: current restore code reads model, optimizer, scheduler and progress files locally on every rank. Preserve both servers' provenance and both launchers' topology/logs.
-
-With sequence length 3072, input-token capacity per update changes from `6 * 3072 = 18,432` to `12 * 3072 = 36,864` (including padding; excluding synthetic draft positions). Updates per epoch generally decrease, so this is a different global batch budget from the six-card run. Learning rates are left at Muon `6e-4` / AdamW `6e-5`; no automatic scaling is applied. FSDP can shard model state across more ranks, but each rank still computes up to 512 block-15 anchors, so activation/loss memory does not halve automatically.
-
-The symmetric `2 target + 6 training` layout is preferred here over `4 target + 4 training` on `.101` and `8 training` on `.137`: it uses equal local worker counts and avoids pulling all of `.137`'s hidden states across the network. The asymmetric layout needs separate launch/topology validation; it is not what this recipe implements. Neither choice establishes a measured throughput advantage without a real NPU run.
+Input-token capacity per update is now `12 * 3072 = 36,864`, compared with `18,432` on six training devices (including padding capacity, excluding synthetic draft positions). Updates per epoch generally decrease, so this is a different global batch budget. FSDP can shard model state across more ranks, but each rank still computes up to 512 block-15 anchors: activation/loss memory does not shrink proportionally, and the previous OOM is not guaranteed to disappear. Throughput and memory must be measured on the actual two-host environment; the launcher tests do not run live NPU training.
 
 ## Optimizers and architecture
 

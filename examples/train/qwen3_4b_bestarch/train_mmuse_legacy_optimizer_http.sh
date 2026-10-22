@@ -1,5 +1,5 @@
 #!/bin/bash
-# MMuse Qwen3-4B, block 15: two hosts, each with 2 target + 6 training NPUs.
+# MMuse Qwen3-4B, block 15: .135 and .137, each with 2 target + 6 training NPUs.
 # Run from the repository root. Edit this file directly; no shared settings.
 set -euo pipefail
 
@@ -11,14 +11,14 @@ export TASK_QUEUE_ENABLE=1 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUN
 # ============ Configuration ============
 MODEL="../../Qwen3-4B"
 DATA_PATH="../../datasets/open_perfectblend_qwen3_4b_700k"
-OUTPUT_DIR="./output/qwen3_4b_bestarch/mmuse_legacy_http_2x6_bs15"
-RUN_NAME="mmuse_legacy_http_2x6_bs15"
+OUTPUT_DIR="./output/qwen3_4b_bestarch/mmuse_legacy_http_2x6_135_137_bs15"
+RUN_NAME="mmuse_legacy_http_2x6_135_137_bs15"
 TARGET_HOST="127.0.0.1"  # Each host uses its own local server_http.sh instance.
 VLLM_PORT=8001
 HS_HTTP_PORT=8002
-HTTP_TOKEN="ff7b93b9f2e5be1e3eb1c5448b37bb15d158b7b31c1c64a2ae2e6dd5244f9083"  # Shared with the server; keep the same value on both hosts.
+HTTP_TOKEN="ff7b93b9f2e5be1e3eb1c5448b37bb15d158b7b31c1c64a2ae2e6dd5244f9083"  # Shared with the server; keep the same value on all hosts.
 VLLM_ENDPOINT="http://${TARGET_HOST}:${VLLM_PORT}/v1"
-HS_HTTP_ENDPOINTS=("http://80.5.5.101:${HS_HTTP_PORT}" "http://80.5.5.137:${HS_HTTP_PORT}")
+HS_HTTP_ENDPOINTS=("http://80.5.5.135:${HS_HTTP_PORT}" "http://80.5.5.137:${HS_HTTP_PORT}")
 HS_HTTP_TIMEOUT=120
 REQUEST_TIMEOUT=600
 # The shared HTTP_TOKEN is exported to child processes during launch.
@@ -27,12 +27,12 @@ export no_proxy="$NO_PROXY"
 TRAIN_NPUS="2,3,4,5,6,7"
 NUM_TRAIN_NPUS=6  # LOCAL device count on each machine, not the global total.
 NUM_TRAIN_NODES=2
-TRAIN_NODE_IPS=("80.5.5.101" "80.5.5.137")  # Ordered: rank 0, rank 1.
+TRAIN_NODE_IPS=("80.5.5.135" "80.5.5.137")  # Ordered: ranks 0, 1.
 TRAIN_NODE_RANK="auto"  # Resolve from a locally assigned address in TRAIN_NODE_IPS.
-TRAIN_MASTER_ADDR="80.5.5.101"
+TRAIN_MASTER_ADDR="80.5.5.135"
 TRAIN_MASTER_PORT=34655
 TRAIN_IFNAME="auto"  # Resolve the interface owning that exact local IP.
-TRAIN_LOCAL_IP="auto"  # Resolve to .101 on the main host, .137 on the second.
+TRAIN_LOCAL_IP="auto"  # Resolve to this host's .135 or .137 address.
 
 SEQ_LENGTH=3072
 EPOCHS=10

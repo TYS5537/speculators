@@ -214,7 +214,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         for flag, value in {
             "--hidden-states-backend": "http",
             "--vllm-endpoint": "http://127.0.0.1:8001/v1",
-            "--hs-http-endpoints": "http://80.5.5.101:8002",
+            "--hs-http-endpoints": "http://80.5.5.135:8002",
             "--block-size": "15",
             "--max-anchors": "512",
             "--on-generate": "delete",
@@ -247,35 +247,37 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
                     self.assertEqual(result.returncode, 2)
                     self.assertIn("HTTP_TOKEN", result.stderr)
 
-    def test_http_two_nodes_join_one_job_with_six_workers_each(self):
-        endpoints = ["http://192.0.2.10:8002", "http://192.0.2.11:8002"]
-        for node in (0, 1):
-            command = preview_command(
-                HTTP_TRAINER,
-                TARGET_HOST="127.0.0.1",
-                NUM_TRAIN_NODES="2",
-                TRAIN_NODE_RANK=str(node),
-                TRAIN_MASTER_ADDR="192.0.2.10",
-                HS_HTTP_ENDPOINTS=endpoints,
-            )
-            for flag, value in {
-                "--nnodes": "2",
-                "--node_rank": str(node),
-                "--nproc_per_node": "6",
-                "--master_addr": "192.0.2.10",
-                "--master_port": "34655",
-                "--max_restarts": "0",
-                "--vllm-endpoint": "http://127.0.0.1:8001/v1",
-            }.items():
-                self.assertEqual(command[command.index(flag) + 1], value)
-            self.assertNotIn("--standalone", command)
-            self.assertIn("ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7", command)
-            start = command.index("--hs-http-endpoints") + 1
-            self.assertEqual(command[start : start + 2], endpoints)
-            self.assertEqual(
-                command[command.index("--rdzv_id") + 1],
-                command[command.index("--run-name") + 1],
-            )
+    def test_http_two_or_three_nodes_join_one_job_with_six_workers_each(self):
+        for nodes in (2, 3):
+            endpoints = [f"http://192.0.2.{10 + node}:8002" for node in range(nodes)]
+            for node in range(nodes):
+                with self.subTest(nodes=nodes, node=node):
+                    command = preview_command(
+                        HTTP_TRAINER,
+                        TARGET_HOST="127.0.0.1",
+                        NUM_TRAIN_NODES=str(nodes),
+                        TRAIN_NODE_RANK=str(node),
+                        TRAIN_MASTER_ADDR="192.0.2.10",
+                        HS_HTTP_ENDPOINTS=endpoints,
+                    )
+                    for flag, value in {
+                        "--nnodes": str(nodes),
+                        "--node_rank": str(node),
+                        "--nproc_per_node": "6",
+                        "--master_addr": "192.0.2.10",
+                        "--master_port": "34655",
+                        "--max_restarts": "0",
+                        "--vllm-endpoint": "http://127.0.0.1:8001/v1",
+                    }.items():
+                        self.assertEqual(command[command.index(flag) + 1], value)
+                    self.assertNotIn("--standalone", command)
+                    self.assertIn("ASCEND_RT_VISIBLE_DEVICES=2,3,4,5,6,7", command)
+                    start = command.index("--hs-http-endpoints") + 1
+                    self.assertEqual(command[start : start + nodes], endpoints)
+                    self.assertEqual(
+                        command[command.index("--rdzv_id") + 1],
+                        command[command.index("--run-name") + 1],
+                    )
 
     def test_http_multinode_rejects_invalid_topology_before_contacting_servers(self):
         settings = {
@@ -315,8 +317,9 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
     def test_http_auto_node_detection_rejects_missing_or_ambiguous_addresses(self):
         for addresses, expected_count in (
             ("1: lo inet 127.0.0.1/8 scope host lo", 0),
+            ("2: bond0 inet 80.5.5.101/24 scope global bond0", 0),
             (
-                "2: bond0 inet 80.5.5.101/24 scope global bond0\n"
+                "2: bond0 inet 80.5.5.135/24 scope global bond0\n"
                 "3: bond1 inet 80.5.5.137/24 scope global bond1",
                 2,
             ),
@@ -347,7 +350,7 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
         self.assertIn("Cannot read local IPv4 interfaces", result.stderr)
         for settings, message in (
             ({"TRAIN_NODE_RANK": "0"}, "conflict with the detected local node"),
-            ({"TRAIN_LOCAL_IP": "80.5.5.101"}, "conflict with the detected local node"),
+            ({"TRAIN_LOCAL_IP": "80.5.5.135"}, "conflict with the detected local node"),
             ({"TRAIN_IFNAME": "eth0"}, "conflict with the detected local node"),
             ({"TRAIN_NODE_IPS": ["80.5.5.137"]}, "one ordered IP per training node"),
         ):
@@ -364,12 +367,15 @@ class Qwen4BBestarchScriptTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 2, result.stderr)
                 self.assertIn(message, result.stderr)
 
-    def test_http_multinode_launch_detects_local_network_and_checks_both_targets(self):
+    def test_http_multinode_launch_detects_local_network_and_checks_all_targets(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             data = root / "data"
             data.mkdir()
-            hosts = (("80.5.5.101", "bond0"), ("80.5.5.137", "enp1s0@if7"))
+            hosts = (
+                ("80.5.5.135", "bond0"),
+                ("80.5.5.137", "enp1s0@if7"),
+            )
             for node, (local_ip, address_interface) in enumerate(hosts):
                 interface = address_interface.split("@")[0]
                 output = root / f"node{node}"
@@ -402,7 +408,7 @@ nohup() {
                 self.assertIn("Global training workers: 12", result.stdout)
                 self.assertIn(
                     f"Training node {node}: {local_ip} on {interface}; "
-                    "master 80.5.5.101:34655",
+                    "master 80.5.5.135:34655",
                     result.stdout,
                 )
                 logdir = output / "logs" / f"node{node}"
@@ -420,6 +426,7 @@ nohup() {
                 preflight = (output / "preflight.argv").read_text().split("\0")
                 for host_ip, _ in hosts:
                     self.assertIn(f"http://{host_ip}:8002", preflight)
+                self.assertNotIn("http://80.5.5.101:8002", preflight)
                 self.assertNotIn("fixture-only", (logdir / "topology.txt").read_text())
                 repeated = run_recipe(HTTP_TRAINER, settings=settings, prelude=prelude)
                 self.assertEqual(repeated.returncode, 2)
