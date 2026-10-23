@@ -363,6 +363,22 @@ class OptimizerArgs(_Group):
         description="Weight decay for the AdamW optimizer (and the AdamW group in muon "
         "mode).",
     )
+    adam_beta1: float = Field(
+        default=0.9,
+        ge=0.0,
+        lt=1.0,
+        allow_inf_nan=False,
+        description="First-moment beta for AdamW, including the AdamW group "
+        "in Muon mode.",
+    )
+    adam_beta2: float = Field(
+        default=0.999,
+        ge=0.0,
+        lt=1.0,
+        allow_inf_nan=False,
+        description="Second-moment beta for AdamW; defaults to the historical "
+        "PyTorch value.",
+    )
     muon_lr: float | None = Field(
         default=None,
         description="LR for the Muon (2D weights) group. Only used with --optimizer "
@@ -410,6 +426,12 @@ class SchedulerArgs(_Group):
 
 
 class TrainerArgs(_Group):
+    max_grad_norm: float = Field(
+        default=1.0,
+        gt=0.0,
+        allow_inf_nan=False,
+        description="Maximum gradient norm before each optimizer update.",
+    )
     activation_checkpointing: bool = Field(
         default=False, json_schema_extra=_CLI_BOOL_OPTIONAL
     )

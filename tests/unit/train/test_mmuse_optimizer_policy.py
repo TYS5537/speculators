@@ -87,13 +87,31 @@ def test_adamw_runs_remain_all_adamw_with_an_explicit_policy():
     assert len(optimizers[0].param_groups[0]["params"]) == len(list(model.parameters()))
 
 
+@pytest.mark.parametrize("mode", ["adamw", "muon"])
+def test_custom_betas_reach_adamw_and_survive_optimizer_resume(mode):
+    model, cfg = build_fixture("upstream", None, optimizer=mode)
+    cfg = cfg._replace(adam_beta1=0.85, adam_beta2=0.95)
+    optimizers = build_optimizers(model, cfg)
+    adamw = next(opt for opt in optimizers if isinstance(opt, torch.optim.AdamW))
+    assert all(group["betas"] == (0.85, 0.95) for group in adamw.param_groups)
+    sum(parameter.square().mean() for parameter in model.parameters()).backward()
+    for opt in optimizers:
+        opt.step()
+    reloaded = build_optimizers(model, cfg._replace(adam_beta2=0.999))
+    for saved, restored in zip(optimizers, reloaded, strict=True):
+        restored.load_state_dict(saved.state_dict())
+    restored_adamw = next(opt for opt in reloaded if isinstance(opt, torch.optim.AdamW))
+    assert all(group["betas"] == (0.85, 0.95) for group in restored_adamw.param_groups)
+    assert restored_adamw.state
+
+
 def test_old_config_objects_without_policy_keep_their_grouping():
     model, cfg = build_fixture("legacy", None)
     old = SimpleNamespace(
         **{
             key: value
             for key, value in cfg._asdict().items()
-            if key != "muon_parameter_policy"
+            if key not in {"muon_parameter_policy", "adam_beta1", "adam_beta2"}
         }
     )
     optimizers = build_optimizers(model, old)
@@ -102,6 +120,7 @@ def test_old_config_objects_without_policy_keep_their_grouping():
         parameter is markov for parameter in optimizers[0].param_groups[0]["params"]
     )
     assert isinstance(optimizers[0], torch.optim.Muon)
+    assert optimizers[1].param_groups[0]["betas"] == (0.9, 0.999)
 
 
 def test_policy_override_does_not_change_loss_or_lr_defaults():

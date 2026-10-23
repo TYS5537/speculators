@@ -224,21 +224,30 @@ def test_one_active_rank_keeps_all_ranks_in_backward_and_optimizer_step(
     assert trainer.model.backward_grads[0].item() == (1.0 if local_active else 0.0)
 
 
-def test_all_valid_training_retains_existing_numerical_updates(
-    trainer_module, tmp_path
+@pytest.mark.parametrize("max_grad_norm", [1.0, 0.1])
+def test_all_valid_training_applies_configured_gradient_clip(
+    trainer_module, tmp_path, max_grad_norm
 ):
     trainer = _make_trainer(trainer_module, tmp_path, [_batch(), _batch()])
+    trainer.config = trainer.config._replace(max_grad_norm=max_grad_norm)
     expected = _TinyModel()
     optimizer = torch.optim.AdamW(expected.parameters(), lr=0.01)
     scheduler = torch.optim.lr_scheduler.StepLR(optimizer, 1, 0.9)
     for _ in range(2):
         optimizer.zero_grad()
         expected.weight.square().backward()
-        torch.nn.utils.clip_grad_norm_(expected.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(expected.parameters(), max_grad_norm)
         optimizer.step()
         scheduler.step()
     trainer.train_epoch(0)
     torch.testing.assert_close(trainer.model.weight, expected.weight, rtol=0, atol=0)
+    for key in ("exp_avg", "exp_avg_sq"):
+        torch.testing.assert_close(
+            trainer.optimizers[0].state[trainer.model.weight][key],
+            optimizer.state[expected.weight][key],
+            rtol=0,
+            atol=0,
+        )
     assert trainer.schedulers[0].state_dict() == scheduler.state_dict()
     assert trainer.global_step == 3
 

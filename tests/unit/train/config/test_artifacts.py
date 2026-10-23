@@ -52,6 +52,14 @@ def _reload(tmp_path, cfg):
     [
         {"verifier_name_or_path": "m"},
         {"verifier_name_or_path": "m", "lr": 0.9, "num_layers": 4},
+        {
+            "verifier_name_or_path": "m",
+            "optimizer": "adamw",
+            "lr": 5e-5,
+            "adam_beta1": 0.9,
+            "adam_beta2": 0.95,
+            "max_grad_norm": 0.5,
+        },
         # --from-pretrained is the case a full materialized dump could not survive:
         # persisting the derived decoder-shaping defaults would self-reject on reload.
         {"verifier_name_or_path": "m", "from_pretrained": "ckpt"},

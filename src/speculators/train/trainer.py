@@ -209,6 +209,9 @@ class TrainerConfig(NamedTuple):
     muon_parameter_policy: Literal["legacy", "upstream"] | None = None
     profile_freq: int = 0
     activation_checkpoint_layers: list[int] | None = None
+    adam_beta1: float = 0.9
+    adam_beta2: float = 0.999
+    max_grad_norm: float = 1.0
 
 
 def _resolve_scheduler_steps(
@@ -811,7 +814,9 @@ class Trainer:
                     epoch, local_step, complete=local_step == num_steps
                 )
                 continue
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                self.model.parameters(), self.config.max_grad_norm
+            )
 
             metrics["error_records_sum"] = torch.tensor(
                 error_records, dtype=torch.float32, device=loss.device

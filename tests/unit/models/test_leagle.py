@@ -223,18 +223,26 @@ def test_teacher_forcing_is_explicit_and_disabled_for_proposals():
 
 
 @pytest.mark.parametrize("selected", [None, [1]])
-def test_checkpoint_recompute_preserves_cache_and_full_loop_gradients(selected):
-    plain = make_model()
+@pytest.mark.parametrize(
+    ("loss_fn", "implementation", "attention"),
+    [("kl_div", "eager", "eager"), ('{"ce": 0.1, "tv": 0.9}', "legacy", "sdpa")],
+)
+def test_checkpoint_recompute_preserves_cache_and_full_loop_gradients(
+    selected, loss_fn, implementation, attention
+):
+    plain = make_model(attention=attention)
     recomputed = copy.deepcopy(plain)
     recomputed.set_activation_checkpointing(True, layer_ids=selected)
     inputs = batch()
     inputs["verifier_last_hidden_states"] = torch.randn(1, 6, 16)
+    train_kwargs, _ = LEagleDraftModel.get_trainer_kwargs(
+        loss_fn=loss_fn, loss_implementation=implementation, ttt_steps=3
+    )
     losses = []
     for model in [plain, recomputed]:
         _, loss, _ = model(
             **inputs,
-            ttt_steps=3,
-            loss_config=resolve_loss_config("kl_div", implementation="eager"),
+            **train_kwargs,
         )
         loss.backward()
         losses.append(loss)

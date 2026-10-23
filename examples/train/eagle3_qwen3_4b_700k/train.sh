@@ -33,14 +33,17 @@ TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
 LOGGER="${LOGGER:-tensorboard}"
 NOISE_STD="${NOISE_STD:-0.05}"
 
-# EAGLE online-example backbone: one layer, 32K vocabulary, and the same base
-# LR for both optimizer groups. Seven TTT steps match DSpark's token horizon.
-LR="${LR:-1e-4}"
-MUON_LR="${MUON_LR:-1e-4}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
-MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-0.1}"
+# Match LEAGLE's peak LR; retain the author's AdamW betas, decay and clipping.
+# Keep the existing 700k / 5-epoch / TTT=7 budget.
+# Warmup uses the official 12000/800000 ratio over our actual training steps;
+# the repository's linear scheduler is retained, not the full DeepSpeed recipe.
+LR="${LR:-6e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+ADAM_BETA1="${ADAM_BETA1:-0.9}"
+ADAM_BETA2="${ADAM_BETA2:-0.95}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-0.5}"
 SCHEDULER_TYPE="${SCHEDULER_TYPE:-linear}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.01}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.015}"
 DRAFT_ARCH="llama"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
@@ -52,7 +55,7 @@ TTT_STEPS="${TTT_STEPS:-7}" # Token prediction steps; independent of any future 
 TTT_STEP_LOSS_DECAY="${TTT_STEP_LOSS_DECAY:-1.0}"
 LOSS_FN="${LOSS_FN:-kl_div}"
 # Eager KL keeps this preset independent of the installed Triton/NPU loss stack.
-# This changes the loss implementation, not the upstream recipe or KL objective.
+# This changes only the loss implementation, keeping the KL objective.
 LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-eager}"
 
 FSDP_SHARD="${FSDP_SHARD:-1}"
@@ -130,9 +133,9 @@ fi
 
 TRAIN_ARGS=(
     --training-recipe upstream --loss-implementation "$LOSS_IMPLEMENTATION" \
-    --optimizer muon --muon-parameter-policy upstream \
-    --lr "$LR" --muon-lr "$MUON_LR" \
-    --weight-decay "$WEIGHT_DECAY" --muon-weight-decay "$MUON_WEIGHT_DECAY" \
+    --optimizer adamw --lr "$LR" --weight-decay "$WEIGHT_DECAY" \
+    --adam-beta1 "$ADAM_BETA1" --adam-beta2 "$ADAM_BETA2" \
+    --max-grad-norm "$MAX_GRAD_NORM" \
     --scheduler-type "$SCHEDULER_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
     --verifier-name-or-path "$MODEL" --data-path "$DATA_PATH" \
     --hidden-states-backend file --hidden-states-path "$HIDDEN_STATES_PATH" \

@@ -50,15 +50,31 @@ Qwen3-4B 预设的所有 draft 层使用 full causal attention。脚本根据 `N
 
 每个实验分别使用一份 `server.sh` 和一份 `train.sh`。先在一个终端启动目标服务，看到 ready 后，在另一个终端启动训练。服务脚本在前台运行；训练脚本内部使用 `nohup` 后台启动训练，并打印 PID 和日志路径。训练退出不会停止目标服务；停止服务时在服务终端按 Ctrl+C。
 
-两组的共同配方为 KL、Muon + AdamW（两组 LR 均为 `1e-4`，weight decay 分别为 `0.1` / `0.01`）、linear scheduler、1% warmup，以及上述 70 万数据 / 5 epochs 设置。这是仓库 EAGLE 示例配方，不是原论文超参数复现。attention 使用 SDPA；`LOSS_IMPLEMENTATION=eager` 只控制 KL loss 的计算实现。
+两组沿用上述 70 万数据 / 5 epochs 设置，训练配方分别为：
+
+| 参数 | 普通 EAGLE-3 | LEAGLE |
+|---|---|---|
+| 优化器 | AdamW | AdamW |
+| 峰值 LR | `6e-4` | `6e-4` |
+| Adam betas | `(0.9, 0.95)` | `(0.9, 0.999)` |
+| Weight decay | `0` | `0` |
+| 梯度裁剪 max norm | `0.5` | `1.0` |
+| Loss | KL | `0.1 CE + 0.9 TV` |
+| Loss 实现 | `eager` | `legacy`，与 DSpark 相同 |
+| LR scheduler | linear | cosine |
+| Warmup 比例 | `0.015` | `0.04` |
+
+普通 EAGLE-3 的 AdamW betas、weight decay 和梯度裁剪取自[作者的 EAGLE3 配置](https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json)，峰值 LR 则按本次实验要求与 LEAGLE 统一为 `6e-4`（作者配置为 `5e-5`）。这里把 `12000 / 800000 = 1.5%` warmup 比例应用到实际 5 epochs 的训练步数，并继续使用仓库的 linear scheduler；这不是原作者 DeepSpeed 训练的完整复现。
+
+LEAGLE 的优化器、loss 与调度参数取自仓库的 [`train_dspark.sh`](../../../examples/train/qwen3_4b_bestarch/train_dspark.sh)。保留 LEAGLE 的层数 / loop、32K 词表、目标特征层和 5 epochs，不引入 DSpark 的 Markov / confidence head 及其辅助损失。`training-recipe=upstream` 保留按词表大小命名的缓存和 hidden-state 恢复流程；loss 显式指定 `legacy`，因此使用与 DSpark 相同的 CE / TV 数值实现。两组 attention 均为 SDPA，loss 的实现选项不改变 attention backend。
 
 两份训练脚本默认开启 `FSDP_SHARD=1` 和 `ACTIVATION_CHECKPOINTING=1`，可分别设为 `0` 关闭。EAGLE3 的重算使用独立缓存，避免反向传播重复追加 TTT KV；LEAGLE 按物理层重算全部共享 loop。FSDP 分片按物理层执行。这里的默认配置尚需在实际 NPU 集群验证显存和速度。
 
-新运行可用环境变量覆盖 `LR`、`MUON_LR`、`LOSS_FN`、`LOSS_IMPLEMENTATION`、`EPOCHS`、`SEQ_LENGTH`、`SEED`、`TTT_STEPS`、`TTT_STEP_LOSS_DECAY`、weight decay 和 scheduler 参数。`LOSS_FN` 也接受仓库已有的加权 JSON，例如 `'{"ce":0.1,"tv":0.9}'`。修改配方时为实验指定新的 `OUTPUT_DIR`，服务端也使用该目录。
+新运行可用环境变量覆盖 `LR`、`WEIGHT_DECAY`、`ADAM_BETA1`、`ADAM_BETA2`、`MAX_GRAD_NORM`、`LOSS_FN`、`LOSS_IMPLEMENTATION`、`EPOCHS`、`SEQ_LENGTH`、`SEED`、`TTT_STEPS`、`TTT_STEP_LOSS_DECAY` 和 scheduler 参数。`LOSS_FN` 也接受仓库已有的加权 JSON，例如 `'{"ce":0.1,"tv":0.9}'`。修改配方时为实验指定新的 `OUTPUT_DIR`，服务端也使用该目录。
 
 ```bash
 # 只打印最终启动命令，不连接服务、不加载模型、不创建训练输出。
-DRY_RUN=1 NUM_LAYERS=2 NUM_LOOPS=2 LR=5e-5 MUON_LR=5e-5 \
+DRY_RUN=1 NUM_LAYERS=2 NUM_LOOPS=2 \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 
 # 已停止的训练继续运行；先用相同 OUTPUT_DIR 重启 server.sh。
@@ -66,11 +82,11 @@ RESUME=1 OUTPUT_DIR=./output/leagle_qwen3_4b_700k_5ep_d2_r2_full \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-`RESUME=1` 从该目录的 `checkpoints/run.yaml` 恢复原架构、loss、LR、优化器、scheduler 和显存设置，再加载最新训练进度；不会用脚本的默认 D/R 或 LR 覆盖原配方。续训仍保留所有 epoch，可更新服务端口与输出路径。脚本会拒绝向仍有存活训练 PID 的目录启动第二个 trainer。若早期版本已经删除 `run.yaml`，须先从原始命令恢复配置；缺失的配置不会被猜测。
+`RESUME=1` 从该目录的 `checkpoints/run.yaml` 恢复原架构、loss、LR、优化器（含 betas）、梯度裁剪、scheduler 和显存设置，再加载最新训练进度；不会用脚本的新默认值覆盖原配方。旧 YAML 未记录 betas / 梯度裁剪时，仍采用历史默认值 `(0.9, 0.999)` / `1.0`；旧 Muon 运行继续使用 Muon。切换到本次新配方需要新的输出目录。续训仍保留所有 epoch，可更新服务端口与输出路径。脚本会拒绝向仍有存活训练 PID 的目录启动第二个 trainer。若早期版本已经删除 `run.yaml`，须先从原始命令恢复配置；缺失的配置不会被猜测。
 
 默认保存每个 epoch（五轮对应 `checkpoints/0` 至 `checkpoints/4`），并维护 validation loss 最优的 `checkpoint_best`。最佳 loss 不保证最佳接受长度；可在独立验证集上评估各 epoch。显式启用底层 `--save-best` 时仅清理旧编号 checkpoint，保留 `run.yaml`、`train_command.txt`、patch 和恢复数据。
 
-两组默认一个物理 decoder 层，LEAGLE 默认 `num_loops=1`；两组均显式使用 full attention。普通 EAGLE-3 保留示例的 Llama decoder 和输入归一化设置；LEAGLE 保留 Qwen3 decoder、输入融合和每层 KV 注入。该实验比较整体结构，不单独归因于某一种输入改动。
+两组默认一个物理 decoder 层，LEAGLE 默认 `num_loops=1`；两组均显式使用 full attention。普通 EAGLE-3 保留示例的 Llama decoder 和输入归一化设置；LEAGLE 保留 Qwen3 decoder、输入融合和每层 KV 注入。该实验比较结构及训练配方的组合，接受长度差异不能单独归因于结构或 loop；峰值 LR 已统一，若要隔离结构因素，还需统一 loss、betas、梯度裁剪和 scheduler。
 
 ```bash
 # 普通 EAGLE-3，终端 1：目标特征服务。

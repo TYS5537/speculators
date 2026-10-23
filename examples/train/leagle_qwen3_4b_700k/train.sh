@@ -36,12 +36,15 @@ NOISE_STD="${NOISE_STD:-0.05}"
 
 # LEAGLE: Qwen3 KV-conditioned layers, shared loops, and seven AR token steps.
 # NUM_LAYERS * NUM_LOOPS is the effective decoder depth per token.
-LR="${LR:-1e-4}"
-MUON_LR="${MUON_LR:-1e-4}"
-WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
-MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-0.1}"
-SCHEDULER_TYPE="${SCHEDULER_TYPE:-linear}"
-WARMUP_RATIO="${WARMUP_RATIO:-0.01}"
+# Optimizer, loss and schedule follow qwen3_4b_bestarch/train_dspark.sh.
+# Keep LEAGLE's depth/loops, vocabulary, feature layers and five-epoch budget.
+LR="${LR:-6e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
+ADAM_BETA1="${ADAM_BETA1:-0.9}"
+ADAM_BETA2="${ADAM_BETA2:-0.999}"
+MAX_GRAD_NORM="${MAX_GRAD_NORM:-1.0}"
+SCHEDULER_TYPE="${SCHEDULER_TYPE:-cosine}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 DRAFT_ARCH="qwen3"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
@@ -51,10 +54,10 @@ TARGET_LAYER_IDS=(2 18 33)
 DRAFT_ATTN_IMPL="sdpa"  # Attention backend; independent of LOSS_IMPLEMENTATION.
 TTT_STEPS="${TTT_STEPS:-7}" # Token prediction steps; independent of NUM_LOOPS.
 TTT_STEP_LOSS_DECAY="${TTT_STEP_LOSS_DECAY:-1.0}"
-LOSS_FN="${LOSS_FN:-kl_div}"
-# Eager KL keeps this preset independent of the installed Triton/NPU loss stack.
-# This changes the loss implementation, not the upstream recipe or KL objective.
-LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-eager}"
+DEFAULT_LOSS_FN='{"ce": 0.1, "tv": 0.9}'
+LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
+# Match DSpark's CE/TV numerical implementation; attention still uses SDPA.
+LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-legacy}"
 
 FSDP_SHARD="${FSDP_SHARD:-1}"
 ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-1}"
@@ -129,11 +132,13 @@ if [[ "$DRY_RUN" == 0 ]]; then
     HIDDEN_STATES_PATH="$(cd "$HIDDEN_STATES_PATH" && pwd -P)"
 fi
 
+# Upstream keeps size-keyed vocabulary caches and hidden-state recovery behavior.
+# The explicit optimizer/loss/scheduler settings above take precedence.
 TRAIN_ARGS=(
     --training-recipe upstream --loss-implementation "$LOSS_IMPLEMENTATION" \
-    --optimizer muon --muon-parameter-policy upstream \
-    --lr "$LR" --muon-lr "$MUON_LR" \
-    --weight-decay "$WEIGHT_DECAY" --muon-weight-decay "$MUON_WEIGHT_DECAY" \
+    --optimizer adamw --lr "$LR" --weight-decay "$WEIGHT_DECAY" \
+    --adam-beta1 "$ADAM_BETA1" --adam-beta2 "$ADAM_BETA2" \
+    --max-grad-norm "$MAX_GRAD_NORM" \
     --scheduler-type "$SCHEDULER_TYPE" --scheduler-warmup-ratio "$WARMUP_RATIO" \
     --verifier-name-or-path "$MODEL" --data-path "$DATA_PATH" \
     --hidden-states-backend file --hidden-states-path "$HIDDEN_STATES_PATH" \

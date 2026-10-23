@@ -81,12 +81,18 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
     :return: A list of optimizers for the trainer to step in tandem. The default
         "adamw" returns a single optimizer; "muon" returns ``[Muon, AdamW]``.
     """
+    # Keep older programmatic config objects on PyTorch's historical defaults.
+    betas = (
+        getattr(config, "adam_beta1", 0.9),
+        getattr(config, "adam_beta2", 0.999),
+    )
     if config.optimizer == "adamw":
         return [
             torch.optim.AdamW(
                 model.named_parameters(),
                 lr=config.lr,
                 weight_decay=config.weight_decay,
+                betas=betas,
             )
         ]
 
@@ -123,6 +129,7 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
                     adamw_params,
                     lr=config.lr,
                     weight_decay=config.weight_decay,
+                    betas=betas,
                 )
             )
         if not optimizers:

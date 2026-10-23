@@ -7,6 +7,7 @@ real parser is proven separately by the example-recipe tests, not a golden
 """
 
 import pytest
+from pydantic import ValidationError
 
 from speculators.train.config import TrainConfig
 from speculators.train.config.schema import (
@@ -16,12 +17,26 @@ from speculators.train.config.schema import (
     DraftArgs,
     LossArgs,
     OptimizerArgs,
+    TrainerArgs,
 )
 
 
 def test_constructs_from_defaults():
     # The whole point of the schema seam: a config exists with no inputs.
     TrainConfig()
+
+
+@pytest.mark.parametrize("field", ["adam_beta1", "adam_beta2"])
+@pytest.mark.parametrize("value", [-0.1, 1.0, float("nan"), float("inf")])
+def test_adam_betas_must_be_finite_and_in_unit_interval(field, value):
+    with pytest.raises(ValidationError, match=field):
+        OptimizerArgs(**{field: value})
+
+
+@pytest.mark.parametrize("value", [0.0, -0.1, float("nan"), float("inf")])
+def test_gradient_clip_must_be_positive_and_finite(value):
+    with pytest.raises(ValidationError, match="max_grad_norm"):
+        TrainerArgs(max_grad_norm=value)
 
 
 def test_flatten_covers_exactly_the_schema_fields():

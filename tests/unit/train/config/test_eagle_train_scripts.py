@@ -8,7 +8,10 @@ from pathlib import Path
 
 import pytest
 
+from speculators.models.dspark.core import DSparkDraftModel
+from speculators.models.leagle import LEagleDraftModel
 from speculators.train.config import TrainConfig
+from tests.standalone.test_qwen4b_bestarch_scripts import training_arguments
 
 ROOT = Path(__file__).resolve().parents[4]
 BASH = shutil.which("bash") or "C:/Program Files/Git/bin/bash.exe"
@@ -31,6 +34,56 @@ def launch_args(algorithm, **overrides):
 
 
 @pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
+def test_default_recipes_resolve_without_changing_training_budget(algorithm):
+    flags = launch_args(algorithm, MODEL="model")
+    args = TrainConfig.resolve(flags).flatten()
+    assert args["optimizer"] == "adamw"
+    assert args["lr"] == 6e-4
+    assert not any(flag.startswith("--muon-") for flag in flags)
+    assert args["weight_decay"] == 0.0
+    assert args["adam_beta1"] == 0.9
+    assert args["epochs"] == 5
+    assert args["ttt_steps"] == 7
+    assert args["num_layers"] == args["num_loops"] == 1
+    assert args["draft_vocab_size"] == 32000
+    assert args["target_layer_ids"] == [2, 18, 33]
+    assert args["full_attention_indices"] == [0]
+    assert args["training_recipe"] == "upstream"  # Retain size-keyed vocab caches.
+    if algorithm == "eagle3":
+        assert args["adam_beta2"] == 0.95
+        assert args["max_grad_norm"] == 0.5
+        assert args["loss_fn"] == "kl_div"
+        assert args["loss_implementation"] == "eager"
+        assert args["scheduler_type"] == "linear"
+        assert args["scheduler_warmup_ratio"] == 0.015
+    else:
+        dspark = TrainConfig.resolve(training_arguments("train_dspark.sh")).flatten()
+        for key in (
+            "optimizer",
+            "lr",
+            "weight_decay",
+            "adam_beta1",
+            "adam_beta2",
+            "max_grad_norm",
+            "loss_fn",
+            "loss_implementation",
+            "scheduler_type",
+            "scheduler_warmup_ratio",
+            "scheduler_total_steps",
+            "scheduler_warmup_steps",
+            "scheduler_num_cosine_cycles",
+            "noise_std",
+            "train_data_ratio",
+            "total_seq_len",
+        ):
+            assert args[key] == dspark[key], key
+        # Explicit legacy CE/TV must reach the model despite upstream data handling.
+        leagle_train, _ = LEagleDraftModel.get_trainer_kwargs(**args)
+        dspark_train, _ = DSparkDraftModel.get_trainer_kwargs(**dspark)
+        assert leagle_train["loss_config"] == dspark_train["loss_config"]
+
+
+@pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
 def test_script_memory_retention_and_loss_overrides(algorithm):
     flags = launch_args(
         algorithm,
@@ -38,7 +91,9 @@ def test_script_memory_retention_and_loss_overrides(algorithm):
         NUM_LAYERS="2",
         NUM_LOOPS="3",
         LR="0.00003",
-        MUON_LR="0.00004",
+        ADAM_BETA1="0.85",
+        ADAM_BETA2="0.98",
+        MAX_GRAD_NORM="0.3",
         LOSS_FN="tv",
     )
     args = TrainConfig.resolve(flags).flatten()
@@ -48,7 +103,9 @@ def test_script_memory_retention_and_loss_overrides(algorithm):
     assert args["checkpoint_freq"] == 1
     assert args["epochs"] == 5
     assert args["lr"] == 0.00003
-    assert args["muon_lr"] == 0.00004
+    assert args["adam_beta1"] == 0.85
+    assert args["adam_beta2"] == 0.98
+    assert args["max_grad_norm"] == 0.3
     assert args["loss_fn"] == "tv"
     assert args["num_layers"] == 2
     assert args["num_loops"] == (3 if algorithm == "leagle" else 1)
@@ -59,7 +116,14 @@ def test_script_memory_retention_and_loss_overrides(algorithm):
 def test_resume_uses_saved_recipe_and_can_disable_best_only(algorithm, tmp_path):
     original = TrainConfig.resolve(
         launch_args(
-            algorithm, MODEL="model", NUM_LAYERS="2", NUM_LOOPS="3", LR="0.00003"
+            algorithm,
+            MODEL="model",
+            NUM_LAYERS="2",
+            NUM_LOOPS="3",
+            LR="0.00003",
+            ADAM_BETA1="0.85",
+            ADAM_BETA2="0.98",
+            MAX_GRAD_NORM="0.3",
         )
     )
     path = tmp_path / "checkpoints"
@@ -70,8 +134,35 @@ def test_resume_uses_saved_recipe_and_can_disable_best_only(algorithm, tmp_path)
     assert not args["no_resume_from_checkpoint"]
     assert not args["save_best"]
     assert args["lr"] == 0.00003  # Original recipe, not the script's default.
+    assert args["adam_beta1"] == 0.85
+    assert args["adam_beta2"] == 0.98
+    assert args["max_grad_norm"] == 0.3
     assert args["num_layers"] == 2
     assert args["num_loops"] == (3 if algorithm == "leagle" else 1)
+
+
+@pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
+def test_resume_old_muon_yaml_keeps_historical_optimizer_and_clipping(
+    algorithm, tmp_path
+):
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(
+        f"train:\n  speculator_type: {algorithm}\n  training_recipe: upstream\n"
+        "  verifier:\n    verifier_name_or_path: model\n"
+        "  optimizer:\n    optimizer: muon\n    lr: 0.0001\n    muon_lr: 0.0001\n"
+        "  loss:\n    loss_fn: kl_div\n    loss_implementation: eager\n"
+    )
+    args = TrainConfig.resolve(
+        launch_args(algorithm, RESUME="1", OUTPUT_DIR=tmp_path.as_posix())
+    ).flatten()
+    assert args["optimizer"] == "muon"
+    assert args["lr"] == args["muon_lr"] == 1e-4
+    assert args["adam_beta1"] == 0.9
+    assert args["adam_beta2"] == 0.999
+    assert args["max_grad_norm"] == 1.0
+    assert args["loss_fn"] == "kl_div"
+    assert args["loss_implementation"] == "eager"
 
 
 def test_memory_flags_can_be_disabled():
