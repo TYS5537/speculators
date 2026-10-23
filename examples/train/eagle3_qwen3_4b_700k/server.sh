@@ -19,7 +19,7 @@ export GLOO_SOCKET_IFNAME=lo
 # ============ Configuration ============
 MODEL="${MODEL:-../../Qwen3-4B}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_full}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_fullvocab}"
 VLLM_PORT="${VLLM_PORT:-8003}"
 TARGET_LAYER_IDS=(2 18 33)  # Auxiliary layers only; the launcher appends teacher slot 36.
 VLLM_NPUS="${VLLM_NPUS:-0,1}"

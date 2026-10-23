@@ -11,7 +11,7 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTH
 
 MODEL="${MODEL:-../../Qwen3-4B}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
-RUN_DIR="./output/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_full"
+RUN_DIR="./output/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_fullvocab"
 DRAFT_MODEL="${DRAFT_MODEL:-$RUN_DIR/checkpoints/checkpoint_best}"
 SPEC_TOKENS="${SPEC_TOKENS:-7}"
 OUTPUT_DIR="${OUTPUT_DIR:-$RUN_DIR/eval_k${SPEC_TOKENS}_$(date +%Y%m%d_%H%M%S)_$$}"

@@ -5,6 +5,8 @@
 # The original dataset's token IDs and loss masks are reused without regeneration.
 set -euo pipefail
 
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+
 export OMP_PROC_BIND=false OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 VE_OMP_NUM_THREADS=1
 export PYTORCH_NPU_ALLOC_CONF=expandable_segments:True
 export TASK_QUEUE_ENABLE=2 ACLNN_CACHE_LIMIT=100000 NPU_ASD_ENABLE=0 ASCEND_LAUNCH_BLOCKING=0
@@ -16,10 +18,11 @@ export GLOO_SOCKET_IFNAME=lo
 
 # ============ Configuration ============
 MODEL="${MODEL:-../../Qwen3-4B}"
+PYTHON="${PYTHON:-python}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
 DATA_PATH="${DATA_PATH:-../../datasets/open_perfectblend_qwen3_4b_700k}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_full}"
-RUN_NAME="eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_full"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_fullvocab}"
+RUN_NAME="eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_fullvocab"
 VLLM_PORT="${VLLM_PORT:-8003}"
 VLLM_ENDPOINT="http://127.0.0.1:${VLLM_PORT}/v1"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
@@ -45,7 +48,7 @@ MAX_GRAD_NORM="${MAX_GRAD_NORM:-0.5}"
 SCHEDULER_TYPE="${SCHEDULER_TYPE:-linear}"
 WARMUP_RATIO="${WARMUP_RATIO:-0.015}"
 DRAFT_ARCH="llama"
-DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-151936}"  # Qwen3-4B full vocabulary.
 TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
 # Qwen3-4B has 36 layers: the default auxiliary slots are 2, 18 and 33.
 # server.sh appends final teacher slot 36; do not append it here.
@@ -164,7 +167,10 @@ else
     if [[ "$FSDP_SHARD" == 1 ]]; then TRAIN_ARGS+=(--fsdp-shard); fi
     if [[ "$ACTIVATION_CHECKPOINTING" == 1 ]]; then TRAIN_ARGS+=(--activation-checkpointing); fi
 fi
-CMD=(env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun
+# Use this checkout and the selected Python environment for every worker.
+CMD=(env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS"
+    PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
+    "$PYTHON" -m torch.distributed.run
     --standalone --nproc_per_node "$NUM_TRAIN_NPUS" -m speculators.train "${TRAIN_ARGS[@]}")
 if [[ "$DRY_RUN" == 1 ]]; then
     printf '%q ' "${CMD[@]}"

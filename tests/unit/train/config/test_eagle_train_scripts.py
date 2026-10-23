@@ -1,6 +1,7 @@
 """Exercise the actual two launch scripts through their model-free dry run."""
 
 import os
+import runpy
 import shlex
 import shutil
 import subprocess
@@ -17,7 +18,7 @@ ROOT = Path(__file__).resolve().parents[4]
 BASH = shutil.which("bash") or "C:/Program Files/Git/bin/bash.exe"
 
 
-def launch_args(algorithm, **overrides):
+def launch_command(algorithm, **overrides):
     if not Path(BASH).is_file():
         pytest.skip("bash unavailable")
     result = subprocess.run(  # noqa: S603 -- Repository script in non-executing mode.
@@ -29,7 +30,11 @@ def launch_args(algorithm, **overrides):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    command = shlex.split(result.stdout)
+    return shlex.split(result.stdout)
+
+
+def launch_args(algorithm, **overrides):
+    command = launch_command(algorithm, **overrides)
     return command[command.index("speculators.train") + 1 :]
 
 
@@ -45,7 +50,7 @@ def test_default_recipes_resolve_without_changing_training_budget(algorithm):
     assert args["epochs"] == 5
     assert args["ttt_steps"] == 7
     assert args["num_layers"] == args["num_loops"] == 1
-    assert args["draft_vocab_size"] == 32000
+    assert args["draft_vocab_size"] == 151936
     assert args["target_layer_ids"] == [2, 18, 33]
     assert args["full_attention_indices"] == [0]
     assert args["training_recipe"] == "upstream"  # Retain size-keyed vocab caches.
@@ -94,6 +99,7 @@ def test_script_memory_retention_and_loss_overrides(algorithm):
         ADAM_BETA1="0.85",
         ADAM_BETA2="0.98",
         MAX_GRAD_NORM="0.3",
+        DRAFT_VOCAB_SIZE="32000",
         LOSS_FN="tv",
     )
     args = TrainConfig.resolve(flags).flatten()
@@ -106,6 +112,7 @@ def test_script_memory_retention_and_loss_overrides(algorithm):
     assert args["adam_beta1"] == 0.85
     assert args["adam_beta2"] == 0.98
     assert args["max_grad_norm"] == 0.3
+    assert args["draft_vocab_size"] == 32000
     assert args["loss_fn"] == "tv"
     assert args["num_layers"] == 2
     assert args["num_loops"] == (3 if algorithm == "leagle" else 1)
@@ -124,6 +131,7 @@ def test_resume_uses_saved_recipe_and_can_disable_best_only(algorithm, tmp_path)
             ADAM_BETA1="0.85",
             ADAM_BETA2="0.98",
             MAX_GRAD_NORM="0.3",
+            DRAFT_VOCAB_SIZE="32000",
         )
     )
     path = tmp_path / "checkpoints"
@@ -137,6 +145,7 @@ def test_resume_uses_saved_recipe_and_can_disable_best_only(algorithm, tmp_path)
     assert args["adam_beta1"] == 0.85
     assert args["adam_beta2"] == 0.98
     assert args["max_grad_norm"] == 0.3
+    assert args["draft_vocab_size"] == 32000  # Resuming does not resize the head.
     assert args["num_layers"] == 2
     assert args["num_loops"] == (3 if algorithm == "leagle" else 1)
 
@@ -173,3 +182,49 @@ def test_memory_flags_can_be_disabled():
     ).flatten()
     assert not args["fsdp_shard"]
     assert not args["activation_checkpointing"]
+
+
+@pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
+def test_script_uses_checkout_with_selected_python(algorithm):
+    command = launch_command(
+        algorithm, PYTHON="/selected env/bin/python", PYTHONPATH="/old-installed-code"
+    )
+    python_index = command.index("/selected env/bin/python")
+    assert command[python_index + 1 : python_index + 3] == [
+        "-m",
+        "torch.distributed.run",
+    ]
+    path = next(
+        arg.removeprefix("PYTHONPATH=")
+        for arg in command[:python_index]
+        if arg.startswith("PYTHONPATH=")
+    )
+    # Bash emits POSIX paths on Windows too. The repo must precede inherited code.
+    repo_path = subprocess.check_output(  # noqa: S603 -- Only resolves the test cwd.
+        [BASH, "-c", "pwd"], cwd=ROOT, text=True
+    ).strip()
+    assert path.split(":")[:3] == [
+        f"{repo_path}/src",
+        f"{repo_path}/hs_connectors/src",
+        repo_path,
+    ]
+    assert path.endswith(":/old-installed-code")
+
+
+@pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
+def test_actual_module_entrypoint_accepts_script_flags(
+    algorithm, monkeypatch, capsys, tmp_path
+):
+    flags = launch_args(algorithm, MODEL="model")
+    monkeypatch.setattr("sys.argv", ["speculators.train", *flags, "--dump-config"])
+    with pytest.raises(SystemExit) as result:
+        runpy.run_module("speculators.train", run_name="__main__")
+    output = capsys.readouterr()
+    assert result.value.code == 0, output.err
+    path = tmp_path / "run.yaml"
+    path.write_text(output.out)
+    config = TrainConfig.resolve(["--config", str(path)]).flatten()
+    assert config["draft_vocab_size"] == 151936
+    assert config["adam_beta1"] == 0.9
+    assert config["adam_beta2"] == (0.95 if algorithm == "eagle3" else 0.999)
+    assert config["max_grad_norm"] == (0.5 if algorithm == "eagle3" else 1.0)

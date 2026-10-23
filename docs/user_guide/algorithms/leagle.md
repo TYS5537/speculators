@@ -42,7 +42,9 @@ LEAGLE 没有并行 mask-token backbone、Markov/RNN correction head、confidenc
 
 ## 训练
 
-从仓库根目录运行。沿用已经准备好的 Qwen3-4B / 70 万数据、5 epochs、seed 42、3072 packing 长度、0.9 训练比例、32K draft vocabulary、三个目标特征层 `[2,18,33]` 和 TTT=7。默认目标服务使用 NPU 0–1，训练使用 NPU 2–7，端口 8003。脚本中的模型与数据路径需要与训练机器一致。
+从仓库根目录运行。沿用已经准备好的 Qwen3-4B / 70 万数据、5 epochs、seed 42、3072 packing 长度、0.9 训练比例、三个目标特征层 `[2,18,33]` 和 TTT=7。两组默认 `DRAFT_VOCAB_SIZE=151936`，使用 Qwen3-4B 的完整词表。默认目标服务使用 NPU 0–1，训练使用 NPU 2–7，端口 8003。脚本中的模型与数据路径需要与训练机器一致。
+
+词表切换无需重新生成预处理数据；启动仍要求数据目录中有 `token_freq.pt`，或与词表大小匹配的 `t2d-151936.npy` / `d2t-151936.npy`。原有 32K 映射不会被当成全词表缓存使用。新训练使用独立的 `fullvocab` 输出目录；如需重新做 32K 对照，可设置 `DRAFT_VOCAB_SIZE=32000` 并另指定 `OUTPUT_DIR`。
 
 Qwen3-4B 预设的所有 draft 层使用 full causal attention。脚本根据 `NUM_LAYERS` 自动生成 `--full-attention-indices 0 ... D-1`，每次 loop 复用相同设置。注意力覆盖完整的可见前缀；未来目标特征、其他文档和其他训练轨迹仍然不可见。
 
@@ -66,11 +68,13 @@ Qwen3-4B 预设的所有 draft 层使用 full causal attention。脚本根据 `N
 
 普通 EAGLE-3 的 AdamW betas、weight decay 和梯度裁剪取自[作者的 EAGLE3 配置](https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json)，峰值 LR 则按本次实验要求与 LEAGLE 统一为 `6e-4`（作者配置为 `5e-5`）。这里把 `12000 / 800000 = 1.5%` warmup 比例应用到实际 5 epochs 的训练步数，并继续使用仓库的 linear scheduler；这不是原作者 DeepSpeed 训练的完整复现。
 
-LEAGLE 的优化器、loss 与调度参数取自仓库的 [`train_dspark.sh`](../../../examples/train/qwen3_4b_bestarch/train_dspark.sh)。保留 LEAGLE 的层数 / loop、32K 词表、目标特征层和 5 epochs，不引入 DSpark 的 Markov / confidence head 及其辅助损失。`training-recipe=upstream` 保留按词表大小命名的缓存和 hidden-state 恢复流程；loss 显式指定 `legacy`，因此使用与 DSpark 相同的 CE / TV 数值实现。两组 attention 均为 SDPA，loss 的实现选项不改变 attention backend。
+LEAGLE 的优化器、loss 与调度参数取自仓库的 [`train_dspark.sh`](../../../examples/train/qwen3_4b_bestarch/train_dspark.sh)。保留 LEAGLE 的层数 / loop、完整词表、目标特征层和 5 epochs，不引入 DSpark 的 Markov / confidence head 及其辅助损失。`training-recipe=upstream` 保留按词表大小命名的缓存和 hidden-state 恢复流程；loss 显式指定 `legacy`，因此使用与 DSpark 相同的 CE / TV 数值实现。两组 attention 均为 SDPA，loss 的实现选项不改变 attention backend。
 
 两份训练脚本默认开启 `FSDP_SHARD=1` 和 `ACTIVATION_CHECKPOINTING=1`，可分别设为 `0` 关闭。EAGLE3 的重算使用独立缓存，避免反向传播重复追加 TTT KV；LEAGLE 按物理层重算全部共享 loop。FSDP 分片按物理层执行。这里的默认配置尚需在实际 NPU 集群验证显存和速度。
 
 新运行可用环境变量覆盖 `LR`、`WEIGHT_DECAY`、`ADAM_BETA1`、`ADAM_BETA2`、`MAX_GRAD_NORM`、`LOSS_FN`、`LOSS_IMPLEMENTATION`、`EPOCHS`、`SEQ_LENGTH`、`SEED`、`TTT_STEPS`、`TTT_STEP_LOSS_DECAY` 和 scheduler 参数。`LOSS_FN` 也接受仓库已有的加权 JSON，例如 `'{"ce":0.1,"tv":0.9}'`。修改配方时为实验指定新的 `OUTPUT_DIR`，服务端也使用该目录。
+
+训练脚本通过 `python -m torch.distributed.run` 启动，并将当前仓库的源码路径放在 `PYTHONPATH` 最前面，避免载入环境中安装的旧版 `speculators`。可用 `PYTHON=/path/to/env/bin/python` 指定训练解释器。新版模块入口和旧版 `scripts/train.py` 均支持 `--adam-beta1`、`--adam-beta2`、`--max-grad-norm`（注意最后一个参数的连字符）。
 
 ```bash
 # 只打印最终启动命令，不连接服务、不加载模型、不创建训练输出。
@@ -78,7 +82,7 @@ DRY_RUN=1 NUM_LAYERS=2 NUM_LOOPS=2 \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 
 # 已停止的训练继续运行；先用相同 OUTPUT_DIR 重启 server.sh。
-RESUME=1 OUTPUT_DIR=./output/leagle_qwen3_4b_700k_5ep_d2_r2_full \
+RESUME=1 OUTPUT_DIR=./output/leagle_qwen3_4b_700k_5ep_d2_r2_fullvocab \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
@@ -106,7 +110,7 @@ bash examples/train/leagle_qwen3_4b_700k/server.sh
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-默认输出分别为 `output/eagle3_qwen3_4b_700k_5ep_d1_full/` 和 `output/leagle_qwen3_4b_700k_5ep_d1_r1_full/`。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。此前在 `leagle/runs/` 下的运行产物可继续保留；如需使用原路径，在服务和训练脚本中显式设置相同的 `OUTPUT_DIR`。
+默认输出分别为 `output/eagle3_qwen3_4b_700k_5ep_d1_fullvocab/` 和 `output/leagle_qwen3_4b_700k_5ep_d1_r1_fullvocab/`，配套服务与评估脚本使用相同路径。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。旧 32K 运行不会自动升级词表；续训时在服务和训练脚本中显式设置相同的原 `OUTPUT_DIR`，词表大小仍读取原 `run.yaml`。
 
 模型、数据、输出路径和 NPU 分配可在各自脚本配置区或通过同名环境变量修改。服务与训练脚本的 `MODEL`、`OUTPUT_DIR`、`VLLM_PORT`、`NUM_LAYERS` 和 LEAGLE 的 `NUM_LOOPS` 必须一致；两边均使用目标特征层 `[2,18,33]`，服务另加最后一层 teacher slot 36。`VLLM_NPUS` 与 `TRAIN_NPUS` 应使用互不重叠的设备。重复实验时，为两份脚本指定同一个新的 `OUTPUT_DIR`。
 

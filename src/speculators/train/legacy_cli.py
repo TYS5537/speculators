@@ -68,7 +68,8 @@ _LEGACY_FIELDS = """
     save_best activation_checkpointing activation_checkpoint_layers
     fsdp_shard scheduler_type
     scheduler_warmup_steps scheduler_warmup_ratio scheduler_total_steps
-    scheduler_num_cosine_cycles optimizer weight_decay muon_lr muon_momentum
+    scheduler_num_cosine_cycles optimizer weight_decay
+    adam_beta1 adam_beta2 max_grad_norm muon_lr muon_momentum
     muon_weight_decay muon_ns_steps muon_adjust_lr_fn
 """.split()  # noqa: SIM905 -- Compact, ordered compatibility allowlist.
 

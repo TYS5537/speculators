@@ -2,7 +2,7 @@
 
 import pytest
 
-from scripts.train import parse_args
+from scripts.train import main, parse_args
 from speculators.models.dflash.core import DFlashDraftModel
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.models.eagle3.core import Eagle3DraftModel
@@ -21,6 +21,33 @@ def _parse(monkeypatch, extra: list[str]):
 def test_activation_checkpointing_defaults_off(monkeypatch):
     args = _parse(monkeypatch, [])
     assert args.activation_checkpointing is False
+
+
+@pytest.mark.parametrize("recipe_flags", [[], ["--training-recipe", "upstream"]])
+def test_adam_betas_and_clipping_reach_training_config(monkeypatch, recipe_flags):
+    args = _parse(
+        monkeypatch,
+        [
+            "--speculator-type",
+            "eagle3",
+            "--optimizer",
+            "adamw",
+            "--adam-beta1",
+            "0.85",
+            "--adam-beta2",
+            "0.95",
+            "--max-grad-norm",
+            "0.5",
+            *recipe_flags,
+        ],
+    )
+    monkeypatch.setattr("scripts.train._train_cli.main", lambda config: config)
+    config = main(args)
+    assert config.optimizer.adam_beta1 == 0.85
+    assert config.optimizer.adam_beta2 == 0.95
+    assert config.trainer.max_grad_norm == 0.5
+    for field in ("adam_beta1", "adam_beta2", "max_grad_norm"):
+        assert config.provenance[field] == "flag"
 
 
 @pytest.mark.parametrize("fsdp", [False, True])

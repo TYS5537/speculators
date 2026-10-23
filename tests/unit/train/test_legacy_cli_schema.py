@@ -38,6 +38,12 @@ def test_runtime_optimization_defaults_keep_all_layer_policy():
     assert args.activation_checkpoint_layers is None
 
 
+def test_legacy_optimizer_defaults_preserve_existing_runs():
+    args = legacy_cli.build_train_parser().parse_args(_argv())
+    assert (args.adam_beta1, args.adam_beta2) == (0.9, 0.999)
+    assert args.max_grad_norm == 1.0
+
+
 def test_legacy_raw_defaults_do_not_inherit_schema_policy():
     parser = legacy_cli.build_train_parser()
     historical = {
