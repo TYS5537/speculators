@@ -77,7 +77,7 @@ def test_unsupported_model_fails_before_placement(monkeypatch):
     model = SimpleNamespace(to=Mock())
     trainer = _trainer(model, enabled=True)
 
-    with pytest.raises(ValueError, match="only supported by.*DFlash/DSpark"):
+    with pytest.raises(ValueError, match="set_activation_checkpointing support"):
         trainer.setup_model()
 
     model.to.assert_not_called()

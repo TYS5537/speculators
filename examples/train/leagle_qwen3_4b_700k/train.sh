@@ -27,36 +27,47 @@ HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
 TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
 
 # Keep the existing 700k data/packing budget, with the requested five epochs.
-SEQ_LENGTH=3072
-EPOCHS=5
-SEED=42
-TRAIN_DATA_RATIO=0.9
-LOGGER="tensorboard"
-NOISE_STD=0.05
+SEQ_LENGTH="${SEQ_LENGTH:-3072}"
+EPOCHS="${EPOCHS:-5}"
+SEED="${SEED:-42}"
+TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
+LOGGER="${LOGGER:-tensorboard}"
+NOISE_STD="${NOISE_STD:-0.05}"
 
 # LEAGLE: Qwen3 KV-conditioned layers, shared loops, and seven AR token steps.
 # NUM_LAYERS * NUM_LOOPS is the effective decoder depth per token.
-LR=1e-4
-MUON_LR=1e-4
-WEIGHT_DECAY=0.01
-MUON_WEIGHT_DECAY=0.1
-SCHEDULER_TYPE="linear"
-WARMUP_RATIO=0.01
+LR="${LR:-1e-4}"
+MUON_LR="${MUON_LR:-1e-4}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.01}"
+MUON_WEIGHT_DECAY="${MUON_WEIGHT_DECAY:-0.1}"
+SCHEDULER_TYPE="${SCHEDULER_TYPE:-linear}"
+WARMUP_RATIO="${WARMUP_RATIO:-0.01}"
 DRAFT_ARCH="qwen3"
-DRAFT_VOCAB_SIZE=32000
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
 TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
 # Qwen3-4B has 36 layers: the default auxiliary slots are 2, 18 and 33.
 # server.sh appends final teacher slot 36; do not append it here.
 TARGET_LAYER_IDS=(2 18 33)
 DRAFT_ATTN_IMPL="sdpa"  # Attention backend; independent of LOSS_IMPLEMENTATION.
-TTT_STEPS=7  # Token prediction steps; independent of NUM_LOOPS.
-TTT_STEP_LOSS_DECAY=1.0
-LOSS_FN="kl_div"
+TTT_STEPS="${TTT_STEPS:-7}" # Token prediction steps; independent of NUM_LOOPS.
+TTT_STEP_LOSS_DECAY="${TTT_STEP_LOSS_DECAY:-1.0}"
+LOSS_FN="${LOSS_FN:-kl_div}"
 # Eager KL keeps this preset independent of the installed Triton/NPU loss stack.
 # This changes the loss implementation, not the upstream recipe or KL objective.
-LOSS_IMPLEMENTATION="eager"
+LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-eager}"
+
+FSDP_SHARD="${FSDP_SHARD:-1}"
+ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-1}"
+RESUME="${RESUME:-0}"
+DRY_RUN="${DRY_RUN:-0}"  # Print the resolved launch command without loading models.
 
 # ============ Launch ============
+for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN; do
+    if [[ "${!setting}" != 0 && "${!setting}" != 1 ]]; then
+        echo "$setting must be 0 or 1." >&2
+        exit 2
+    fi
+done
 if [[ ! "$NUM_LAYERS" =~ ^[1-9][0-9]*$ || ! "$NUM_LOOPS" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_LAYERS and NUM_LOOPS must be positive integers." >&2
     exit 2
@@ -73,38 +84,52 @@ if [[ ! "$TRAIN_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
 fi
 IFS=',' read -r -a TRAIN_DEVICES <<< "$TRAIN_NPUS"
 NUM_TRAIN_NPUS="${#TRAIN_DEVICES[@]}"
-if [[ ! -d "$MODEL" || ! -d "$DATA_PATH" ]]; then
+if [[ "$RESUME" == 0 && "$DRY_RUN" == 0 ]] && [[ ! -d "$MODEL" || ! -d "$DATA_PATH" ]]; then
     echo "Model or prepared Arrow data not found; check MODEL and DATA_PATH from the repository root." >&2
     exit 2
 fi
 # Upstream uses size-keyed mappings. Do not silently fall back to full vocabulary
 # when only another experiment's legacy t2d.npy/d2t.npy files are present.
-if [[ ! -f "$TOKEN_FREQ_PATH" ]] &&
+if [[ "$RESUME" == 0 && "$DRY_RUN" == 0 && ! -f "$TOKEN_FREQ_PATH" ]] &&
    [[ ! -f "$DATA_PATH/d2t-${DRAFT_VOCAB_SIZE}.npy" ||
       ! -f "$DATA_PATH/t2d-${DRAFT_VOCAB_SIZE}.npy" ]]; then
     echo "Need $TOKEN_FREQ_PATH or paired d2t-${DRAFT_VOCAB_SIZE}.npy/t2d-${DRAFT_VOCAB_SIZE}.npy in DATA_PATH." >&2
     exit 2
 fi
-if [[ -e "$OUTPUT_DIR/checkpoints" || -e "$OUTPUT_DIR/logs/train.pid" ]]; then
-    echo "Run directory already used: $OUTPUT_DIR; choose a new OUTPUT_DIR in both scripts." >&2
-    exit 2
-fi
-if ! curl --noproxy '*' --connect-timeout 2 --max-time 5 -sf \
-    "${VLLM_ENDPOINT%/}/models" > /dev/null; then
-    echo "Target unavailable: start examples/train/leagle_qwen3_4b_700k/server.sh first ($VLLM_ENDPOINT)." >&2
-    exit 2
+if [[ "$DRY_RUN" == 0 ]]; then
+    if [[ -f "$OUTPUT_DIR/logs/train.pid" ]]; then
+        read -r PREVIOUS_PID < "$OUTPUT_DIR/logs/train.pid" || true
+        if [[ "${PREVIOUS_PID:-}" =~ ^[0-9]+$ ]] && kill -0 "$PREVIOUS_PID" 2>/dev/null; then
+            echo "Trainer PID $PREVIOUS_PID is still running; refusing a second writer." >&2
+            exit 2
+        fi
+    fi
+    if [[ "$RESUME" == 1 ]]; then
+        if [[ ! -f "$OUTPUT_DIR/checkpoints/run.yaml" ]]; then
+            echo "RESUME=1 requires the original checkpoints/run.yaml." >&2
+            exit 2
+        fi
+        if ! compgen -G "$OUTPUT_DIR/checkpoints/*/training_state.json" > /dev/null; then
+            echo "No saved training progress in $OUTPUT_DIR/checkpoints." >&2
+            exit 2
+        fi
+    elif [[ -e "$OUTPUT_DIR/checkpoints" || -e "$OUTPUT_DIR/logs/train.pid" ]]; then
+        echo "Run directory already used: $OUTPUT_DIR; use RESUME=1 or a new OUTPUT_DIR." >&2
+        exit 2
+    fi
+    if ! curl --noproxy '*' --connect-timeout 2 --max-time 5 -sf \
+        "${VLLM_ENDPOINT%/}/models" > /dev/null; then
+        echo "Target unavailable: start the paired server.sh first ($VLLM_ENDPOINT)." >&2
+        exit 2
+    fi
 fi
 
-mkdir -p "$HIDDEN_STATES_PATH"
-HIDDEN_STATES_PATH="$(cd "$HIDDEN_STATES_PATH" && pwd -P)"
-LOG_DIR="$OUTPUT_DIR/logs"
-mkdir -p "$LOG_DIR"
-LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S).log"
-PID_FILE="$LOG_DIR/train.pid"
+if [[ "$DRY_RUN" == 0 ]]; then
+    mkdir -p "$HIDDEN_STATES_PATH"
+    HIDDEN_STATES_PATH="$(cd "$HIDDEN_STATES_PATH" && pwd -P)"
+fi
 
-nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
-    --standalone --nproc_per_node "$NUM_TRAIN_NPUS" \
-    -m speculators.train \
+TRAIN_ARGS=(
     --training-recipe upstream --loss-implementation "$LOSS_IMPLEMENTATION" \
     --optimizer muon --muon-parameter-policy upstream \
     --lr "$LR" --muon-lr "$MUON_LR" \
@@ -114,7 +139,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --hidden-states-backend file --hidden-states-path "$HIDDEN_STATES_PATH" \
     --vllm-endpoint "$VLLM_ENDPOINT" --save-path "$OUTPUT_DIR/checkpoints" \
     --log-dir "$OUTPUT_DIR/tensorboard" --run-name "$RUN_NAME" \
-    --no-resume-from-checkpoint --save-best \
+    --no-resume-from-checkpoint --checkpoint-freq 1 \
     --seed "$SEED" --epochs "$EPOCHS" --logger "$LOGGER" \
     --total-seq-len "$SEQ_LENGTH" --train-data-ratio "$TRAIN_DATA_RATIO" \
     --hidden-states-dtype bfloat16 --noise-std "$NOISE_STD" \
@@ -126,13 +151,36 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --no-norm-before-fc --norm-output --no-embed-requires-grad \
     --ttt-steps "$TTT_STEPS" --ttt-step-loss-decay "$TTT_STEP_LOSS_DECAY" \
     --loss-fn "$LOSS_FN" --on-missing generate --on-generate delete \
-    > "$LOG_FILE" 2>&1 &
+)
+if [[ "$RESUME" == 1 ]]; then
+    # Architecture, optimizer, loss, schedule and memory settings come from the
+    # original run. Endpoint and output paths may change when restarting.
+    TRAIN_ARGS=(--config "$OUTPUT_DIR/checkpoints/run.yaml" --resume-from-checkpoint
+        --no-save-best --checkpoint-freq 1
+        --save-path "$OUTPUT_DIR/checkpoints" --log-dir "$OUTPUT_DIR/tensorboard"
+        --vllm-endpoint "$VLLM_ENDPOINT" --hidden-states-path "$HIDDEN_STATES_PATH")
+else
+    if [[ "$FSDP_SHARD" == 1 ]]; then TRAIN_ARGS+=(--fsdp-shard); fi
+    if [[ "$ACTIVATION_CHECKPOINTING" == 1 ]]; then TRAIN_ARGS+=(--activation-checkpointing); fi
+fi
+CMD=(env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun
+    --standalone --nproc_per_node "$NUM_TRAIN_NPUS" -m speculators.train "${TRAIN_ARGS[@]}")
+if [[ "$DRY_RUN" == 1 ]]; then
+    printf '%q ' "${CMD[@]}"
+    printf '\n'
+    exit 0
+fi
+LOG_DIR="$OUTPUT_DIR/logs"
+mkdir -p "$LOG_DIR"
+LOG_FILE="$LOG_DIR/train_$(date +%Y%m%d_%H%M%S)_$$.log"
+PID_FILE="$LOG_DIR/train.pid"
+nohup "${CMD[@]}" > "$LOG_FILE" 2>&1 &
 
 TRAIN_PID=$!
 echo "$TRAIN_PID" > "$PID_FILE"
 echo "Started $RUN_NAME, PID $TRAIN_PID, NPUs $TRAIN_NPUS"
 echo "Log: $LOG_FILE"
 echo "TensorBoard: $OUTPUT_DIR/tensorboard"
-echo "Checkpoints: $OUTPUT_DIR/checkpoints (best validation loss: checkpoint_best)"
+echo "Checkpoints: $OUTPUT_DIR/checkpoints (all epochs retained; best validation loss: checkpoint_best)"
 echo "Stop trainer: kill $TRAIN_PID; server.sh remains running independently."
 echo "Run separately from other recipes using these NPUs; check the log for startup errors."

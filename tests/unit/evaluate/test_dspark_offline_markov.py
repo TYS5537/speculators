@@ -1,4 +1,3 @@
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
 """Standalone Markov decoding must preserve the training-time block recurrence."""
 
 import importlib.util

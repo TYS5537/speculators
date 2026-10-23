@@ -3,6 +3,7 @@ from typing import ClassVar
 
 import torch
 from torch.nn.attention.flex_attention import create_block_mask, create_mask
+from torch.utils.checkpoint import checkpoint
 from transformers import AutoConfig, DynamicCache, PretrainedConfig
 
 from speculators.config import SpeculatorsConfig, VerifierConfig
@@ -15,6 +16,7 @@ from speculators.models.eagle3.attention import (
     extend_dense_mask_for_draft_tokens,
     extend_mask_for_draft_tokens,
 )
+from speculators.models.eagle3.checkpointing import checkpointed_decoder
 from speculators.models.eagle3.metrics import compute_metrics
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.models.metrics import resolve_training_loss
@@ -140,7 +142,18 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 ]
             )
 
+        self.activation_checkpointing = False
+        self.activation_checkpoint_layers: frozenset[int] | None = None
         self.post_init()
+
+    def set_activation_checkpointing(self, enabled: bool, *, layer_ids=None):
+        selected = None if layer_ids is None else frozenset(layer_ids)
+        if selected is not None and any(
+            i < 0 or i >= len(self.layers) for i in selected
+        ):
+            raise ValueError("Checkpoint layer IDs must index physical decoder layers")
+        self.activation_checkpointing = enabled
+        self.activation_checkpoint_layers = selected
 
     @property
     def target_layer_ids(self) -> list[int]:
@@ -290,15 +303,43 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     if layer_idx in self.sliding_window_indices
                     else full_attn_mask
                 )
-                hidden_states = decoder_layer(
-                    hidden_states,
-                    attention_mask=layer_mask,
-                    position_ids=position_ids,
-                    past_key_values=past_key_values,
-                    cache_position=cache_position,
-                    position_embeddings=position_embeddings,
-                    **kwargs,
+                recompute = (
+                    self.training
+                    and self.activation_checkpointing
+                    and (
+                        self.activation_checkpoint_layers is None
+                        or layer_idx in self.activation_checkpoint_layers
+                    )
                 )
+                if recompute:
+                    previous = None
+                    if past_key_values.get_seq_length(layer_idx):
+                        cached = past_key_values.layers[layer_idx]
+                        previous = (cached.keys, cached.values)
+                    hidden_states, present = checkpoint(
+                        checkpointed_decoder,
+                        decoder_layer,
+                        hidden_states,
+                        layer_mask,
+                        position_ids,
+                        cache_position,
+                        position_embeddings,
+                        previous,
+                        kwargs,
+                        use_reentrant=False,
+                        preserve_rng_state=True,
+                    )
+                    past_key_values.update(*present, layer_idx)
+                else:
+                    hidden_states = decoder_layer(
+                        hidden_states,
+                        attention_mask=layer_mask,
+                        position_ids=position_ids,
+                        past_key_values=past_key_values,
+                        cache_position=cache_position,
+                        position_embeddings=position_embeddings,
+                        **kwargs,
+                    )
 
             if self.config.norm_output:
                 hidden_states = self.norm(hidden_states)

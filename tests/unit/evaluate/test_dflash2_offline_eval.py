@@ -1,4 +1,3 @@
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
 """Standalone DFlash2 backbone and sequential-selector integration in offline eval."""
 
 import importlib.util

@@ -1,7 +1,5 @@
 """Real CPU page storage tests, including padding/scales/compressor rollback."""
 
-# ruff: noqa: INP001
-
 from types import SimpleNamespace
 
 import pytest

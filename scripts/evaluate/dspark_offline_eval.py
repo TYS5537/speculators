@@ -757,6 +757,14 @@ class DSparkOfflineRunner:
         self.sample_from_anchor = _draft_sample_from_anchor(draft_model)
         self.first_draft_slot = first_draft_slot_for_draft(draft_model)
         self.max_proposal_tokens = speculative_slots_for_draft(draft_model)
+        requested = getattr(args, "spec_tokens", None)
+        if requested is not None:
+            if requested < 1 or requested > self.max_proposal_tokens:
+                raise ValueError(
+                    f"--spec-tokens must be in [1, {self.max_proposal_tokens}] "
+                    "for this checkpoint"
+                )
+            self.max_proposal_tokens = requested
         correction_output_mode = getattr(
             getattr(draft_model, "correction_head", None),
             "output_mode",
@@ -1199,9 +1207,10 @@ class DSparkOfflineRunner:
             )
 
     def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
-            self.device
-        )
+        token_options = {"return_tensors": "pt"}
+        if getattr(self.args, "target_backend", "hf") == "hf":
+            token_options["add_special_tokens"] = False
+        input_ids = self.tokenizer(prompt, **token_options).input_ids.to(self.device)
         validate_budget = getattr(self.target_model, "validate_request_budget", None)
         if validate_budget is not None and int(self.args.max_new_tokens) > 0:
             validate_budget(
@@ -1230,6 +1239,18 @@ class DSparkOfflineRunner:
                 )
 
             response = generate()
+            if getattr(self.args, "check_greedy", False):
+                from speculators_eval.leagle_decoding import (  # noqa: PLC0415
+                    check_greedy_output,
+                )
+
+                check_greedy_output(
+                    self.target_model,
+                    input_ids,
+                    response,
+                    int(self.args.max_new_tokens),
+                    stop_token_ids,
+                )
             if replay:
                 self.target_model.audit(generate, response)
             return response
@@ -1243,9 +1264,10 @@ class BaseModelOfflineRunner:
         self.device = next(target_model.parameters()).device
 
     def generate_one(self, prompt: str, stop_token_ids: list[int] | None):
-        input_ids = self.tokenizer(prompt, return_tensors="pt").input_ids.to(
-            self.device
-        )
+        token_options = {"return_tensors": "pt"}
+        if getattr(self.args, "target_backend", "hf") == "hf":
+            token_options["add_special_tokens"] = False
+        input_ids = self.tokenizer(prompt, **token_options).input_ids.to(self.device)
         with torch.inference_mode():
             return generate_base_model_sample(
                 target_model=self.target_model,
@@ -1579,6 +1601,22 @@ def _run(args: argparse.Namespace, resources: ExitStack) -> None:
         run_ascend_data_parallel(args)
         return
     models = _load_evaluation_models(args, setup, resources)
+    if hasattr(args, "checkpoint_identity"):
+        from speculators_eval import provenance  # noqa: PLC0415
+
+        provenance.validate_checkpoint_files(args)
+        provenance.write_eval_provenance(
+            args,
+            {
+                "draft_config": models.draft_config.to_dict(),
+                "spec_tokens": getattr(args, "spec_tokens", None)
+                or speculative_slots_for_draft(models.draft_model),
+                "resolved_dtype": str(
+                    getattr(models.target_model, "dtype", args.dtype)
+                ),
+                "online_speedup_benchmark": False,
+            },
+        )
     _log_loaded_draft(models.draft_model, models.draft_config)
     _evaluate_loaded_models(args, models)
 
@@ -1702,7 +1740,16 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-    run(parse_args())
+    from speculators_eval import provenance  # noqa: PLC0415
+
+    args = parse_args()
+    _eval_orchestration.validate_run_options(args)
+    provenance.prepare_checkpoints(args)
+    provenance.write_eval_provenance(args)
+    try:
+        run(args)
+    finally:
+        provenance.validate_checkpoint_files(args)
 
 
 if __name__ == "__main__":

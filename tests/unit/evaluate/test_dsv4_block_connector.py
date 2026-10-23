@@ -1,7 +1,5 @@
 """CPU tests for the server connector: real tensors/files, isolated vLLM stubs."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import sys
 from concurrent.futures import ThreadPoolExecutor

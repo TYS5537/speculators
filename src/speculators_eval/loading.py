@@ -155,6 +155,7 @@ def load_evaluation_models(
             AutoModelForCausalLM.from_pretrained(
                 args.verifier_model,
                 torch_dtype=dtype,
+                attn_implementation=getattr(args, "target_attn_impl", "sdpa"),
                 trust_remote_code=args.trust_remote_code,
             )
             .to(device)
@@ -193,6 +194,10 @@ def load_evaluation_draft(
         from speculators_dsv4.eval_contract import bind_draft_verifier  # noqa: PLC0415
 
         bind_draft_verifier(draft_config, setup.report)
+    else:
+        # Borrow embeddings/head/norm from the same target that verifies tokens,
+        # including when its local path differs from the training checkpoint.
+        draft_config.speculators_config.verifier.name_or_path = args.verifier_model
     sample_from_anchor = parse_bool_override(args.sample_from_anchor)
     if sample_from_anchor is not None:
         draft_config.sample_from_anchor = sample_from_anchor

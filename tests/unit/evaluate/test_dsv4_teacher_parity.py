@@ -1,7 +1,5 @@
 """Real CPU tensors/safetensors; fake target transport, never an A3 parity claim."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import json
 import math

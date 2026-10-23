@@ -192,6 +192,14 @@ def _add_field_argument(
         else:
             kwargs.pop("choices", None)
     parser.add_argument(_dest_to_flag(name), dest=name, **kwargs)
+    if name == "no_resume_from_checkpoint":
+        parser.add_argument(
+            "--resume-from-checkpoint",
+            dest=name,
+            action="store_false",
+            default=argparse.SUPPRESS,
+            help="Resume saved progress, overriding no_resume_from_checkpoint in YAML.",
+        )
 
 
 def _add_backend_arguments(parser: argparse.ArgumentParser) -> None:

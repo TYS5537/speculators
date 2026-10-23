@@ -6,8 +6,6 @@ The optional NPU test captures that whole bridge with the real graph API; it is
 not an integration test for vLLM scheduling, attention kernels or HS transport.
 """
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import gc
 import importlib.util
 import sys

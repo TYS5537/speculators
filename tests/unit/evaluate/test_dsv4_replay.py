@@ -1,7 +1,5 @@
 """CPU replay tests: real packets/cache files and the unchanged decoding loop."""
 
-# ruff: noqa: INP001 -- Existing evaluate tests are not a package.
-
 import importlib.util
 import json
 import sys

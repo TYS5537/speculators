@@ -1,7 +1,5 @@
 """CPU adapter tests: mock transport, real tensors and existing acceptance math."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import json
 import math

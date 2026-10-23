@@ -44,3 +44,4 @@ Eagle-3 is based on research from SafeAI Lab: [EAGLE Repository](https://github.
 ## See Also
 
 - [Train a Speculator](../tutorials/train.md) -- Step-by-step training guide (select Eagle-3, then online, offline, or hybrid)
+- [Qwen3-4B EAGLE3 / LEAGLE comparison](leagle.md) -- Independent training scripts, FSDP and activation checkpointing, resumable runs, and a shared single-chain greedy offline evaluation protocol. EAGLE3 evaluation starts with `examples/evaluate/eagle3_qwen3_4b_700k.sh`.

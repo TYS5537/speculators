@@ -427,7 +427,10 @@ class TrainerArgs(_Group):
     )
     save_best: bool = Field(
         default=False,
-        description="Also point a checkpoint at the lowest validation loss.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Save only improved validation-loss checkpoints and remove "
+        "older numbered checkpoints. Default keeps periodic checkpoints "
+        "and a best pointer.",
     )
     no_resume_from_checkpoint: bool = Field(
         default=False, description="Do not resume training from an existing checkpoint."
@@ -447,6 +450,7 @@ class TrainerArgs(_Group):
     )
     fsdp_shard: bool = Field(
         default=False,
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
         description="Shard model parameters across GPUs with FSDP. By default "
         "parameters are fully replicated (DDP-like). Enable when the model does not "
         "fit in a single GPU's memory.",

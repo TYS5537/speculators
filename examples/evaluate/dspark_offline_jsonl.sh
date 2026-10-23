@@ -48,6 +48,8 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTH
 # Generation controls.
 : "${MAX_NEW_TOKENS:=512}"
 : "${TEMPERATURE:=0.0}"
+: "${SPEC_TOKENS:=}"  # Set 7 for the EAGLE3/LEAGLE comparison; otherwise use saved slots.
+: "${CHECK_GREEDY:=0}"
 : "${SEED:=980406}"
 
 # Runtime controls. For multi-NPU evaluation set ASCEND_DEVICES and keep
@@ -56,6 +58,7 @@ export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTH
 : "${DEVICE:=npu:0}"
 : "${DTYPE:=bfloat16}"
 : "${DRAFT_ATTN_IMPL:=sdpa}"
+: "${TARGET_ATTN_IMPL:=sdpa}"
 : "${DRAFT_KV_REUSE:=0}"  # Optional confirmed-context projection/KV reuse.
 : "${TRUST_REMOTE_CODE:=1}"
 
@@ -77,6 +80,7 @@ cmd=(
   --device "$DEVICE"
   --dtype "$DTYPE"
   --draft-attn-impl "$DRAFT_ATTN_IMPL"
+  --target-attn-impl "$TARGET_ATTN_IMPL"
   --seed "$SEED"
 )
 
@@ -86,6 +90,12 @@ fi
 if [[ -n "$MAX_SAMPLES" ]]; then
   cmd+=(--max-samples "$MAX_SAMPLES")
 fi
+if [[ -n "$SPEC_TOKENS" ]]; then cmd+=(--spec-tokens "$SPEC_TOKENS"); fi
+case "$CHECK_GREEDY" in
+  0) ;;
+  1) cmd+=(--check-greedy) ;;
+  *) echo 'CHECK_GREEDY must be 0 or 1.' >&2; exit 1 ;;
+esac
 if [[ -n "$ASCEND_DEVICES" ]]; then
   cmd+=(--ascend-devices "$ASCEND_DEVICES")
 fi

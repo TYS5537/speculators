@@ -51,6 +51,9 @@ class _Case:
         self.clients = []
         self.config = SimpleNamespace(
             speculators_model_type="mmuse",
+            speculators_config=SimpleNamespace(
+                verifier=SimpleNamespace(name_or_path="training-target")
+            ),
             sample_from_anchor=True,
             transformer_layer_config=SimpleNamespace(_attn_implementation="saved"),
             correction_output_mode="logits",

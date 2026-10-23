@@ -487,8 +487,8 @@ class Trainer:
             )
             if not callable(enable_checkpointing):
                 raise ValueError(
-                    "--activation-checkpointing is only supported by the "
-                    "DFlash/DSpark dense backbone."
+                    "--activation-checkpointing requires a model with "
+                    "set_activation_checkpointing support."
                 )
             if layers is None:
                 enable_checkpointing(True)

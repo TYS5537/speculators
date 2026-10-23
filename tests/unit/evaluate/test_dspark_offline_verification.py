@@ -1,7 +1,5 @@
 """Verifier branch, stop-token and RNG contracts on real CPU tensors."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import sys
 from pathlib import Path

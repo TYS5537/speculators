@@ -31,6 +31,7 @@ RESULT_COLUMNS = [
     "acceptance_length",
     "accepted_draft_length",
     "position_accept_rates",
+    "position_accept_rates_per_round",
     "position_accept_prob_means",
     "position_support_accept_rate_means",
     "position_accept_prob_sums",
@@ -81,6 +82,14 @@ class EvalStats:
                 self.position_proposed_counts,
                 strict=True,
             )
+        ]
+
+    @property
+    def position_accept_rates_per_round(self) -> list[float]:
+        """Unconditional prefix acceptance, matching vLLM's per-round metric."""
+        return [
+            count / self.num_proposals if self.num_proposals else 0.0
+            for count in self.position_accepted_counts
         ]
 
     @property
@@ -318,6 +327,9 @@ def summary_row(dataset: str, num_requests: int, stats: EvalStats) -> dict[str, 
         "acceptance_length": stats.acceptance_length,
         "accepted_draft_length": stats.accepted_draft_length,
         "position_accept_rates": json.dumps(stats.position_accept_rates),
+        "position_accept_rates_per_round": json.dumps(
+            stats.position_accept_rates_per_round
+        ),
         "position_accept_prob_means": json.dumps(stats.position_accept_prob_means),
         "position_support_accept_rate_means": json.dumps(
             stats.position_support_accept_rate_means

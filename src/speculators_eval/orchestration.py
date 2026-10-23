@@ -9,6 +9,13 @@ from speculators_eval.loading import LoadedEvaluation, TargetSetup
 
 
 def validate_run_options(args: argparse.Namespace) -> None:
+    budget = getattr(args, "spec_tokens", None)
+    if budget is not None and budget < 1:
+        raise ValueError("--spec-tokens must be >= 1")
+    if getattr(args, "check_greedy", False) and (
+        getattr(args, "target_backend", "hf") != "hf" or args.temperature != 0
+    ):
+        raise ValueError("--check-greedy requires an HF target and temperature=0")
     if getattr(args, "dsv4_verification_mode", "reference") == "replay":
         if (
             getattr(args, "target_backend", "hf") != "dsv4-vllm"

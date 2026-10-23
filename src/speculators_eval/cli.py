@@ -70,6 +70,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--max-new-tokens", type=int, default=512)
+    parser.add_argument(
+        "--spec-tokens",
+        type=int,
+        default=None,
+        help="Cap draft tokens per round; must fit the checkpoint's slots.",
+    )
+    parser.add_argument("--target-attn-impl", choices=["sdpa", "eager"], default="sdpa")
+    parser.add_argument(
+        "--check-greedy",
+        action="store_true",
+        help="Audit HF temperature=0 outputs against target-only generation.",
+    )
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=980406)
     parser.add_argument(
@@ -125,6 +137,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--worker-shard-index", type=int, default=None)
     parser.add_argument("--worker-num-shards", type=int, default=1)
     parser.add_argument("--worker-progress-path", type=Path, help=argparse.SUPPRESS)
+    parser.add_argument("--checkpoint-manifest", type=Path, help=argparse.SUPPRESS)
     return parser
 
 

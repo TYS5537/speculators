@@ -1,7 +1,5 @@
 """Exercise the real SDK response parser without a server, model, or API key."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import json
 
 import httpx

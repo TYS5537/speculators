@@ -1,7 +1,5 @@
 """Prompt-field selection and Alpaca instruction/input composition."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import json
 import sys

@@ -309,6 +309,9 @@ class OfflineEvalModuleTests(unittest.TestCase):
                 "output_dir": Path("dspark_offline_eval"),
                 "max_samples": None,
                 "max_new_tokens": 512,
+                "spec_tokens": None,
+                "target_attn_impl": "sdpa",
+                "check_greedy": False,
                 "temperature": 0.0,
                 "seed": 980406,
                 "enable_thinking": "false",
@@ -330,6 +333,7 @@ class OfflineEvalModuleTests(unittest.TestCase):
                 "worker_shard_index": None,
                 "worker_num_shards": 1,
                 "worker_progress_path": None,
+                "checkpoint_manifest": None,
             },
         )
         argv = [

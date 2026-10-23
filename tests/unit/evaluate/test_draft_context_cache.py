@@ -1,4 +1,3 @@
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
 """Real draft-layer cache/reference parity, including MMuse and reject boundaries."""
 
 import importlib.util

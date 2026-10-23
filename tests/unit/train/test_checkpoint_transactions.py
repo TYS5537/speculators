@@ -314,6 +314,22 @@ def test_repeated_save_keeps_one_backup_and_best_cleanup_preserves_it(
     assert cp._epoch_checkpoint_path(0) == tmp_path / "0"
 
 
+def test_best_cleanup_only_removes_numbered_checkpoints(checkpoint_module, tmp_path):
+    cp = checkpoint_module.SingleGPUCheckpointer(tmp_path)
+    for name in ("0", "1", "interrupted", ".previous-0-test", ".pending-test", "eval"):
+        (tmp_path / name).mkdir()
+        (tmp_path / name / "sentinel").write_text(name)
+    artifacts = ("train_command.txt", "run.yaml", "speculators.patch", "vllm.patch")
+    for name in artifacts:
+        (tmp_path / name).write_text(name)
+    cp.cleanup_keep_only_best(1)
+    assert not (tmp_path / "0").exists()
+    for name in ("1", "interrupted", ".previous-0-test", ".pending-test", "eval"):
+        assert (tmp_path / name / "sentinel").read_text() == name
+    for name in artifacts:
+        assert (tmp_path / name).read_text() == name
+
+
 @pytest.mark.parametrize(
     "damage", ["config", "manifest", "missing_manifest", "missing_directory"]
 )

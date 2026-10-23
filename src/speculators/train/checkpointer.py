@@ -546,7 +546,7 @@ class BaseCheckpointer:
     @_rank0_only
     def cleanup_keep_only_best(self, best_epoch: int) -> None:
         """
-        Delete all epoch dir. except best_epoch, and keep best_checkpoint symlink.
+        Delete old numbered checkpoints, preserving provenance and recovery data.
         """
         keep_dir = self.path / str(best_epoch)
         best_link = self.best_path()
@@ -554,8 +554,6 @@ class BaseCheckpointer:
         # Safety checks
         if not keep_dir.exists() or not keep_dir.is_dir():
             raise FileNotFoundError(f"Best epoch dir does not exist: {keep_dir}")
-
-        train_cmd_file = self.path / self.TRAIN_COMMAND_FILENAME
 
         for child in self.path.iterdir():
             # Keep the symlink itself
@@ -566,16 +564,13 @@ class BaseCheckpointer:
             if child == keep_dir:
                 continue
 
-            if child == train_cmd_file:
+            # Only numbered checkpoints belong to this retention policy. Keep
+            # run.yaml, patches, user artifacts and interrupted/recovery saves.
+            if not child.name.isdecimal() or not child.is_dir():
                 continue
 
-            # Transaction recovery generations must survive best-only cleanup.
-            if child.name.startswith((".previous-", ".pending-")):
-                continue
-
-            # Delete numbered epoch directories and any other stray dirs/files
             try:
-                if child.is_symlink() or child.is_file():
+                if child.is_symlink():
                     child.unlink()
                 elif child.is_dir():
                     shutil.rmtree(child)

@@ -1,7 +1,5 @@
 """Regression tests for exact acceptance ratios of rare proposed tokens."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import sys
 from pathlib import Path

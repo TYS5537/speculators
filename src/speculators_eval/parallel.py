@@ -79,6 +79,17 @@ def target_worker_args(args: argparse.Namespace) -> list[str]:
     return result
 
 
+def _proposal_worker_args(args) -> list[str]:
+    result = []
+    for name in ("spec_tokens", "target_attn_impl", "checkpoint_manifest"):
+        value = getattr(args, name, None)
+        if value is not None:
+            result.extend(["--" + name.replace("_", "-"), str(value)])
+    if getattr(args, "check_greedy", False):
+        result.append("--check-greedy")
+    return result
+
+
 def worker_command(
     args: argparse.Namespace,
     *,
@@ -140,6 +151,8 @@ def worker_command(
         cmd.append("--trust-remote-code")
     if args.sample_from_anchor is not None:
         cmd.extend(["--sample-from-anchor", str(args.sample_from_anchor).lower()])
+    # Preserve the proposal budget, attention backend and pinned weights.
+    cmd.extend(_proposal_worker_args(args))
     cmd.extend(target_worker_args(args))
     if args.measure_base_speedup:
         cmd.extend(

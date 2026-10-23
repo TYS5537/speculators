@@ -1,7 +1,5 @@
 """Dataset identities and output isolation for the offline evaluator."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import json
 import sys

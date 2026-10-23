@@ -1,7 +1,5 @@
 """Draft-loading precision at the HF target/draft hidden-state boundary."""
 
-# ruff: noqa: INP001 -- Existing evaluate test directory is not a package.
-
 import importlib.util
 import sys
 from pathlib import Path
@@ -58,6 +56,7 @@ def load_draft(evaluator, monkeypatch, *, target_dtype, checkpoint_dtype, backen
             return self.fc(hidden_states)
 
     args = SimpleNamespace(
+        verifier_model="local-target",
         draft_model="local-checkpoint",
         dtype="auto",
         device="cpu",
@@ -66,7 +65,12 @@ def load_draft(evaluator, monkeypatch, *, target_dtype, checkpoint_dtype, backen
         d2t_path=None,
         t2d_path=None,
     )
-    config = SimpleNamespace(transformer_layer_config=SimpleNamespace())
+    config = SimpleNamespace(
+        transformer_layer_config=SimpleNamespace(),
+        speculators_config=SimpleNamespace(
+            verifier=SimpleNamespace(name_or_path="training-target")
+        ),
+    )
     report = {"model_path": "local-target"} if backend == "dsv4-vllm" else None
     setup = evaluator._TargetSetup(backend, {}, report, None)
     monkeypatch.setattr(evaluator, "_load_draft_config", lambda _path: config)
