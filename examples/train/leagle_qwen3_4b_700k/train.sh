@@ -91,7 +91,7 @@ if [[ -e "$OUTPUT_DIR/checkpoints" || -e "$OUTPUT_DIR/logs/train.pid" ]]; then
 fi
 if ! curl --noproxy '*' --connect-timeout 2 --max-time 5 -sf \
     "${VLLM_ENDPOINT%/}/models" > /dev/null; then
-    echo "Target unavailable: start leagle/qwen3_4b_700k/server.sh first ($VLLM_ENDPOINT)." >&2
+    echo "Target unavailable: start examples/train/leagle_qwen3_4b_700k/server.sh first ($VLLM_ENDPOINT)." >&2
     exit 2
 fi
 

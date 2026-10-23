@@ -4,8 +4,8 @@ LEAGLE 是用于深度 / loop 对照实验的自回归 drafter：保留 DFlash /
 
 ## 目录
 
-- `qwen3_4b_700k/server.sh`：LEAGLE 目标模型 vLLM 隐藏状态服务，单独启动。
-- `qwen3_4b_700k/train.sh`：LEAGLE 70 万数据、5 epochs 的训练脚本，默认 1 层、1 loop。
+- `../examples/train/leagle_qwen3_4b_700k/server.sh`：LEAGLE 目标模型 vLLM 隐藏状态服务，单独启动。
+- `../examples/train/leagle_qwen3_4b_700k/train.sh`：LEAGLE 70 万数据、5 epochs 的训练脚本，默认 1 层、1 loop。
 - `../examples/train/eagle3_qwen3_4b_700k/`：普通 EAGLE-3 的独立 `server.sh` 和 `train.sh`。
 - `tests/`：CPU 数值与训练接口测试。
 - `runs/`：本地运行产物，已加入忽略规则。
@@ -65,10 +65,10 @@ bash examples/train/eagle3_qwen3_4b_700k/train.sh
 
 ```bash
 # LEAGLE，终端 1：目标特征服务。
-bash leagle/qwen3_4b_700k/server.sh
+bash examples/train/leagle_qwen3_4b_700k/server.sh
 
 # LEAGLE，终端 2：看到服务 ready 后启动训练。
-bash leagle/qwen3_4b_700k/train.sh
+bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
 默认输出分别为 `leagle/runs/eagle3_qwen3_4b_700k_5ep_d1_full/` 和 `leagle/runs/leagle_qwen3_4b_700k_5ep_d1_r1_full/`。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。
@@ -78,8 +78,8 @@ bash leagle/qwen3_4b_700k/train.sh
 测试其他深度和 loop 时，可在两个终端分别指定相同参数，例如：
 
 ```bash
-NUM_LAYERS=2 NUM_LOOPS=3 bash leagle/qwen3_4b_700k/server.sh
-NUM_LAYERS=2 NUM_LOOPS=3 bash leagle/qwen3_4b_700k/train.sh
+NUM_LAYERS=2 NUM_LOOPS=3 bash examples/train/leagle_qwen3_4b_700k/server.sh
+NUM_LAYERS=2 NUM_LOOPS=3 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
 也可通过统一入口使用 `--speculator-type leagle --num-layers D --num-loops R --ttt-steps 7`，或把对应字段放进训练 YAML 的 `draft` 和 `loss` 组。保存的 checkpoint 包含 `num_loops`。继续训练已有 checkpoint 时不能静默改变这一值。
