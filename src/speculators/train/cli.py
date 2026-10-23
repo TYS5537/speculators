@@ -275,6 +275,7 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Setup dataloaders
     preprocess_fns = {
         "eagle3": shift_batch,
+        "leagle": shift_batch,
         "peagle": shift_batch,
         "mtp": shift_batch_mtp,
     }

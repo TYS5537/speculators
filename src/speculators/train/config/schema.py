@@ -100,6 +100,12 @@ class DraftArgs(_Group):
         description="Number of draft decoder layers to synthesize. "
         "(default: 5 for dflash/dspark/dflash2, 1 otherwise).",
     )
+    num_loops: int = Field(
+        default=1,
+        ge=1,
+        description="LEAGLE shared decoder-stack visits per token; independent of "
+        "--num-layers and --ttt-steps. Other algorithms require 1.",
+    )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
         description="Architecture for draft decoder layers "
@@ -825,12 +831,31 @@ class TrainConfig(BaseSettings):
 
     def _resolve_model_defaults(self) -> None:
         is_eagle3 = self.speculator_type == "eagle3"
+        is_leagle = self.speculator_type == "leagle"
+        if self.draft.num_loops != 1 and not is_leagle:
+            raise ValueError(
+                "--num-loops is only supported by --speculator-type leagle"
+            )
         if self.draft.draft_arch is None:
             self.draft.draft_arch = "llama" if is_eagle3 else "qwen3"
         if self.draft.norm_before_fc is None:
             self.draft.norm_before_fc = is_eagle3
         if self.draft.norm_output is None:
-            self.draft.norm_output = is_eagle3
+            self.draft.norm_output = is_eagle3 or is_leagle
+        if is_leagle:
+            if "ttt_steps" not in self.loss.model_fields_set:
+                self.loss.ttt_steps = 7
+            if self.draft.draft_arch != "qwen3":
+                raise ValueError("LEAGLE requires --draft-arch qwen3")
+            if (
+                self.draft.norm_before_fc
+                or self.draft.fc_norm
+                or self.draft.embed_requires_grad
+            ):
+                raise ValueError(
+                    "LEAGLE uses FC then RMSNorm target fusion and frozen embeddings; "
+                    "norm-before-fc, fc-norm and embed-requires-grad are unsupported"
+                )
         if self.draft.sliding_window_non_causal is None:
             self.draft.sliding_window_non_causal = self.speculator_type == "dflash2"
 

@@ -49,7 +49,8 @@ _LEGACY_FIELDS = """
     on_generate request_timeout max_retries legacy_data save_path epochs lr
     train_data_ratio no_resume_from_checkpoint logger total_seq_len log_freq
     profile_freq
-    log_dir run_name num_layers draft_arch draft_hidden_act draft_mrope_full_head_hack
+    log_dir run_name num_layers num_loops draft_arch draft_hidden_act
+    draft_mrope_full_head_hack
     target_layer_ids target_hidden_state_format dsv4_external_arrow token_freq_path
     draft_vocab_size d2t_path t2d_path mask_token_id ttt_steps num_speculative_steps
     ttt_step_loss_decay loss_fn step_weight_beta seed hidden_states_dtype
@@ -85,7 +86,7 @@ _LEGACY_DEFAULTS = {
 }
 _LEGACY_HELP = {
     "speculator_type": "Type of speculator model to train "
-    "(eagle3, dflash, dflash2, dspark, mmuse, peagle, mtp); "
+    "(eagle3, leagle, dflash, dflash2, dspark, mmuse, peagle, mtp); "
     "muse is a legacy alias for mmuse",
     "epochs": "Training epochs (default: 20; DSpark paper default: 10).",
     "num_layers": "Draft decoder layers (default: 1; DSpark paper default: 5).",
@@ -213,9 +214,27 @@ def _apply_training_defaults(args: argparse.Namespace, provided: set[str]) -> No
     if args.norm_before_fc is None:
         args.norm_before_fc = is_eagle3
     if args.norm_output is None:
-        args.norm_output = is_eagle3
+        args.norm_output = is_eagle3 or args.speculator_type == "leagle"
+    _apply_leagle_defaults(args, provided)
     if args.muon_lr is None:
         args.muon_lr = 10 * args.lr
+
+
+def _apply_leagle_defaults(args: argparse.Namespace, provided: set[str]) -> None:
+    if args.speculator_type == "leagle" and "ttt_steps" not in provided:
+        args.ttt_steps = 7
+
+
+def _validate_leagle_args(parser, args) -> None:
+    if args.num_loops < 1 or (args.num_loops != 1 and args.speculator_type != "leagle"):
+        parser.error("--num-loops must be >= 1 and requires --speculator-type leagle")
+    if args.speculator_type == "leagle":
+        if args.draft_arch != "qwen3":
+            parser.error("LEAGLE requires --draft-arch qwen3")
+        if args.norm_before_fc or args.fc_norm or args.embed_requires_grad:
+            parser.error(
+                "LEAGLE uses FC then RMSNorm target fusion and frozen embeddings"
+            )
 
 
 def _validate_dflash2_args(
@@ -238,6 +257,7 @@ def _validate_training_args(
 ) -> None:
     """Validate initialized arguments in the established CLI error order."""
     validate_draft_init_args(parser, args, provided)
+    _validate_leagle_args(parser, args)
     resolve_loss_config(args.loss_fn)
     if args.speculator_type == "dflash2":
         _validate_dflash2_args(parser, args)

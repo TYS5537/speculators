@@ -22,6 +22,7 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
 # learned proposal semantics and therefore must match the checkpoint. The small
 # runtime-only subset below can safely change without adding/removing weights.
 PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
+    "num_loops": "--num-loops",
     "target_hidden_state_format": "--target-hidden-state-format",
     "block_size": "--block-size",
     "sample_from_anchor": "--sample-from-anchor",
