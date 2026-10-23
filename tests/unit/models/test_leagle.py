@@ -194,7 +194,7 @@ def test_packed_documents_and_padding_do_not_leak_or_receive_cross_document_loss
         loss_config=resolve_loss_config("kl_div", implementation="eager"),
     )
     assert torch.isfinite(loss)
-    assert [metrics[f"full_acc_{s}_total"].item() for s in range(3)] == [5, 3, 1]
+    assert [metrics[f"position_{s}_acc_total"].item() for s in range(3)] == [5, 3, 1]
     tokens, separate_logits = model.propose(
         inputs["hidden_states"][:, 3:5],
         inputs["input_ids"][:, 4:5],

@@ -17,7 +17,7 @@ from speculators.models.eagle3.attention import (
     extend_mask_for_draft_tokens,
 )
 from speculators.models.eagle3.checkpointing import checkpointed_decoder
-from speculators.models.eagle3.metrics import compute_metrics
+from speculators.models.eagle3.metrics import EagleTrainingMetrics, compute_metrics
 from speculators.models.eagle3.model_definitions import model_classes
 from speculators.models.metrics import resolve_training_loss
 from speculators.models.utils import (
@@ -277,7 +277,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                 if loss_mask is not None
                 else torch.ones(1, total_seq_len, device=device, dtype=torch.bool)
             )
-            metrics = {}
+            metrics = EagleTrainingMetrics(document_ids, loss_mask, ttt_steps)
 
         draft_tokens = []
         for ttt_step in range(ttt_steps):
@@ -349,7 +349,8 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             # shape: [1, total_seq_len, draft_vocab_size]
 
             if return_loss:
-                s_loss, s_metrics = compute_metrics(
+                metrics.update(logits, targets, ttt_step)
+                s_loss, _ = compute_metrics(
                     logits,
                     targets,
                     loss_mask,
@@ -359,7 +360,6 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
                     loss_config=loss_config,
                 )
                 loss += s_loss
-                metrics.update(s_metrics)
 
             input_ids = torch.argmax(logits, dim=-1)
             draft_tokens.append(input_ids.detach().clone())
@@ -400,9 +400,7 @@ class Eagle3DraftModel(DraftVocabMixin, SpeculatorModel):
             # shape: [1, total_seq_len]
 
         if return_loss:
-            metrics["loss_sum"] = loss.detach().clone()
-            metrics["loss_total"] = torch.tensor(1.0, device=device)
-            return draft_tokens, loss, metrics
+            return draft_tokens, loss, metrics.finish(loss)
         else:
             return draft_tokens
 

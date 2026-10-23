@@ -127,6 +127,22 @@ NUM_LAYERS=2 NUM_LOOPS=3 bash examples/train/leagle_qwen3_4b_700k/train.sh
 
 训练使用 EAGLE 的 `shift_batch` 对齐和 ground-truth-token TTT：token 输入采用数据中的 token，hidden state 则由 draft 自己逐步递推。目标 KV 的可见范围固定在各自的起始前缀；训练步骤增加不会开放未来目标特征。packed document 边界与 padding 不计入跨边界预测损失。
 
+### 训练与验证指标
+
+EAGLE3 / LEAGLE 默认日志采用与 DSpark 对应的紧凑指标，不再输出各位置的 `loss_i`、`ce_loss_i`、`tv_loss_i` 和重复的 `full_acc_i` / `cond_acc_i`。训练目标、各步 loss 权重及梯度计算保持原样。
+
+| 指标 | 含义 |
+|---|---|
+| `loss` | 原训练目标，仍为各 TTT 步加权 loss 之和 |
+| `full_acc` | 所有有效预测位置的 argmax 匹配率，按有效位置数加权 |
+| `position_0_acc` … `position_6_acc` | 各预测步独立的 argmax 匹配率；位置 0 是第一个草稿 token |
+| `eal` | 每条训练轨迹的连续 argmax 匹配长度 + 1，再按轨迹数求平均 |
+| `accept_len` | 每条轨迹计算 `1 + Σᵢ ∏ⱼ≤ᵢ αⱼ` 的均值，`α` 为 draft/teacher 概率分布的重叠 |
+
+一条轨迹从有监督的位置开始；mask 中断、文档边界和序列尾部截断其连续接受前缀。TTT=7 时两个长度指标上限为 8；尾部不足七步时，即使全部匹配也可能低于 8。各卡先合并原始分子、分母，再计算均值，空 mask 不贡献长度样本。分布重叠按 token 分块计算 FP32 概率，不保留全序列概率张量或梯度图。
+
+训练日志使用 `train/…`，验证日志使用 `val/…_epoch`。两种长度均是 teacher-forced 训练代理，不能替代离线真实生成的 `acceptance_length`。当前全词表脚本按完整 teacher 分布统计；旧缩小词表运行仍使用其裁剪后重新归一化的 teacher 分布，不能与全词表接受长度直接比较。`checkpoint_best` 继续按 validation loss 选择。
+
 ## 参考推理与验证
 
 `LEagleDraftModel.propose()` 提供单条前缀的真实贪心自回归草稿生成：
@@ -142,7 +158,7 @@ tokens, logits = model.propose(
 
 `tokens` 为目标词表 ID，`logits` 对应 draft 词表。方法不会调用目标模型验证；每次验证之后，使用更新后的真实前缀再次调用。当前参考实现每次重新投影目标前缀，没有跨验证轮次的缓存优化。
 
-原有 vLLM EAGLE / DSpark speculator 不能直接执行这种模型。这里的 vLLM 脚本仅用于训练数据的目标特征提取；高性能 serving adapter 仍未接入。完整的单链贪心接受长度评估使用下面的离线入口。普通 validation loss / conditional accuracy 沿用 teacher-forced TTT，不能直接当作真实接受长度。
+原有 vLLM EAGLE / DSpark speculator 不能直接执行这种模型。这里的 vLLM 脚本仅用于训练数据的目标特征提取；高性能 serving adapter 仍未接入。完整的单链贪心接受长度评估使用下面的离线入口。普通 validation loss、准确率及训练代理长度沿用 teacher-forced TTT，不能直接当作真实接受长度。
 
 ## 离线接受长度评估
 

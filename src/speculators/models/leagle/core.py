@@ -11,7 +11,7 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm, Qwen3RotaryEm
 from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
-from speculators.models.eagle3.metrics import compute_metrics
+from speculators.models.eagle3.metrics import EagleTrainingMetrics, compute_metrics
 from speculators.models.leagle.attention import rollout_mask, trajectory_mask
 from speculators.models.leagle.config import LEagleSpeculatorConfig
 from speculators.models.leagle.model_definitions import DraftKV, LEagleDecoderLayer
@@ -216,7 +216,6 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         windows = {layer.self_attn.sliding_window for layer in self.layers}
         tokens = input_ids
         predictions = []
-        metrics = {}
         loss = context.new_zeros(())
         if return_loss:
             with torch.no_grad():
@@ -227,6 +226,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             if loss_mask is not None:
                 valid_mask = valid_mask & loss_mask.bool()
             prev_correct = valid_mask.clone()
+            metrics = EagleTrainingMetrics(document_ids, loss_mask, ttt_steps)
         for step in range(ttt_steps):
             masks = {
                 window: self._create_mask(
@@ -249,6 +249,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             predicted = self._target_token_ids(logits)
             predictions.append(predicted.detach())
             if return_loss and step < length:
+                metrics.update(logits, targets, step)
                 step_mask = valid_mask.clone()
                 if step:
                     # No supervision across packed-document boundaries. The
@@ -257,7 +258,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                         document_ids[:, step:] == document_ids[:, :-step]
                     )
                 prev_correct[:, : length - step] &= step_mask[:, step:]
-                step_loss, step_metrics = compute_metrics(
+                step_loss, _ = compute_metrics(
                     logits,
                     targets,
                     step_mask,
@@ -267,7 +268,6 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     loss_config=loss_config,
                 )
                 loss = loss + step_loss
-                metrics.update(step_metrics)
             if teacher_forcing:
                 offset = min(step + 1, length)
                 tokens = torch.cat(
@@ -280,9 +280,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             else:
                 tokens = predicted
         if return_loss:
-            metrics["loss_sum"] = loss.detach()
-            metrics["loss_total"] = loss.new_ones(())
-            return predictions, loss, metrics
+            return predictions, loss, metrics.finish(loss)
         return predictions
 
     @torch.no_grad()

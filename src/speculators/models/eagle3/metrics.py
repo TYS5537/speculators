@@ -12,6 +12,89 @@ from speculators.losses import (
 )
 from speculators.models.metrics import compute_accuracy_single_step
 
+_OVERLAP_CHUNK_ELEMENTS = 4 * 1024 * 1024
+
+
+@torch.no_grad()
+def _distribution_overlap(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    """FP32 overlap without materializing full-sequence probability tensors."""
+    result = torch.empty(logits.shape[:-1], device=logits.device, dtype=torch.float32)
+    chunk_size = max(1, _OVERLAP_CHUNK_ELEMENTS // logits.shape[-1])
+    for start in range(0, logits.shape[1], chunk_size):
+        end = start + chunk_size
+        draft_p = torch.softmax(logits[:, start:end], dim=-1, dtype=torch.float32)
+        target_p = torch.softmax(targets[:, start:end], dim=-1, dtype=torch.float32)
+        result[:, start:end] = torch.minimum(draft_p, target_p).sum(-1).clamp(0, 1)
+        del draft_p, target_p
+    return result
+
+
+class EagleTrainingMetrics:
+    """DSpark-style metrics over teacher-forced TTT trajectories.
+
+    A trajectory starts at a supervised token. Masks, packed-document boundaries
+    and sequence tails truncate its accepted prefix. ``eal`` counts consecutive
+    greedy matches; ``accept_len`` sums products of distribution overlaps. Both
+    include one verifier token and are training proxies, not generation results.
+    With a reduced teacher head these refer to the conditional draft vocabulary.
+    Only detached per-trajectory vectors and scalar counts survive each update.
+    """
+
+    def __init__(self, document_ids, loss_mask, num_steps):
+        self.document_ids = document_ids
+        self.valid = document_ids >= 0
+        if loss_mask is not None:
+            self.valid = self.valid & loss_mask.bool()
+        self.correct_prefix = self.valid.clone()
+        self.overlap_prefix = self.valid.float()
+        count = self.valid.sum(dtype=torch.float32)
+        self.counts = {
+            "full_acc_sum": count.new_zeros(()),
+            "full_acc_total": count.new_zeros(()),
+            "eal_sum": count.clone(),
+            "eal_total": count.clone(),
+            "accept_len_sum": count.clone(),
+            "accept_len_total": count.clone(),
+        }
+        # All ranks must return the same scalar keys, even with short sequences.
+        for step in range(num_steps):
+            self.counts[f"position_{step}_acc_sum"] = count.new_zeros(())
+            self.counts[f"position_{step}_acc_total"] = count.new_zeros(())
+
+    @torch.no_grad()
+    def update(self, logits, targets, step):
+        length = self.valid.shape[1] - step
+        if length <= 0:
+            return
+        logits = logits[:, :length]
+        targets = targets[:, step:]
+        valid = (
+            self.valid[:, :length]
+            & self.valid[:, step:]
+            & (self.document_ids[:, :length] == self.document_ids[:, step:])
+        )
+        correct = (logits.argmax(-1) == targets.argmax(-1)) & valid
+        correct_count = correct.sum(dtype=torch.float32)
+        total = valid.sum(dtype=torch.float32)
+        self.counts[f"position_{step}_acc_sum"] = correct_count
+        self.counts[f"position_{step}_acc_total"] = total
+        self.counts["full_acc_sum"] += correct_count
+        self.counts["full_acc_total"] += total
+
+        # Never restart a prefix after a masked or incorrect intermediate slot.
+        self.correct_prefix[:, :length] &= correct
+        self.counts["eal_sum"] += self.correct_prefix[:, :length].sum()
+        overlap = _distribution_overlap(logits, targets)
+        self.overlap_prefix[:, :length] *= torch.where(valid, overlap, 0.0)
+        self.counts["accept_len_sum"] += self.overlap_prefix[:, :length].sum()
+
+    def finish(self, loss):
+        return {
+            "loss_sum": loss.detach().clone(),
+            "loss_total": loss.new_ones(()),
+            **self.counts,
+        }
+
 
 def align_for_step(
     logits: torch.Tensor,  # shape: [1, total_seq_len, draft_vocab_size]
