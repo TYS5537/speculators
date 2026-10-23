@@ -2,14 +2,15 @@
 
 LEAGLE 是用于深度 / loop 对照实验的自回归 drafter：保留 DFlash / DSpark 的目标特征融合与每层 KV 注入，使用 EAGLE 式的 token + hidden-state 递推。它是独立算法 `leagle`，原来的 `eagle3`、`dflash`、`dspark` 仍可作为实验基线。
 
-## 目录
+## 仓库位置
 
-- `../examples/train/leagle_qwen3_4b_700k/server.sh`：LEAGLE 目标模型 vLLM 隐藏状态服务，单独启动。
-- `../examples/train/leagle_qwen3_4b_700k/train.sh`：LEAGLE 70 万数据、5 epochs 的训练脚本，默认 1 层、1 loop。
-- `../examples/train/eagle3_qwen3_4b_700k/`：普通 EAGLE-3 的独立 `server.sh` 和 `train.sh`。
-- `tests/`：CPU 数值与训练接口测试。
-- `runs/`：本地运行产物，已加入忽略规则。
-- 模型代码按仓库约定位于 `../src/speculators/models/leagle/`。
+以下路径均相对于仓库根目录。
+
+- `src/speculators/models/leagle/`：模型配置、共享 loop、注意力和自回归草稿生成实现。
+- `examples/train/leagle_qwen3_4b_700k/`：LEAGLE 的独立 `server.sh` 和 `train.sh`，默认 1 层、1 loop。
+- `examples/train/eagle3_qwen3_4b_700k/`：普通 EAGLE-3 的独立 `server.sh` 和 `train.sh`。
+- `tests/unit/models/test_leagle.py`：CPU 数值与训练接口测试，使用仓库统一测试和代码检查配置。
+- `output/`：训练日志、checkpoint 和复现记录；这两组实验的输出目录已加入忽略规则。
 
 ## 架构
 
@@ -71,7 +72,7 @@ bash examples/train/leagle_qwen3_4b_700k/server.sh
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-默认输出分别为 `leagle/runs/eagle3_qwen3_4b_700k_5ep_d1_full/` 和 `leagle/runs/leagle_qwen3_4b_700k_5ep_d1_r1_full/`。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。
+默认输出分别为 `output/eagle3_qwen3_4b_700k_5ep_d1_full/` 和 `output/leagle_qwen3_4b_700k_5ep_d1_r1_full/`。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。此前在 `leagle/runs/` 下的运行产物可继续保留；如需使用原路径，在服务和训练脚本中显式设置相同的 `OUTPUT_DIR`。
 
 模型、数据、输出路径和 NPU 分配可在各自脚本配置区或通过同名环境变量修改。服务与训练脚本的 `MODEL`、`OUTPUT_DIR`、`VLLM_PORT`、`NUM_LAYERS` 和 LEAGLE 的 `NUM_LOOPS` 必须一致；两边均使用目标特征层 `[2,18,33]`，服务另加最后一层 teacher slot 36。`VLLM_NPUS` 与 `TRAIN_NPUS` 应使用互不重叠的设备。重复实验时，为两份脚本指定同一个新的 `OUTPUT_DIR`。
 
@@ -106,7 +107,7 @@ tokens, logits = model.propose(
 原有 vLLM EAGLE / DSpark speculator 不能直接执行这种模型。这里的 vLLM 脚本仅用于训练数据的目标特征提取；LEAGLE 的高性能 serving adapter 与端到端接受长度 benchmark 仍需接入。普通 validation loss / conditional accuracy 沿用 teacher-forced TTT，不能直接当作真实接受长度。
 
 ```bash
-PYTHONPATH=src:hs_connectors/src python -m pytest leagle/tests -q
+PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle.py -q
 ```
 
 测试覆盖共享 loop 与展开独立层的前向 / 梯度等价性、缓存长度、packed document 与未来特征隔离、SDPA / eager、词表映射、真实自回归与并行训练轨迹的一致性，以及 activation checkpointing。

@@ -1,10 +1,14 @@
 # Algorithms
 
-This fork supports the six upstream speculative decoding algorithms plus MMuse. All are lossless -- they produce output from the same distribution as the target model.
+This fork includes the upstream speculative decoding algorithms, MMuse extensions, and experimental LEAGLE training support. Lossless generation requires verification by the target model.
 
 ## [Eagle-3](eagle3.md)
 
 Predicts draft tokens autoregressively using Llama-style draft layers. The more established algorithm with mature support in both Speculators and vLLM.
+
+## [LEAGLE](leagle.md)
+
+Combines EAGLE-style autoregressive drafting with target-feature KV conditioning and shared decoder loops. Supports depth/loop training experiments and reference greedy proposals; end-to-end verification and a serving adapter remain to be integrated.
 
 ## [P-EAGLE](peagle.md)
 

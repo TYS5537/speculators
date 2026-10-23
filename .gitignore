@@ -48,6 +48,10 @@ htmlcov/
 .coverage.*
 .cache
 /dsv4_greedy_traces/
+# EAGLE / LEAGLE training outputs, including the former experiment directory.
+/output/eagle3_qwen3_4b_700k_*/
+/output/leagle_qwen3_4b_700k_*/
+/leagle/runs/
 nosetests.xml
 coverage.xml
 *.cover

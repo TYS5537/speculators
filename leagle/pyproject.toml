@@ -1,5 +1,0 @@
-[tool.ruff]
-extend = "../pyproject.toml"
-
-[tool.ruff.lint.extend-per-file-ignores]
-"tests/*.py" = ["INP001", "S101", "SLF001", "PLR2004"]
