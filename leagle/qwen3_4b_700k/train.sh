@@ -17,15 +17,14 @@ export GLOO_SOCKET_IFNAME=lo
 # ============ Configuration ============
 MODEL="${MODEL:-../../Qwen3-4B}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
-NUM_LOOPS="${NUM_LOOPS:-2}"
-DATA_PATH="../../datasets/open_perfectblend_qwen3_4b_700k"
-OUTPUT_DIR="./leagle/runs/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}"
-RUN_NAME="leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}"
-VLLM_PORT=8003
+NUM_LOOPS="${NUM_LOOPS:-1}"
+DATA_PATH="${DATA_PATH:-../../datasets/open_perfectblend_qwen3_4b_700k}"
+OUTPUT_DIR="${OUTPUT_DIR:-./leagle/runs/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_full}"
+RUN_NAME="leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_full"
+VLLM_PORT="${VLLM_PORT:-8003}"
 VLLM_ENDPOINT="http://127.0.0.1:${VLLM_PORT}/v1"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
-TRAIN_NPUS="2,3,4,5,6,7"
-NUM_TRAIN_NPUS=6  # Must match the number of devices in TRAIN_NPUS.
+TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
 
 # Keep the existing 700k data/packing budget, with the requested five epochs.
 SEQ_LENGTH=3072
@@ -49,7 +48,7 @@ TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
 # Qwen3-4B has 36 layers: the default auxiliary slots are 2, 18 and 33.
 # server.sh appends final teacher slot 36; do not append it here.
 TARGET_LAYER_IDS=(2 18 33)
-DRAFT_ATTN_IMPL="sdpa"
+DRAFT_ATTN_IMPL="sdpa"  # Attention backend; independent of LOSS_IMPLEMENTATION.
 TTT_STEPS=7  # Token prediction steps; independent of NUM_LOOPS.
 TTT_STEP_LOSS_DECAY=1.0
 LOSS_FN="kl_div"
@@ -68,12 +67,12 @@ for ((layer_idx=0; layer_idx<NUM_LAYERS; layer_idx++)); do
     FULL_ATTENTION_INDICES+=("$layer_idx")
 done
 
-if [[ ! "$TRAIN_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ||
-      ! "$NUM_TRAIN_NPUS" =~ ^[1-9][0-9]*$ ||
-      "$NUM_TRAIN_NPUS" != "$(awk -F, '{print NF}' <<< "$TRAIN_NPUS")" ]]; then
-    echo "TRAIN_NPUS and NUM_TRAIN_NPUS must list/count the same devices." >&2
+if [[ ! "$TRAIN_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "TRAIN_NPUS must be comma-separated device IDs." >&2
     exit 2
 fi
+IFS=',' read -r -a TRAIN_DEVICES <<< "$TRAIN_NPUS"
+NUM_TRAIN_NPUS="${#TRAIN_DEVICES[@]}"
 if [[ ! -d "$MODEL" || ! -d "$DATA_PATH" ]]; then
     echo "Model or prepared Arrow data not found; check MODEL and DATA_PATH from the repository root." >&2
     exit 2

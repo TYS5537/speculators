@@ -19,17 +19,26 @@ export GLOO_SOCKET_IFNAME=lo
 # ============ Configuration ============
 MODEL="${MODEL:-../../Qwen3-4B}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
-NUM_LOOPS="${NUM_LOOPS:-2}"
-OUTPUT_DIR="./leagle/runs/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}"
-VLLM_PORT=8003
+NUM_LOOPS="${NUM_LOOPS:-1}"
+OUTPUT_DIR="${OUTPUT_DIR:-./leagle/runs/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_full}"
+VLLM_PORT="${VLLM_PORT:-8003}"
 TARGET_LAYER_IDS=(2 18 33)  # Auxiliary layers only; the launcher appends teacher slot 36.
-VLLM_NPUS="0,1"
-VLLM_EXTRA_ARGS=(--data-parallel-size 2)
+VLLM_NPUS="${VLLM_NPUS:-0,1}"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
-SERVER_READY_TIMEOUT=600
+SERVER_READY_TIMEOUT="${SERVER_READY_TIMEOUT:-600}"
 SERVER_PROVENANCE_DIR="$OUTPUT_DIR/server/$(date +%Y%m%d_%H%M%S)_$$"
 
 # ============ Launch ============
+if [[ ! "$NUM_LAYERS" =~ ^[1-9][0-9]*$ || ! "$NUM_LOOPS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_LAYERS and NUM_LOOPS must be positive integers." >&2
+    exit 2
+fi
+if [[ ! "$VLLM_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "VLLM_NPUS must be comma-separated device IDs." >&2
+    exit 2
+fi
+IFS=',' read -r -a SERVER_DEVICES <<< "$VLLM_NPUS"
+VLLM_EXTRA_ARGS=(--data-parallel-size "${#SERVER_DEVICES[@]}")
 if [[ ! "$SERVER_READY_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
     echo "SERVER_READY_TIMEOUT must be a positive number of seconds." >&2
     exit 2

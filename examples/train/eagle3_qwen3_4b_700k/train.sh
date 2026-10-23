@@ -15,15 +15,15 @@ export MASTER_PORT=34655
 export GLOO_SOCKET_IFNAME=lo
 
 # ============ Configuration ============
-MODEL="../../Qwen3-4B"
-DATA_PATH="../../datasets/open_perfectblend_qwen3_4b_700k"
-OUTPUT_DIR="./output/eagle3_qwen3_4b_700k_5ep"
-RUN_NAME="eagle3_qwen3_4b_700k_5ep"
-VLLM_PORT=8003
+MODEL="${MODEL:-../../Qwen3-4B}"
+NUM_LAYERS="${NUM_LAYERS:-1}"
+DATA_PATH="${DATA_PATH:-../../datasets/open_perfectblend_qwen3_4b_700k}"
+OUTPUT_DIR="${OUTPUT_DIR:-./leagle/runs/eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_full}"
+RUN_NAME="eagle3_qwen3_4b_700k_5ep_d${NUM_LAYERS}_full"
+VLLM_PORT="${VLLM_PORT:-8003}"
 VLLM_ENDPOINT="http://127.0.0.1:${VLLM_PORT}/v1"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
-TRAIN_NPUS="2,3,4,5,6,7"
-NUM_TRAIN_NPUS=6  # Must match the number of devices in TRAIN_NPUS.
+TRAIN_NPUS="${TRAIN_NPUS:-2,3,4,5,6,7}"
 
 # Keep the existing 700k data/packing budget, with the requested five epochs.
 SEQ_LENGTH=3072
@@ -41,15 +41,13 @@ WEIGHT_DECAY=0.01
 MUON_WEIGHT_DECAY=0.1
 SCHEDULER_TYPE="linear"
 WARMUP_RATIO=0.01
-NUM_LAYERS=1
 DRAFT_ARCH="llama"
 DRAFT_VOCAB_SIZE=32000
 TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
 # Qwen3-4B has 36 layers: the default auxiliary slots are 2, 18 and 33.
 # server.sh appends final teacher slot 36; do not append it here.
 TARGET_LAYER_IDS=(2 18 33)
-DRAFT_ATTN_IMPL="sdpa"
-SLIDING_WINDOW=2048
+DRAFT_ATTN_IMPL="sdpa"  # Attention backend; independent of LOSS_IMPLEMENTATION.
 TTT_STEPS=7  # Token prediction steps; independent of any future inner loop depth.
 TTT_STEP_LOSS_DECAY=1.0
 LOSS_FN="kl_div"
@@ -58,12 +56,22 @@ LOSS_FN="kl_div"
 LOSS_IMPLEMENTATION="eager"
 
 # ============ Launch ============
-if [[ ! "$TRAIN_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ||
-      ! "$NUM_TRAIN_NPUS" =~ ^[1-9][0-9]*$ ||
-      "$NUM_TRAIN_NPUS" != "$(awk -F, '{print NF}' <<< "$TRAIN_NPUS")" ]]; then
-    echo "TRAIN_NPUS and NUM_TRAIN_NPUS must list/count the same devices." >&2
+if [[ ! "$NUM_LAYERS" =~ ^[1-9][0-9]*$ ]]; then
+    echo "NUM_LAYERS must be a positive integer." >&2
     exit 2
 fi
+# Qwen3-4B: full causal attention in every physical draft layer.
+FULL_ATTENTION_INDICES=()
+for ((layer_idx=0; layer_idx<NUM_LAYERS; layer_idx++)); do
+    FULL_ATTENTION_INDICES+=("$layer_idx")
+done
+
+if [[ ! "$TRAIN_NPUS" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
+    echo "TRAIN_NPUS must be comma-separated device IDs." >&2
+    exit 2
+fi
+IFS=',' read -r -a TRAIN_DEVICES <<< "$TRAIN_NPUS"
+NUM_TRAIN_NPUS="${#TRAIN_DEVICES[@]}"
 if [[ ! -d "$MODEL" || ! -d "$DATA_PATH" ]]; then
     echo "Model or prepared Arrow data not found; check MODEL and DATA_PATH from the repository root." >&2
     exit 2
@@ -112,7 +120,7 @@ nohup env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS" torchrun \
     --speculator-type eagle3 --num-layers "$NUM_LAYERS" --draft-arch "$DRAFT_ARCH" \
     --draft-vocab-size "$DRAFT_VOCAB_SIZE" --token-freq-path "$TOKEN_FREQ_PATH" \
     --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
-    --draft-attn-impl "$DRAFT_ATTN_IMPL" --sliding-window "$SLIDING_WINDOW" \
+    --draft-attn-impl "$DRAFT_ATTN_IMPL" --full-attention-indices "${FULL_ATTENTION_INDICES[@]}" \
     --norm-before-residual --norm-before-fc --norm-output --no-embed-requires-grad \
     --ttt-steps "$TTT_STEPS" --ttt-step-loss-decay "$TTT_STEP_LOSS_DECAY" \
     --loss-fn "$LOSS_FN" --on-missing generate --on-generate delete \
