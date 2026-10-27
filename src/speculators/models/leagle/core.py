@@ -13,6 +13,7 @@ from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
 from speculators.models.eagle3.metrics import EagleTrainingMetrics, compute_metrics
 from speculators.models.leagle.attention import rollout_mask, trajectory_mask
+from speculators.models.leagle.candidate_head import LowRankCandidateHead
 from speculators.models.leagle.config import LEagleSpeculatorConfig
 from speculators.models.leagle.model_definitions import DraftKV, LEagleDecoderLayer
 from speculators.models.metrics import resolve_training_loss
@@ -67,10 +68,72 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         self.activation_checkpointing = False
         self.activation_checkpoint_layers: frozenset[int] | None = None
         self.post_init()
+        self.candidate_head = None
+        if config.candidate_head:
+            # Build the head after backbone initialization and isolate its RNG:
+            # adding the auxiliary objective must not change the seeded backbone.
+            with torch.random.fork_rng(devices=[]):
+                self.candidate_head = LowRankCandidateHead(
+                    width,
+                    self.draft_vocab_size,
+                    config.candidate_head_rank,
+                    initializer_range=decoder.initializer_range,
+                )
+        self.candidate_head_enabled = config.candidate_head
+        self.candidate_top_k = config.candidate_head_top_k
 
     @property
     def target_layer_ids(self) -> list[int]:
         return self.config.aux_hidden_state_layer_ids
+
+    def set_candidate_head(self, enabled: bool, *, top_k: int | None = None):
+        """Override proposal retrieval; training uses the checkpoint's architecture."""
+        if enabled:
+            if self.candidate_head is None:
+                raise ValueError(
+                    "Checkpoint has no candidate head. "
+                    "Train LEAGLE with --candidate-head."
+                )
+            selected = self.config.candidate_head_top_k if top_k is None else top_k
+            if not 1 <= selected <= self.draft_vocab_size:
+                raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
+            self.candidate_head.validate_weights()
+            self.candidate_top_k = selected
+        elif top_k is not None:
+            raise ValueError("Candidate top_k requires an enabled candidate head")
+        self.candidate_head_enabled = enabled
+
+    def _prepare_missing_checkpoint_weights(self, loading_info):
+        if self.candidate_head is None:
+            if any(
+                key.startswith("candidate_head.")
+                for key in loading_info.get("unexpected_keys", [])
+            ):
+                raise ValueError(
+                    "Candidate head weights require candidate_head=true in config"
+                )
+            return
+        missing = loading_info.get("missing_keys", [])
+        mismatched = loading_info.get("mismatched_keys", [])
+        invalid = [
+            *missing,
+            *(key[0] if isinstance(key, tuple) else key for key in mismatched),
+        ]
+        if any(key.startswith("candidate_head.") for key in invalid):
+            raise ValueError("Checkpoint is missing compatible candidate head weights")
+        self.candidate_head.validate_weights()
+        self.candidate_head.requires_grad_(True)
+
+    def gradient_clip_groups(self):
+        """Clip the auxiliary head separately so it cannot rescale backbone updates."""
+        if self.candidate_head is None:
+            return [list(self.parameters())]
+        backbone = [
+            p
+            for name, p in self.named_parameters()
+            if not name.startswith("candidate_head.")
+        ]
+        return [backbone, list(self.candidate_head.parameters())]
 
     def set_activation_checkpointing(self, enabled: bool, *, layer_ids=None):
         selected = None if layer_ids is None else frozenset(layer_ids)
@@ -107,6 +170,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         query_positions,
         masks,
         caches,
+        context_kv=None,
+        use_candidate_head=False,
     ):
         embeddings = self.embed_tokens(token_ids)
         hidden = self.input_fc(
@@ -118,7 +183,11 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 dim=-1,
             )
         )
-        positions = torch.cat([context_positions, query_positions], dim=-1)
+        positions = (
+            torch.cat([context_positions, query_positions], dim=-1)
+            if context_kv is None
+            else query_positions
+        )
         position_embeddings = self.rotary_emb(hidden, positions)
         next_caches: list[DraftKV] = []
         for loop in range(self.config.num_loops):
@@ -132,6 +201,10 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     mask,
                     caches[logical_depth],
                 )
+                if context_kv is not None:
+                    # Target context and projection weights are shared by loops;
+                    # only the synthetic draft KV remains per logical depth.
+                    layer_args = (*layer_args, context_kv[index])
                 recompute = (
                     self.training
                     and self.activation_checkpointing
@@ -151,9 +224,13 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     hidden, present = layer(*layer_args)
                 next_caches.append(present)
         normalized = self.norm(hidden)
-        logits = self.lm_head(normalized)
+        logits = (
+            self.candidate_head(normalized, self.lm_head.weight, self.candidate_top_k)
+            if use_candidate_head
+            else self.lm_head(normalized)
+        )
         state = normalized if self.config.norm_output else hidden
-        return logits, state, next_caches
+        return logits, state, next_caches, normalized
 
     def _target_token_ids(self, logits):
         draft_ids = logits.argmax(dim=-1)
@@ -178,6 +255,44 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         if position_ids.shape != input_ids.shape:
             raise ValueError("position_ids must match input_ids")
         return position_ids
+
+    def _candidate_training_step(
+        self, normalized, valid_mask, step_mask, step, *, loss, counts, decay
+    ):
+        if self.candidate_head is None:
+            return loss
+        width = normalized.shape[1] - step
+        candidate_mask = valid_mask[:, :width] & step_mask[:, step:]
+        kl_sum, recall, count = self.candidate_head.distillation_loss(
+            normalized[:, :width],
+            self.lm_head.weight,
+            candidate_mask,
+            top_k=self.config.candidate_head_top_k,
+            chunk_size=self.config.candidate_head_chunk_size,
+        )
+        counts["kl"] += kl_sum.detach()
+        counts["recall"] += recall
+        counts["total"] += count
+        return loss + (decay**step) * kl_sum / count.clamp_min(1)
+
+    def _finish_training(
+        self, predictions, loss, candidate_loss, candidate_counts, metrics
+    ):
+        if self.candidate_head is None:
+            return predictions, loss, metrics.finish(loss)
+        total_loss = loss + self.config.candidate_head_loss_weight * candidate_loss
+        counts = metrics.finish(total_loss)
+        counts.update(
+            {
+                "draft_loss_sum": loss.detach(),
+                "draft_loss_total": loss.new_ones(()),
+                "candidate_kl_sum": candidate_counts["kl"],
+                "candidate_kl_total": candidate_counts["total"],
+                "candidate_recall_sum": candidate_counts["recall"],
+                "candidate_recall_total": candidate_counts["total"],
+            }
+        )
+        return predictions, total_loss, counts
 
     def forward(
         self,
@@ -218,6 +333,10 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         tokens = input_ids
         predictions = []
         loss = context.new_zeros(())
+        candidate_loss = loss.float()
+        candidate_counts = {
+            name: loss.float().clone() for name in ("kl", "recall", "total")
+        }
         if return_loss:
             with torch.no_grad():
                 targets = self.verifier_lm_head(
@@ -238,7 +357,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 )
                 for window in windows
             }
-            logits, state, caches = self._step(
+            logits, state, caches, normalized = self._step(
                 tokens,
                 state,
                 context,
@@ -269,6 +388,15 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     loss_config=loss_config,
                 )
                 loss = loss + step_loss
+                candidate_loss = self._candidate_training_step(
+                    normalized,
+                    valid_mask,
+                    step_mask,
+                    step,
+                    loss=candidate_loss,
+                    counts=candidate_counts,
+                    decay=ttt_step_loss_decay,
+                )
             if teacher_forcing:
                 offset = min(step + 1, length)
                 tokens = torch.cat(
@@ -281,7 +409,9 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             else:
                 tokens = predicted
         if return_loss:
-            return predictions, loss, metrics.finish(loss)
+            return self._finish_training(
+                predictions, loss, candidate_loss, candidate_counts, metrics
+            )
         return predictions
 
     @torch.no_grad()
@@ -293,14 +423,17 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         position_ids=None,
         num_tokens=7,
         temperature=0.0,
+        prepared_context=None,
     ):
         """Greedy or sampled proposals for one prefix, without teacher forcing.
 
         hidden_states: [1, context_length, auxiliary_count * hidden_size], up to
         the last verified token. anchor_token: [1, 1], the next known/bonus token.
         Returns verifier-vocabulary IDs [1, num_tokens] and draft-vocabulary
-        logits [1, num_tokens, draft_vocab_size]. Caches are local to this round;
-        call again with the newly verified prefix after acceptance/rejection.
+        logits [1, num_tokens, draft_vocab_size]. Draft trajectory caches are
+        local to this round. An inference caller may supply prepared_context as
+        (last fused target state, per-physical-layer target KV) to reuse confirmed
+        context across rounds. It must cover exactly the supplied verified prefix.
         """
         validate_temperature(temperature)
         if self.training:
@@ -322,7 +455,11 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         if position_ids.shape != (1, length):
             raise ValueError("position_ids must match the target prefix")
-        context = self.hidden_norm(self.fc(hidden_states))
+        if prepared_context is None:
+            context = self.hidden_norm(self.fc(hidden_states))
+            context_kv = None
+        else:
+            context, context_kv = prepared_context
         state = context[:, -1:]
         caches: list[DraftKV | None] = [None] * self.config.effective_depth
         windows = {layer.self_attn.sliding_window for layer in self.layers}
@@ -339,7 +476,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 )
                 for window in windows
             }
-            logits, state, caches = self._step(
+            logits, state, caches, _ = self._step(
                 tokens,
                 state,
                 context,
@@ -347,6 +484,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 query_positions,
                 masks,
                 caches,
+                context_kv=context_kv,
+                use_candidate_head=self.candidate_head_enabled,
             )
             tokens = sample_from_logits(logits, temperature)
             if self.use_draft_vocab:
@@ -371,6 +510,11 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             aux_hidden_state_layer_ids=target_layers,
             num_loops=kwargs.get("num_loops", 1),
             norm_output=kwargs.get("norm_output", True),
+            candidate_head=kwargs.get("candidate_head", False),
+            candidate_head_rank=kwargs.get("candidate_head_rank", 256),
+            candidate_head_top_k=kwargs.get("candidate_head_top_k", 128),
+            candidate_head_loss_weight=kwargs.get("candidate_head_loss_weight", 1.0),
+            candidate_head_chunk_size=kwargs.get("candidate_head_chunk_size", 32),
             speculators_config=SpeculatorsConfig(
                 algorithm="leagle",
                 proposal_methods=[

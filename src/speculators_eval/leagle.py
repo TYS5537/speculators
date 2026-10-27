@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import logging
 import math
 import time
@@ -49,6 +50,22 @@ def build_parser():
     parser.add_argument("--draft-attn-impl", choices=["sdpa", "eager"], default="sdpa")
     parser.add_argument("--target-attn-impl", choices=["sdpa", "eager"], default="sdpa")
     parser.add_argument(
+        "--no-draft-kv-reuse",
+        action="store_true",
+        help="Use the uncached reference proposals for comparison (slower)",
+    )
+    parser.add_argument(
+        "--candidate-head",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="LEAGLE candidate output head; by default follow the trained checkpoint",
+    )
+    parser.add_argument(
+        "--candidate-top-k",
+        type=int,
+        help="Candidate vocabulary count; defaults to checkpoint (not draft length)",
+    )
+    parser.add_argument(
         "--check-greedy",
         action="store_true",
         help="Audit every output against target-only HF greedy generation (extra work)",
@@ -91,6 +108,12 @@ def validate_args(args):
         raise ValueError("--log-every and --worker-num-shards must be positive")
     if (args.d2t_path is None) != (args.t2d_path is None):
         raise ValueError("--d2t-path and --t2d-path must be provided together")
+    if args.candidate_top_k is not None and (
+        args.candidate_head is False or args.candidate_top_k < 1
+    ):
+        raise ValueError(
+            "--candidate-top-k must be positive and requires --candidate-head"
+        )
     if args.ascend_devices:
         devices = data.split_csv(args.ascend_devices)
         if (
@@ -103,6 +126,42 @@ def validate_args(args):
                 "--ascend-devices requires distinct numeric IDs and --device npu:0"
             )
     data.discover_datasets(args.datasets_root, data.split_csv(args.datasets) or None)
+
+
+def candidate_head_settings(args, config=None):
+    """Validate the switch without initializing Torch in the NPU parent process."""
+    config = config or {}
+    enabled = (
+        config.get("candidate_head", False)
+        if args.candidate_head is None
+        else args.candidate_head
+    )
+    rank = (
+        config.get("candidate_head_rank")
+        if config.get("candidate_head", False)
+        else None
+    )
+    top_k = args.candidate_top_k or config.get("candidate_head_top_k")
+    if enabled and config:
+        if config.get("speculators_model_type") != "leagle":
+            raise ValueError(
+                "--candidate-head is supported only for LEAGLE, not EAGLE3"
+            )
+        if rank is None:
+            raise ValueError(
+                "Checkpoint has no candidate head. Train LEAGLE with --candidate-head."
+            )
+        if top_k is None or not 1 <= top_k <= config["draft_vocab_size"]:
+            raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
+    if not enabled and args.candidate_top_k is not None:
+        raise ValueError("--candidate-top-k requires an enabled candidate head")
+    return {
+        "enabled": enabled,
+        "rank": rank,
+        "top_k": top_k if enabled else None,
+        "scoring": "low-rank-retrieval-exact-rescore" if enabled else "dense",
+        "proposal_support": "retrieved-candidates" if enabled else "draft-vocabulary",
+    }
 
 
 def load_models(args):
@@ -122,6 +181,7 @@ def load_models(args):
     config = SpeculatorModelConfig.from_pretrained(args.draft_model)
     if config.speculators_model_type not in ("leagle", "eagle3"):
         raise ValueError("This entrypoint requires an EAGLE3 or LEAGLE checkpoint")
+    head_settings = candidate_head_settings(args, config.to_dict())
     config.speculators_config.verifier.name_or_path = args.verifier_model
     config.transformer_layer_config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
     target = (
@@ -171,6 +231,14 @@ def load_models(args):
         # Validate checkpoint-resident offsets too: zero placeholders would
         # otherwise silently propose the wrong target-vocabulary token IDs.
         draft.load_vocab_mappings(draft.t2d, draft.d2t)
+    if config.speculators_model_type == "leagle":
+        draft.set_candidate_head(head_settings["enabled"], top_k=head_settings["top_k"])
+    if head_settings["enabled"]:
+        logger.info(
+            "LEAGLE candidate head enabled: rank=%d candidates=%d (exact rescore)",
+            head_settings["rank"],
+            head_settings["top_k"],
+        )
     tokenizer = AutoTokenizer.from_pretrained(
         args.verifier_model, trust_remote_code=args.trust_remote_code
     )
@@ -190,6 +258,10 @@ def load_models(args):
 
 
 def save_provenance(args, draft_config=None):
+    config = draft_config.to_dict() if draft_config is not None else None
+    config_path = Path(args.draft_model) / "config.json"
+    if config is None and config_path.is_file():
+        config = json.loads(config_path.read_text(encoding="utf-8"))
     metadata = {
         "proposal": (
             "single-chain-sampling" if args.temperature > 0 else "single-chain-greedy"
@@ -200,7 +272,11 @@ def save_provenance(args, draft_config=None):
             else "HF full-attention target with KV rollback"
         ),
         "target_kv_reuse": True,
-        "draft_kv_reuse_between_rounds": False,
+        "candidate_head": candidate_head_settings(args, config),
+        "draft_kv_reuse_between_rounds": not args.no_draft_kv_reuse,
+        "draft_cache_policy": (
+            "rebuild-each-round" if args.no_draft_kv_reuse else "verified-prefix-only"
+        ),
         "online_speedup_benchmark": False,
         "probability_diagnostics_available": args.temperature > 0,
         "timing_scope": (

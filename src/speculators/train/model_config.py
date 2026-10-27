@@ -23,6 +23,11 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
 # runtime-only subset below can safely change without adding/removing weights.
 PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "num_loops": "--num-loops",
+    "candidate_head": "--candidate-head",
+    "candidate_head_rank": "--candidate-head-rank",
+    "candidate_head_top_k": "--candidate-head-top-k",
+    "candidate_head_loss_weight": "--candidate-head-loss-weight",
+    "candidate_head_chunk_size": "--candidate-head-chunk-size",
     "target_hidden_state_format": "--target-hidden-state-format",
     "block_size": "--block-size",
     "sample_from_anchor": "--sample-from-anchor",
@@ -69,6 +74,9 @@ PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
 }
 
 PRETRAINED_RUNTIME_CONFIG_FIELDS = {
+    "candidate_head_top_k",
+    "candidate_head_loss_weight",
+    "candidate_head_chunk_size",
     "correction_lm_head_fusion",
     "correction_hidden_aux_weight",
     "correction_rollout_metrics",
@@ -150,6 +158,8 @@ def reconcile_pretrained_config_args(
             if hasattr(config, field)
         }
         validate_mmuse_options({**candidate, **runtime_overrides})
+    if getattr(config, "speculators_model_type", None) == "leagle":
+        type(config).from_dict({**config.to_dict(), **runtime_overrides})
 
     for dest, value in inherited_args.items():
         setattr(args, dest, value)

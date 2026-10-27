@@ -134,7 +134,7 @@ def test_rejected_eos_is_not_a_stop_and_first_mismatch_ends_acceptance():
     assert response.proposal_lengths[0] == 7
 
 
-def make_real_models(layers=1, loops=1, reduced=True):
+def make_real_models(layers=1, loops=1, reduced=True, candidate_head=False):
     config = Qwen3Config(
         vocab_size=32,
         hidden_size=16,
@@ -160,6 +160,10 @@ def make_real_models(layers=1, loops=1, reduced=True):
             draft_vocab_size=16 if reduced else 32,
             aux_hidden_state_layer_ids=[1, 2],
             num_loops=loops,
+            candidate_head=candidate_head,
+            candidate_head_rank=4,
+            candidate_head_top_k=3,
+            candidate_head_chunk_size=2,
             speculators_config=SpeculatorsConfig(
                 algorithm="leagle",
                 proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=7)],
@@ -178,6 +182,8 @@ def make_real_models(layers=1, loops=1, reduced=True):
     with torch.no_grad():
         draft.embed_tokens.weight.copy_(target.model.embed_tokens.weight)
         draft.lm_head.weight.copy_(target.lm_head.weight[selected])
+        draft.verifier_lm_head.weight.copy_(target.lm_head.weight[selected])
+        draft.verifier_norm.weight.copy_(target.model.norm.weight)
     return target, draft
 
 

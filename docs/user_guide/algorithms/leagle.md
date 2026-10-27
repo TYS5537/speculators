@@ -156,7 +156,7 @@ tokens, logits = model.propose(
 )
 ```
 
-`tokens` 为目标词表 ID，`logits` 对应 draft 词表。方法不会调用目标模型验证；每次验证之后，使用更新后的真实前缀再次调用。当前参考实现每次重新投影目标前缀，没有跨验证轮次的缓存优化。
+`tokens` 为目标词表 ID，`logits` 对应 draft 词表。方法不会调用目标模型验证；每次验证之后，使用更新后的真实前缀再次调用。上面的直接调用保留逐轮重算的参考路径；下方离线评估入口默认启用已确认前缀的缓存复用。
 
 原有 vLLM EAGLE / DSpark speculator 不能直接执行这种模型。这里的 vLLM 脚本仅用于训练数据的目标特征提取；高性能 serving adapter 仍未接入。完整的单链贪心或采样接受长度评估使用下面的离线入口。普通 validation loss、准确率及训练代理长度沿用 teacher-forced TTT，不能直接当作真实接受长度。
 
@@ -165,6 +165,13 @@ tokens, logits = model.propose(
 实现位于 `src/speculators_eval/leagle.py` 与 `leagle_decoding.py`，命令入口为 `scripts/evaluate/leagle_offline_eval.py`，启动脚本为 `examples/evaluate/leagle_qwen3_4b_700k.sh`。使用 Transformers 在同一设备加载 full-attention Qwen3 target 和 LEAGLE checkpoint，无需启动 vLLM 服务；默认 target 和 draft 都使用 SDPA、BF16。物理层数和 loop 次数读取 checkpoint，评估不会改变它们。
 
 普通 EAGLE3 使用 `examples/evaluate/eagle3_qwen3_4b_700k.sh`，对应 `scripts/evaluate/eagle3_offline_eval.py`；它与 LEAGLE 共用验证循环。EAGLE3 草稿输入保持训练中的特征/token 错位一位对齐，并使用自己的预测递推。两者与 DSpark 共用 JSONL 处理、选样、prompt 模板和加权统计；完成模板处理后不再额外插入 special tokens。
+
+两份离线评估入口默认启用 draft 已确认前缀缓存，无需修改 checkpoint 或重新训练：
+
+- EAGLE3 首轮建立完整前缀 KV，后续轮次只将新增的真实 target 特征与错位一位的 token 输入送入 decoder。上一轮预测状态生成的 KV 全部裁掉，即使对应 token 被接受，也根据真实 target 特征重新建立新增前缀。
+- LEAGLE 缓存每个物理层对真实 target 上下文的 K/V 投影，轮内各 token 和共享 loop 复用；下一轮仅融合、投影新确认的上下文。每个 `(loop, layer)` 的草稿轨迹 KV 仍独立且每轮清空，避免将预测状态混入真实 target 上下文。
+
+缓存属于单条生成请求，不跨样本共享；训练 forward、loss、full-attention 可见范围、固定草稿预算和采样验证算法均保持原设置。可在任一评估脚本末尾追加 `--no-draft-kv-reuse` 使用旧参考路径，例如 `bash examples/evaluate/leagle_qwen3_4b_700k.sh --no-draft-kv-reuse`。此开关会传给各 NPU worker，并记录到 `eval_config.json` 的 `draft_kv_reuse_between_rounds` 与 `draft_cache_policy`。随长度改变旧位置旋转频率的 RoPE 配置需要关闭缓存；当前 Qwen3 配置使用的固定频率 RoPE 支持复用。计算批次形状改变可能带来浮点舍入差异，实际 NPU 吞吐需用相同数据和参数测量。
 
 ```bash
 DATASETS_ROOT=/path/to/eval_jsonl SPEC_TOKENS=7 TEMPERATURE=0 MAX_NEW_TOKENS=512 \
@@ -210,7 +217,7 @@ bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
 两份评估脚本的 `RUN_DIR` 均手动填写，修改 `NUM_LAYERS` / `NUM_LOOPS` 不会改变评估路径。指定任意 epoch 时使用 `DRAFT_MODEL=/path/to/checkpoints/4`。可设置 `MODEL`、`OUTPUT_DIR`、`DATASETS`、`MAX_SAMPLES`、`MAX_NEW_TOKENS`、`SPEC_TOKENS`、`TEMPERATURE`、`ENABLE_THINKING` 和 `RAW_PROMPT_MODE`。CPU 冒烟测试可设置 `DEVICE=cpu DTYPE=float32`，CUDA 可设置 `DEVICE=cuda:0`；两份脚本均需追加 `--ascend-devices ""`，覆盖默认八卡设置。多卡参数 `ASCEND_DEVICES` 要求 `DEVICE=npu:0`；它是样本并行，不是张量并行。
 
-评估采用单链。`temperature=0` 时 draft/target 取 argmax，接受连续匹配的最长前缀。设置有限的 `temperature>0`（例如脚本默认的 1）时，两者使用同一温度下的 FP32 softmax 分布，不额外启用 top-k/top-p 截断。draft 自回归采样最多 K 个候选；target 一次验证，按 `min(1, p(token)/q(token))` 接受连续前缀，首次拒绝后从归一化的 `max(p-q, 0)` 采样替代 token，全接受时从 target 分布采样 bonus token。缩小词表的 draft 概率映射回完整 target 词表，支持集之外的 q 为零，修正采样可选中这些 token。两种模式下 target 的 KV 和特征都只保留已验证部分；draft 每轮重新建立上下文和各 `(loop, layer)` 的缓存。当前不使用树搜索。
+评估采用单链。`temperature=0` 时 draft/target 取 argmax，接受连续匹配的最长前缀。设置有限的 `temperature>0`（例如脚本默认的 1）时，两者使用同一温度下的 FP32 softmax 分布；默认完整输出头不额外启用 top-k/top-p 截断，可选候选头对 draft 支持集的限制见下节。draft 自回归采样最多 K 个候选；target 一次验证，按 `min(1, p(token)/q(token))` 接受连续前缀，首次拒绝后从归一化的 `max(p-q, 0)` 采样替代 token，全接受时从 target 分布采样 bonus token。缩小词表的 draft 概率映射回完整 target 词表，支持集之外的 q 为零，修正采样可选中这些 token。两种模式下 target 的 KV 和特征都只保留已验证部分；draft 跨轮只复用由真实 target 特征建立的前缀，不保留上一轮的预测状态缓存。当前不使用树搜索。
 
 正温度不能与 `CHECK_GREEDY=1` 同用。采样评估验证目标分布，不要求与 target-only 解码逐 token 相同；相同 seed 下也不保证不同模型或不同分片方式得到相同文本，因为它们消耗随机数的顺序不同。接受 EOS 后不再抽取无用的后续 token。
 
@@ -226,9 +233,74 @@ bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
 这版用于比较接受长度。日志中的吞吐包含参考实现开销，启用审计还包含 target 单独解码，多卡汇总时间还包含模型加载；这些数值不是 vLLM serving 加速比。贪心模式保持概率诊断字段为空并标记 `probability_diagnostics_available=false`；正温度模式输出接受概率与分布重叠诊断，并标记为 true。评估配置记录实际温度与验证模式。
 
+### 可选低秩候选输出头（仅 LEAGLE）
+
+训练默认 `CANDIDATE_HEAD=0`，使用完整输出头；设置为 1 时从头创建并训练两个低秩矩阵，直接保存在训练 checkpoint 中。评估默认 `CANDIDATE_HEAD=auto`，按 checkpoint 配置加载并启用，无需转换脚本或另做 SVD。开启候选推理后，每个草稿 token 执行一次候选筛选，物理层数和 loop 次数不改变输出头的调用次数：
+
+| 步骤 | 矩阵与输出维度（单个 token） |
+|---|---|
+| 降维 | `h[1,H] × Bᵀ[H,R] → [1,R]` |
+| 全 draft 词表粗分 | `[1,R] × Aᵀ[R,V] → [1,V]` |
+| 取候选 | 粗分 top-M，得到候选 ID `[1,M]` |
+| 精算 | 从原始 `W[V,H]` 取 `W_C[M,H]`，计算 `h × W_Cᵀ → [1,M]` |
+| 提议 | 使用精算 logits；候选之外的 draft logits 为 `-inf` |
+
+原始 `lm_head.weight` 保留且冻结，新增 `candidate_head.down_proj.weight[R,H]` 和 `candidate_head.up_proj.weight[V,R]`。全词表 Qwen3-4B 的 `H=2560`、`V=151936`，默认 `R=256`、`M=128`；这两个值是实验起点。`M` 是每个 token 的候选词数量，与 `SPEC_TOKENS=7` 的草稿序列长度独立。缩小词表模型在自己的 draft 词表上筛选，再用原有 d2t 映射到 target ID。
+
+候选头使用随机初始化，与主干同步训练。主干继续用原始完整输出头计算 CE/TV；候选头增加 `KL(softmax(W·stopgrad(h)) || softmax(A·B·stopgrad(h)))`，teacher 是同一个 drafter hidden state 的完整输出分布。辅助损失不向主干或 W 传梯度，top-k 只用于候选召回统计和推理，不直接反传。主干和候选头分别按 `MAX_GRAD_NORM` 裁剪梯度，避免辅助梯度改变主干的裁剪系数；两者沿用同一 LR 与 scheduler，当前脚本为 AdamW、LR=6e-4。使用 Muon 时，候选输出矩阵归入 AdamW 组。
+
+| 环境变量 | 默认值 | 训练参数 |
+|---|---|---|
+| `CANDIDATE_HEAD` | `0` | `--candidate-head` / `--no-candidate-head` |
+| `CANDIDATE_HEAD_RANK` | `256` | `--candidate-head-rank` |
+| `CANDIDATE_TOP_K` | `128` | `--candidate-head-top-k` |
+| `CANDIDATE_HEAD_LOSS_WEIGHT` | `1.0` | `--candidate-head-loss-weight` |
+| `CANDIDATE_HEAD_CHUNK_SIZE` | `32` | `--candidate-head-chunk-size` |
+
+YAML 中对应字段放在 `draft` 组。候选 KL 按 token 分块、反向重算，避免额外保存全序列 FP32 词表激活；减小 chunk size 可减少临时显存，但增加调用开销。训练仍需计算完整输出头，额外的 KL 训练也增加计算量。
+
+继续使用原有服务和训练两份脚本。在两个终端中设置相同的 `OUTPUT_DIR`，保证隐藏状态文件路径一致：
+
+```bash
+OUTPUT_DIR=./output/leagle_candidate_r256 \
+bash examples/train/leagle_qwen3_4b_700k/server.sh
+
+OUTPUT_DIR=./output/leagle_candidate_r256 CANDIDATE_HEAD=1 \
+CANDIDATE_HEAD_RANK=256 CANDIDATE_TOP_K=128 \
+bash examples/train/leagle_qwen3_4b_700k/train.sh
+```
+
+不带候选头的对照实验设置 `CANDIDATE_HEAD=0`，使用另一组匹配的服务/训练输出目录。其余数据、seed、层数、loop、LR 和 epoch 保持一致。同 seed 下候选头初始化不会消耗主干初始化或训练随机数。`RESUME=1` 从原 `run.yaml` 恢复开关及参数；不能在同一次训练的中途增删候选头或改变 rank。新 checkpoint 的权重和配置可直接加载，不支持把已有 dense checkpoint 自动转成候选头模型。
+
+增加三项聚合日志：`draft_loss` 为原主干 loss，`candidate_kl` 为有效 token 上的平均辅助 KL，`candidate_recall` 为候选集包含完整输出头 top-1 的比例。`loss` 是主干 loss 加上加权候选损失，候选损失沿用 TTT 的逐步衰减；普通验证同样报告这些指标。`checkpoint_best` 仍按验证 `loss` 选择，开启候选头时该值包含辅助项。原 `accept_len/eal` 指标仍来自 dense、teacher-forced 轨迹；真实候选接受长度需要离线评估。
+
+同一个训练 checkpoint 可以切换 dense / candidate 推理，评估路径仍手动指定：
+
+```bash
+# Dense 对照：明确关闭训练好的候选头。
+DRAFT_MODEL=/path/to/checkpoints/4 CANDIDATE_HEAD=0 \
+OUTPUT_DIR=eval_leagle_dense bash examples/evaluate/leagle_qwen3_4b_700k.sh
+
+# 默认自动读取 checkpoint 开关、rank 和候选数，温度默认 1。
+DRAFT_MODEL=/path/to/checkpoints/4 \
+OUTPUT_DIR=eval_leagle_candidate128 bash examples/evaluate/leagle_qwen3_4b_700k.sh
+
+# 改候选数无需重训；改 rank 需要新建训练实验。
+DRAFT_MODEL=/path/to/checkpoints/4 CANDIDATE_TOP_K=256 \
+OUTPUT_DIR=eval_leagle_candidate256 bash examples/evaluate/leagle_qwen3_4b_700k.sh
+```
+
+直接调用评估入口时，默认按 checkpoint 决定是否开启；用 `--no-candidate-head` 强制关闭，`--candidate-head` 强制开启，`--candidate-top-k M` 覆盖候选数。参数传递到每个 NPU worker，`eval_config.json` 记录实际开关、rank、候选数和概率支持集。没有候选头的模型强制开启会报错；缺失、尺寸不匹配或非有限低秩权重也会被拒绝。EAGLE3 不支持此开关。
+
+`temperature>0` 时，q 是候选内的精算 logits 按温度重新归一化后的分布；候选外 q=0，验证使用这一真实 q 做接受和残差修正，因此 target 仍可生成候选集合外的 token。`temperature=0` 时仍用 target 贪心验证纠正候选错误。候选遗漏可能降低接受长度；固定 seed 也不保证与 dense draft 生成相同的采样文本。评估开关只改变提议路径，不改变 checkpoint 内的训练配置。
+
+**这是从头联合训练的实验设置，与 EAGLE4 先训练主干、再冻结主干专门训练候选头的两阶段流程不同。** 候选头跟随训练中不断变化的 hidden-state 分布学习，效果需通过候选召回和实际接受长度验证。本实现保留完整输出矩阵，候选模式额外持有两组低秩权重；采用 PyTorch 的投影、top-k、gather 和散射，仍保留全词表形状的 logits。尚未实测 NPU 训练显存或推理吞吐。
+
 ```bash
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle.py -q
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/evaluate/test_leagle_offline_eval.py -q
+PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/evaluate/test_eagle_inference_cache.py -q
+PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle_candidate_head.py tests/unit/evaluate/test_leagle_candidate_head.py -q
 ```
 
 测试覆盖共享 loop 与展开独立层的前向 / 梯度等价性、缓存长度、packed document 与未来特征隔离、SDPA / eager、词表映射、真实自回归与并行训练轨迹的一致性，以及 activation checkpointing。评估测试额外覆盖全接受、首位 / 中途拒绝后的 KV 和特征回退、EOS、长度边界、不同深度 / loop / 词表的真实小型 Qwen3 生成一致性，以及保存 checkpoint 到 JSONL 结果的完整链路。

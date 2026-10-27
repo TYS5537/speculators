@@ -38,6 +38,46 @@ def launch_args(algorithm, **overrides):
     return command[command.index("speculators.train") + 1 :]
 
 
+def test_candidate_head_train_switch_reaches_model_config_and_resume(tmp_path):
+    flags = launch_args(
+        "leagle",
+        MODEL="model",
+        CANDIDATE_HEAD="1",
+        CANDIDATE_HEAD_RANK="64",
+        CANDIDATE_TOP_K="32",
+        CANDIDATE_HEAD_LOSS_WEIGHT="0.5",
+        CANDIDATE_HEAD_CHUNK_SIZE="16",
+    )
+    config = TrainConfig.resolve(flags)
+    assert config.draft.candidate_head
+    assert config.draft.candidate_head_rank == 64
+    assert config.draft.candidate_head_top_k == 32
+    assert config.draft.candidate_head_loss_weight == 0.5
+    assert config.draft.candidate_head_chunk_size == 16
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(config.dump_yaml())
+    resumed = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            MODEL="model",
+            RESUME="1",
+            OUTPUT_DIR=tmp_path.as_posix(),
+            CANDIDATE_HEAD="0",
+        )
+    )
+    assert resumed.draft.candidate_head
+    assert resumed.draft.candidate_head_rank == 64
+    assert resumed.draft.candidate_head_loss_weight == 0.5
+
+
+def test_eagle_script_ignores_leagle_candidate_environment():
+    config = TrainConfig.resolve(
+        launch_args("eagle3", MODEL="model", CANDIDATE_HEAD="1")
+    )
+    assert not config.draft.candidate_head
+
+
 @pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
 def test_default_recipes_resolve_without_changing_training_budget(algorithm):
     flags = launch_args(algorithm, MODEL="model")

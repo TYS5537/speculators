@@ -145,13 +145,15 @@ def generate_speculative(  # noqa: C901 -- Explicit acceptance, EOS and KV rollb
     stop_token_ids=None,
     propose=None,
     temperature=0.0,
+    draft_kv_reuse=True,
 ):
     """Verify draft proposals, retaining only the accepted target KV/features.
 
     The target prefill supplies an anchor token. At every subsequent round the
     target cache/features exclude that anchor; verification consumes the anchor
     and its draft continuation. The next anchor is the rejection replacement or
-    the all-accepted bonus token. Draft caches remain local to ``propose``.
+    the all-accepted bonus token. With draft_kv_reuse, a request-local cache
+    retains only target-conditioned prefix states, never synthetic rollout KV.
 
     Statistics follow the DSpark offline evaluator, including the final target-
     only round (zero proposed tokens) and truncation at an accepted EOS.
@@ -193,6 +195,10 @@ def generate_speculative(  # noqa: C901 -- Explicit acceptance, EOS and KV rollb
     ):
         return _response(output_ids[:, :end], input_length, [], [])
 
+    if draft_kv_reuse and max_new_tokens > 2:  # noqa: PLR2004 -- Anchor + bonus need no draft.
+        from speculators_eval.eagle_cache import cached_proposal  # noqa: PLC0415
+
+        propose = cached_proposal(draft_model, propose)
     initial_features = _features(output, draft_model.target_layer_ids)
     context = initial_features.new_empty((1, max_length, initial_features.shape[-1]))
     context[:, :input_length] = initial_features
@@ -290,6 +296,7 @@ def generate_greedy(
     max_new_tokens=512,
     stop_token_ids=None,
     propose=None,
+    draft_kv_reuse=True,
 ):
     """Compatibility entrypoint for the original deterministic protocol."""
     return generate_speculative(
@@ -301,6 +308,7 @@ def generate_greedy(
         stop_token_ids=stop_token_ids,
         propose=propose,
         temperature=0.0,
+        draft_kv_reuse=draft_kv_reuse,
     )
 
 
@@ -361,6 +369,7 @@ class LEagleOfflineRunner:
             stop_token_ids=stop_token_ids,
             propose=self.propose,
             temperature=self.args.temperature,
+            draft_kv_reuse=not getattr(self.args, "no_draft_kv_reuse", False),
         )
         if self.args.check_greedy:
             check_greedy_output(

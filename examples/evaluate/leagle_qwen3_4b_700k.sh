@@ -6,6 +6,8 @@
 # not change the manually selected checkpoint path.
 set -euo pipefail
 
+# Verified-prefix KV reuse is enabled; append --no-draft-kv-reuse for reference.
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT:${PYTHONPATH:-}"
@@ -17,6 +19,8 @@ RUN_DIR="./output/leagle_qwen3_4b_700k_5ep_d1_r1_fullvocab_5hs"
 DRAFT_MODEL="${DRAFT_MODEL:-$RUN_DIR/checkpoints/checkpoint_best}"
 SPEC_TOKENS="${SPEC_TOKENS:-7}"
 TEMPERATURE="${TEMPERATURE:-1}"  # 0: greedy; >0: draft/target sampling.
+CANDIDATE_HEAD="${CANDIDATE_HEAD:-auto}"  # Follow checkpoint; 0 forces dense, 1 forces candidates.
+CANDIDATE_TOP_K="${CANDIDATE_TOP_K:-}"  # Empty uses checkpoint value (normally 128).
 ASCEND_DEVICES="${ASCEND_DEVICES:-0,1,2,3,4,5,6,7}"
 DATASETS="${DATASETS:-gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,alpaca,arena-hard-v2}"
 OUTPUT_DIR="${OUTPUT_DIR:-eval_leagle_5hs_temp1}"
@@ -36,12 +40,26 @@ cmd=(
 if [[ -n "${DATASETS:-}" ]]; then cmd+=(--datasets "$DATASETS"); fi
 if [[ -n "${MAX_SAMPLES:-}" ]]; then cmd+=(--max-samples "$MAX_SAMPLES"); fi
 if [[ -n "${ASCEND_DEVICES:-}" ]]; then cmd+=(--ascend-devices "$ASCEND_DEVICES"); fi
+case "$CANDIDATE_HEAD" in
+    auto) ;;
+    0)
+        cmd+=(--no-candidate-head)
+        if [[ -n "$CANDIDATE_TOP_K" ]]; then
+            echo 'CANDIDATE_TOP_K cannot be used with CANDIDATE_HEAD=0.' >&2; exit 2
+        fi
+        ;;
+    1)
+        cmd+=(--candidate-head)
+        ;;
+    *) echo 'CANDIDATE_HEAD must be auto, 0 or 1.' >&2; exit 2 ;;
+esac
+if [[ -n "$CANDIDATE_TOP_K" ]]; then cmd+=(--candidate-top-k "$CANDIDATE_TOP_K"); fi
 case "${CHECK_GREEDY:-0}" in
     0) ;;
     1) cmd+=(--check-greedy) ;;
     *) echo 'CHECK_GREEDY must be 0 or 1.' >&2; exit 2 ;;
 esac
 
-echo "LEAGLE evaluation: $DRAFT_MODEL, temperature=$TEMPERATURE"
+echo "LEAGLE evaluation: $DRAFT_MODEL, temperature=$TEMPERATURE, candidate_head=$CANDIDATE_HEAD"
 echo "Results: $OUTPUT_DIR"
 exec "${cmd[@]}" "$@"

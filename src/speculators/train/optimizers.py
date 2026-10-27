@@ -27,6 +27,7 @@ logger = logging.getLogger("speculators")
 _ADAMW_NAME_HINTS = (
     "embed_tokens",
     "lm_head",
+    "candidate_head",
     "codebook",
     "markov_w1",
     "markov_w2",
@@ -55,7 +56,7 @@ def split_named_params_for_muon(
     hints = (
         _ADAMW_NAME_HINTS
         if training_recipe == "upstream"
-        else ("embed_tokens", "lm_head", "codebook")
+        else ("embed_tokens", "lm_head", "candidate_head", "codebook")
     )
     muon_params: list[tuple[str, Tensor]] = []
     adamw_params: list[tuple[str, Tensor]] = []

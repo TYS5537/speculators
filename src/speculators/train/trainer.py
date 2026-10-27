@@ -612,6 +612,12 @@ class Trainer:
         for scheduler in self.schedulers:
             scheduler.step()
 
+    def _clip_gradients(self):
+        model = getattr(self.model, "module", self.model)
+        groups = getattr(model, "gradient_clip_groups", None)
+        for parameters in groups() if groups is not None else [self.model.parameters()]:
+            torch.nn.utils.clip_grad_norm_(parameters, self.config.max_grad_norm)
+
     def _supervision_status(
         self, batch: dict, metrics: dict, device: torch.device
     ) -> tuple[bool, int]:
@@ -814,9 +820,7 @@ class Trainer:
                     epoch, local_step, complete=local_step == num_steps
                 )
                 continue
-            torch.nn.utils.clip_grad_norm_(
-                self.model.parameters(), self.config.max_grad_norm
-            )
+            self._clip_gradients()
 
             metrics["error_records_sum"] = torch.tensor(
                 error_records, dtype=torch.float32, device=loss.device

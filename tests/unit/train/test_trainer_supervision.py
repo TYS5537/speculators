@@ -80,6 +80,30 @@ def trainer_module():
     return module
 
 
+@pytest.mark.parametrize("wrapped", [False, True])
+def test_clip_groups_do_not_let_auxiliary_gradients_rescale_backbone(
+    trainer_module, wrapped
+):
+    class GroupedModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.backbone = torch.nn.Parameter(torch.tensor([1.0]))
+            self.auxiliary = torch.nn.Parameter(torch.tensor([1.0]))
+
+        def gradient_clip_groups(self):
+            return [[self.backbone], [self.auxiliary]]
+
+    model = GroupedModel()
+    model.backbone.grad = torch.tensor([0.5])
+    model.auxiliary.grad = torch.tensor([100.0])
+    trainer = trainer_module.Trainer.__new__(trainer_module.Trainer)
+    trainer.model = SimpleNamespace(module=model) if wrapped else model
+    trainer.config = SimpleNamespace(max_grad_norm=1.0)
+    trainer._clip_gradients()
+    torch.testing.assert_close(model.backbone.grad, torch.tensor([0.5]))
+    torch.testing.assert_close(model.auxiliary.grad, torch.tensor([1.0]))
+
+
 class _Loader(list):
     batch_sampler = SimpleNamespace()
 

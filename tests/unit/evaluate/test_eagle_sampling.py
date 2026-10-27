@@ -243,10 +243,12 @@ def test_real_sampled_decoding_is_seed_reproducible(algorithm, reduced, dtype):
 
 
 @pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
+@pytest.mark.parametrize("reuse", [False, True])
 def test_temperature_one_checkpoint_pipeline_workers_and_provenance(
-    tmp_path, algorithm
+    tmp_path, algorithm, reuse
 ):
     args = save_fixture(tmp_path)
+    args.no_draft_kv_reuse = not reuse
     if algorithm == "eagle3":
         target, draft = make_eagle(layers=1)
         target.save_pretrained(args.verifier_model)
@@ -258,6 +260,10 @@ def test_temperature_one_checkpoint_pipeline_workers_and_provenance(
     assert metadata["arguments"]["temperature"] == 1.0
     assert metadata["proposal"] == "single-chain-sampling"
     assert metadata["probability_diagnostics_available"] is True
+    assert metadata["draft_kv_reuse_between_rounds"] is reuse
+    assert metadata["draft_cache_policy"] == (
+        "verified-prefix-only" if reuse else "rebuild-each-round"
+    )
     rows = json.loads((args.output_dir / "summary.json").read_text())
     assert rows[0]["probability_diagnostics_available"] is True
     assert rows[0]["num_requests"] == 2
@@ -279,6 +285,7 @@ def test_temperature_one_checkpoint_pipeline_workers_and_provenance(
     child_args = leagle.build_parser().parse_args(command[2:])
     assert child_args.temperature == 1.0
     assert not child_args.check_greedy
+    assert child_args.no_draft_kv_reuse is not reuse
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,7 @@
 """Train CLI declaration, algorithm defaults, and argument validation."""
 
 import argparse
+import math
 
 from hs_connectors import HiddenStatesBackend
 from speculators.models.metrics import resolve_loss_config
@@ -50,6 +51,8 @@ _LEGACY_FIELDS = """
     train_data_ratio no_resume_from_checkpoint logger total_seq_len log_freq
     profile_freq
     log_dir run_name num_layers num_loops draft_arch draft_hidden_act
+    candidate_head candidate_head_rank candidate_head_top_k
+    candidate_head_loss_weight candidate_head_chunk_size
     draft_mrope_full_head_hack
     target_layer_ids target_hidden_state_format dsv4_external_arrow token_freq_path
     draft_vocab_size d2t_path t2d_path mask_token_id ttt_steps num_speculative_steps
@@ -227,6 +230,22 @@ def _apply_leagle_defaults(args: argparse.Namespace, provided: set[str]) -> None
 
 
 def _validate_leagle_args(parser, args) -> None:
+    if args.candidate_head and args.speculator_type != "leagle":
+        parser.error("--candidate-head is only supported by --speculator-type leagle")
+    if (
+        min(
+            args.candidate_head_rank,
+            args.candidate_head_top_k,
+            args.candidate_head_chunk_size,
+        )
+        < 1
+    ):
+        parser.error("Candidate head rank, top-k and chunk-size must be positive")
+    if (
+        not math.isfinite(args.candidate_head_loss_weight)
+        or args.candidate_head_loss_weight <= 0
+    ):
+        parser.error("--candidate-head-loss-weight must be finite and positive")
     if args.num_loops < 1 or (args.num_loops != 1 and args.speculator_type != "leagle"):
         parser.error("--num-loops must be >= 1 and requires --speculator-type leagle")
     if args.speculator_type == "leagle":

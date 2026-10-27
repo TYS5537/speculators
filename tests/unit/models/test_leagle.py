@@ -24,7 +24,14 @@ def deterministic_cpu():
     torch.set_num_threads(1)
 
 
-def make_model(layers=2, loops=2, attention="eager", window=None, reduced=False):
+def make_model(
+    layers=2,
+    loops=2,
+    attention="eager",
+    window=None,
+    reduced=False,
+    candidate_head=False,
+):
     decoder = Qwen3Config(
         vocab_size=24,
         hidden_size=16,
@@ -45,6 +52,10 @@ def make_model(layers=2, loops=2, attention="eager", window=None, reduced=False)
         draft_vocab_size=12 if reduced else 24,
         aux_hidden_state_layer_ids=[0, 1],
         num_loops=loops,
+        candidate_head=candidate_head,
+        candidate_head_rank=4,
+        candidate_head_top_k=3,
+        candidate_head_chunk_size=2,
         speculators_config=SpeculatorsConfig(
             algorithm="leagle",
             proposal_methods=[GreedyTokenProposalConfig(speculative_tokens=7)],

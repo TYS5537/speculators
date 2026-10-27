@@ -106,6 +106,24 @@ class DraftArgs(_Group):
         description="LEAGLE shared decoder-stack visits per token; independent of "
         "--num-layers and --ttt-steps. Other algorithms require 1.",
     )
+    candidate_head: bool = Field(
+        default=False,
+        description="LEAGLE: jointly train a low-rank candidate output head.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    candidate_head_rank: int = Field(default=256, gt=0)
+    candidate_head_top_k: int = Field(default=128, gt=0)
+    candidate_head_loss_weight: float = Field(
+        default=1.0,
+        gt=0,
+        allow_inf_nan=False,
+        description="Weight of detached dense-to-candidate forward KL in LEAGLE.",
+    )
+    candidate_head_chunk_size: int = Field(
+        default=32,
+        gt=0,
+        description="Token rows per recomputed candidate KL chunk; limits memory use.",
+    )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
         description="Architecture for draft decoder layers "
@@ -905,6 +923,14 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = "ce" if is_dflash else "kl_div"
         if self.dflash.block_size is None:
             self.dflash.block_size = 16 if is_dflash else 8
+
+    @model_validator(mode="after")
+    def _validate_candidate_head(self) -> "TrainConfig":
+        if self.draft.candidate_head and self.speculator_type != "leagle":
+            raise ValueError(
+                "--candidate-head is only supported by --speculator-type leagle"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_dpace(self) -> "TrainConfig":

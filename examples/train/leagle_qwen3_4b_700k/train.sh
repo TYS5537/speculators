@@ -62,13 +62,21 @@ LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
 # Match DSpark's CE/TV numerical implementation; attention still uses SDPA.
 LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-legacy}"
 
+# Optional candidate head, created and trained from scratch with the draft.
+# Its detached forward-KL objective trains only the two retrieval matrices.
+CANDIDATE_HEAD="${CANDIDATE_HEAD:-0}"
+CANDIDATE_HEAD_RANK="${CANDIDATE_HEAD_RANK:-256}"
+CANDIDATE_TOP_K="${CANDIDATE_TOP_K:-128}"
+CANDIDATE_HEAD_LOSS_WEIGHT="${CANDIDATE_HEAD_LOSS_WEIGHT:-1.0}"
+CANDIDATE_HEAD_CHUNK_SIZE="${CANDIDATE_HEAD_CHUNK_SIZE:-32}"
+
 FSDP_SHARD="${FSDP_SHARD:-1}"
 ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-1}"
 RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"  # Print the resolved launch command without loading models.
 
 # ============ Launch ============
-for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN; do
+for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN CANDIDATE_HEAD; do
     if [[ "${!setting}" != 0 && "${!setting}" != 1 ]]; then
         echo "$setting must be 0 or 1." >&2
         exit 2
@@ -168,6 +176,12 @@ if [[ "$RESUME" == 1 ]]; then
         --save-path "$OUTPUT_DIR/checkpoints" --log-dir "$OUTPUT_DIR/tensorboard"
         --vllm-endpoint "$VLLM_ENDPOINT" --hidden-states-path "$HIDDEN_STATES_PATH")
 else
+    if [[ "$CANDIDATE_HEAD" == 1 ]]; then
+        TRAIN_ARGS+=(--candidate-head --candidate-head-rank "$CANDIDATE_HEAD_RANK"
+            --candidate-head-top-k "$CANDIDATE_TOP_K"
+            --candidate-head-loss-weight "$CANDIDATE_HEAD_LOSS_WEIGHT"
+            --candidate-head-chunk-size "$CANDIDATE_HEAD_CHUNK_SIZE")
+    fi
     if [[ "$FSDP_SHARD" == 1 ]]; then TRAIN_ARGS+=(--fsdp-shard); fi
     if [[ "$ACTIVATION_CHECKPOINTING" == 1 ]]; then TRAIN_ARGS+=(--activation-checkpointing); fi
 fi

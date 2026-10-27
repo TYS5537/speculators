@@ -4,6 +4,7 @@
 # Edit RUN_DIR and OUTPUT_DIR below, or set DRAFT_MODEL to any saved epoch.
 # The model architecture comes from that checkpoint; NUM_LAYERS does not
 # change the manually selected checkpoint path.
+# Verified-prefix KV reuse is enabled; append --no-draft-kv-reuse for reference.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"

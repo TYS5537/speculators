@@ -24,6 +24,13 @@ class LEagleSpeculatorConfig(SpeculatorModelConfig):
         default=True,
         description="Feed normalized hidden states into the next token step.",
     )
+    candidate_head: bool = Field(
+        default=False, description="Train a low-rank candidate head."
+    )
+    candidate_head_rank: int = Field(default=256, gt=0)
+    candidate_head_top_k: int = Field(default=128, gt=0)
+    candidate_head_loss_weight: float = Field(default=1.0, gt=0, allow_inf_nan=False)
+    candidate_head_chunk_size: int = Field(default=32, gt=0)
 
     @field_serializer("transformer_layer_config")
     def serialize_transformer_config(self, value: PretrainedConfig) -> dict:
@@ -47,6 +54,15 @@ class LEagleSpeculatorConfig(SpeculatorModelConfig):
             raise ValueError("LEAGLE needs at least one physical decoder layer")
         if self.draft_vocab_size > decoder.vocab_size:
             raise ValueError("Draft vocabulary cannot exceed the verifier vocabulary")
+        if self.candidate_head:
+            if self.candidate_head_rank > min(
+                decoder.hidden_size, self.draft_vocab_size
+            ):
+                raise ValueError(
+                    "Candidate rank cannot exceed hidden size or draft vocab"
+                )
+            if self.candidate_head_top_k > self.draft_vocab_size:
+                raise ValueError("Candidate top_k cannot exceed the draft vocabulary")
         layers = self.aux_hidden_state_layer_ids
         if layers is not None and (
             not layers or min(layers) < 0 or len(set(layers)) != len(layers)

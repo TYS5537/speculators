@@ -81,12 +81,23 @@ def target_worker_args(args: argparse.Namespace) -> list[str]:
 
 def _proposal_worker_args(args) -> list[str]:
     result = []
-    for name in ("spec_tokens", "target_attn_impl", "checkpoint_manifest"):
+    for name in (
+        "spec_tokens",
+        "target_attn_impl",
+        "checkpoint_manifest",
+        "candidate_top_k",
+    ):
         value = getattr(args, name, None)
         if value is not None:
             result.extend(["--" + name.replace("_", "-"), str(value)])
     if getattr(args, "check_greedy", False):
         result.append("--check-greedy")
+    if getattr(args, "no_draft_kv_reuse", False):
+        result.append("--no-draft-kv-reuse")
+    if getattr(args, "candidate_head", None) is True:
+        result.append("--candidate-head")
+    elif getattr(args, "candidate_head", None) is False:
+        result.append("--no-candidate-head")
     return result
 
 
