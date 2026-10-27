@@ -1,9 +1,16 @@
-"""Single-chain greedy LEAGLE decoding with a cached Hugging Face verifier."""
+"""Single-chain EAGLE decoding with greedy or rejection-sampling verification."""
 
 from types import SimpleNamespace
 
 import torch
 from transformers import DynamicCache, GenerationConfig
+
+from speculators.proposals.sampling import (
+    logits_to_probs,
+    sample_from_logits,
+    sample_from_probs,
+    validate_temperature,
+)
 
 
 def resolve_stop_token_ids(target_model, tokenizer) -> list[int]:
@@ -26,21 +33,32 @@ def _features(output, layer_ids):
     return torch.cat([output.hidden_states[index] for index in layer_ids], dim=-1)
 
 
-def _response(output_ids, input_length, proposal_lengths, accepted_lengths):
+def _response(
+    output_ids,
+    input_length,
+    proposal_lengths,
+    accepted_lengths,
+    accept_prob_lists=None,
+    support_accept_rate_lists=None,
+):
     return SimpleNamespace(
         output_ids=output_ids,
         num_input_tokens=input_length,
         num_output_tokens=output_ids.shape[1] - input_length,
         proposal_lengths=proposal_lengths,
         accepted_draft_lengths=accepted_lengths,
-        accept_prob_lists=[],
-        support_accept_rate_lists=[],
+        accept_prob_lists=accept_prob_lists or [],
+        support_accept_rate_lists=support_accept_rate_lists or [],
     )
 
 
 def _accepted_prefix(draft_ids, target_ids, stop_token_ids):
     matches = draft_ids.eq(target_ids[:, : draft_ids.shape[1]])
     accepted = int(matches.long().cumprod(dim=-1).sum().item())
+    return _truncate_accepted_stop(draft_ids, accepted, stop_token_ids)
+
+
+def _truncate_accepted_stop(draft_ids, accepted, stop_token_ids):
     if accepted and stop_token_ids:
         stops = torch.isin(
             draft_ids[0, :accepted], draft_ids.new_tensor(stop_token_ids)
@@ -50,8 +68,74 @@ def _accepted_prefix(draft_ids, target_ids, stop_token_ids):
     return accepted, False
 
 
+def _draft_probabilities(draft_model, logits, temperature, target_vocab_size):
+    probs = logits_to_probs(logits, temperature)
+    if not draft_model.use_draft_vocab:
+        if probs.shape[-1] != target_vocab_size:
+            raise ValueError("Full draft and target vocabularies must match")
+        return probs
+    # q is zero outside the draft vocabulary. In particular, rejection may
+    # select a target token that the pruned draft could never have proposed.
+    ids = torch.arange(probs.shape[-1], device=probs.device) + draft_model.d2t
+    expanded = probs.new_zeros(*probs.shape[:-1], target_vocab_size)
+    expanded.index_copy_(-1, ids.long(), probs)
+    return expanded
+
+
+def _verify_sampled(
+    draft_model, draft_ids, draft_logits, target_logits, temperature, stop_token_ids
+):
+    """Verify sampled q tokens against p and draw the corrected continuation."""
+    count = draft_ids.shape[1]
+    target_probs = logits_to_probs(target_logits, temperature)
+    accept_probs = target_probs.new_empty((1, 0))
+    support_rates = target_probs.new_empty((1, 0))
+    accepted = 0
+    if count:
+        if draft_logits is None:
+            raise ValueError("Sampled proposals must return their conditional logits")
+        draft_probs = _draft_probabilities(
+            draft_model, draft_logits, temperature, target_probs.shape[-1]
+        )
+        selected_q = draft_probs.gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)
+        if not torch.all(torch.isfinite(selected_q) & (selected_q > 0)):
+            raise ValueError("Sampled draft tokens must have positive finite q")
+        selected_p = (
+            target_probs[:, :count].gather(-1, draft_ids.unsqueeze(-1)).squeeze(-1)
+        )
+        accept_probs = (selected_p / selected_q).clamp(max=1.0)
+        support_rates = torch.minimum(target_probs[:, :count], draft_probs).sum(-1)
+        accepted = int(
+            (torch.rand_like(accept_probs) < accept_probs)
+            .long()
+            .cumprod(-1)
+            .sum()
+            .item()
+        )
+    accepted, stopped = _truncate_accepted_stop(draft_ids, accepted, stop_token_ids)
+    effective_count = accepted if stopped else count
+    next_token = None
+    if not stopped:
+        if accepted < count:
+            # multinomial normalizes max(p-q, 0); no epsilon/fallback that would
+            # silently change the target distribution on rejected proposals.
+            residual = (target_probs[:, accepted] - draft_probs[:, accepted]).clamp_min(
+                0
+            )
+            next_token = sample_from_probs(residual).unsqueeze(-1)
+        else:
+            next_token = sample_from_probs(target_probs[:, count]).unsqueeze(-1)
+    return (
+        accepted,
+        stopped,
+        next_token,
+        accept_probs[0, :effective_count].tolist(),
+        support_rates[0, :effective_count].tolist(),
+    )
+
+
 @torch.inference_mode()
-def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback cases.
+def generate_speculative(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback cases.
     target_model,
     draft_model,
     input_ids,
@@ -60,8 +144,9 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
     max_new_tokens=512,
     stop_token_ids=None,
     propose=None,
+    temperature=0.0,
 ):
-    """Verify top-1 proposals, retaining only the accepted target KV/features.
+    """Verify draft proposals, retaining only the accepted target KV/features.
 
     The target prefill supplies an anchor token. At every subsequent round the
     target cache/features exclude that anchor; verification consumes the anchor
@@ -70,7 +155,10 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
 
     Statistics follow the DSpark offline evaluator, including the final target-
     only round (zero proposed tokens) and truncation at an accepted EOS.
+    Positive temperatures sample both models and use exact rejection sampling;
+    zero retains the original top-1 path without consuming sampling RNG.
     """
+    validate_temperature(temperature)
     if input_ids.ndim != 2 or input_ids.shape[0] != 1 or input_ids.shape[1] == 0:  # noqa: PLR2004
         raise ValueError("Expected one nonempty, unpadded input sequence")
     if spec_tokens < 1 or max_new_tokens < 0:
@@ -79,6 +167,7 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
         raise ValueError("Both models must be in eval mode")
     input_length = input_ids.shape[1]
     proposal_lengths, accepted_lengths = [], []
+    accept_prob_lists, support_accept_rate_lists = [], []
     if max_new_tokens == 0:
         return _response(input_ids.clone(), input_length, [], [])
 
@@ -95,8 +184,8 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
         output_hidden_states=True,
         logits_to_keep=1,
     )
-    output_ids[:, input_length : input_length + 1] = output.logits[:, -1].argmax(
-        dim=-1, keepdim=True
+    output_ids[:, input_length : input_length + 1] = sample_from_logits(
+        output.logits[:, -1:], temperature
     )
     end = input_length + 1
     if max_new_tokens == 1 or _contains_stop(
@@ -113,20 +202,25 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
         start = end - 1  # Known anchor, not yet processed by the target.
         count = min(spec_tokens, max_length - end - 1)  # Reserve a bonus token.
         anchor = output_ids[:, start:end]
+        # Keep compatibility with existing greedy-only proposal callbacks.
+        proposal_kwargs = {"temperature": temperature} if temperature else {}
+        draft_logits = None
         if count and propose is not None:
-            draft_ids, _ = propose(
+            draft_ids, draft_logits = propose(
                 draft_model,
                 hidden_states=context[:, :start],
                 input_ids=output_ids[:, :end],
                 position_ids=positions[:, :start],
                 num_tokens=count,
+                **proposal_kwargs,
             )
         elif count:
-            draft_ids, _ = draft_model.propose(
+            draft_ids, draft_logits = draft_model.propose(
                 hidden_states=context[:, :start],
                 anchor_token=anchor,
                 position_ids=positions[:, :start],
                 num_tokens=count,
+                **proposal_kwargs,
             )
         else:
             draft_ids = input_ids.new_empty((1, 0))
@@ -138,8 +232,23 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
             use_cache=True,
             output_hidden_states=True,
         )
-        target_ids = output.logits.argmax(dim=-1)
-        accepted, stopped = _accepted_prefix(draft_ids, target_ids, stop_token_ids)
+        if temperature > 0:
+            accepted, stopped, next_token, accept_probs, support_rates = (
+                _verify_sampled(
+                    draft_model,
+                    draft_ids,
+                    draft_logits,
+                    output.logits,
+                    temperature,
+                    stop_token_ids,
+                )
+            )
+            accept_prob_lists.append(accept_probs)
+            support_accept_rate_lists.append(support_rates)
+        else:
+            target_ids = output.logits.argmax(dim=-1)
+            accepted, stopped = _accepted_prefix(draft_ids, target_ids, stop_token_ids)
+            next_token = target_ids[:, accepted : accepted + 1]
         proposal_lengths.append(accepted if stopped else count)
         accepted_lengths.append(accepted)
         output_ids[:, end : end + accepted] = draft_ids[:, :accepted]
@@ -147,7 +256,7 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
         if stopped:
             break
 
-        output_ids[:, end : end + 1] = target_ids[:, accepted : accepted + 1]
+        output_ids[:, end : end + 1] = next_token
         end += 1
         # The anchor and accepted proposals are now verified. Discard the
         # rejected suffix before another round can observe its KV or features.
@@ -163,7 +272,35 @@ def generate_greedy(  # noqa: C901 -- Explicit acceptance, EOS and KV rollback c
         del output
 
     return _response(
-        output_ids[:, :end], input_length, proposal_lengths, accepted_lengths
+        output_ids[:, :end],
+        input_length,
+        proposal_lengths,
+        accepted_lengths,
+        accept_prob_lists,
+        support_accept_rate_lists,
+    )
+
+
+def generate_greedy(
+    target_model,
+    draft_model,
+    input_ids,
+    *,
+    spec_tokens=7,
+    max_new_tokens=512,
+    stop_token_ids=None,
+    propose=None,
+):
+    """Compatibility entrypoint for the original deterministic protocol."""
+    return generate_speculative(
+        target_model,
+        draft_model,
+        input_ids,
+        spec_tokens=spec_tokens,
+        max_new_tokens=max_new_tokens,
+        stop_token_ids=stop_token_ids,
+        propose=propose,
+        temperature=0.0,
     )
 
 
@@ -215,7 +352,7 @@ class LEagleOfflineRunner:
             raise ValueError(
                 f"Prompt + max_new_tokens exceeds target context limit {limit}"
             )
-        response = generate_greedy(
+        response = generate_speculative(
             self.target_model,
             self.draft_model,
             input_ids,
@@ -223,6 +360,7 @@ class LEagleOfflineRunner:
             max_new_tokens=self.args.max_new_tokens,
             stop_token_ids=stop_token_ids,
             propose=self.propose,
+            temperature=self.args.temperature,
         )
         if self.args.check_greedy:
             check_greedy_output(

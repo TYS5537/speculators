@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import math
 import time
 from pathlib import Path
 
@@ -16,7 +17,7 @@ logger = logging.getLogger("speculators_eval")
 
 def build_parser():
     parser = argparse.ArgumentParser(
-        description="EAGLE3 / LEAGLE single-chain greedy acceptance with an HF target."
+        description="EAGLE3 / LEAGLE single-chain speculation with an HF target."
     )
     parser.add_argument("--verifier-model", required=True)
     parser.add_argument("--draft-model", required=True)
@@ -26,7 +27,12 @@ def build_parser():
     parser.add_argument("--spec-tokens", type=int, default=7)
     parser.add_argument("--max-new-tokens", type=int, default=512)
     parser.add_argument("--max-samples", type=int, default=None)
-    parser.add_argument("--temperature", type=float, choices=[0.0], default=0.0)
+    parser.add_argument(
+        "--temperature",
+        type=float,
+        default=0.0,
+        help="0 uses greedy decoding; >0 samples draft and target at this temperature.",
+    )
     parser.add_argument("--seed", type=int, default=980406)
     parser.add_argument(
         "--enable-thinking", choices=["false", "true", "default"], default="false"
@@ -75,8 +81,10 @@ def build_parser():
 def validate_args(args):
     if args.spec_tokens < 1 or args.max_new_tokens < 0:
         raise ValueError("--spec-tokens must be >= 1 and --max-new-tokens >= 0")
-    if args.temperature != 0:
-        raise ValueError("LEAGLE evaluation currently supports temperature=0 only")
+    if not math.isfinite(args.temperature) or args.temperature < 0:
+        raise ValueError("--temperature must be finite and >= 0")
+    if args.check_greedy and args.temperature != 0:
+        raise ValueError("--check-greedy requires temperature=0")
     if args.max_samples is not None and args.max_samples < 0:
         raise ValueError("--max-samples must be >= 0")
     if args.log_every < 1 or args.worker_num_shards < 1:
@@ -183,12 +191,18 @@ def load_models(args):
 
 def save_provenance(args, draft_config=None):
     metadata = {
-        "proposal": "single-chain-greedy",
-        "verification": "HF full-attention target with KV rollback",
+        "proposal": (
+            "single-chain-sampling" if args.temperature > 0 else "single-chain-greedy"
+        ),
+        "verification": (
+            "HF rejection sampling with residual correction and KV rollback"
+            if args.temperature > 0
+            else "HF full-attention target with KV rollback"
+        ),
         "target_kv_reuse": True,
         "draft_kv_reuse_between_rounds": False,
         "online_speedup_benchmark": False,
-        "probability_diagnostics_available": False,
+        "probability_diagnostics_available": args.temperature > 0,
         "timing_scope": (
             "parallel worker wall time including model loads"
             if args.ascend_devices and args.worker_shard_index is None
@@ -217,7 +231,7 @@ def evaluate_dataset(path, runner, args, stop_token_ids):
     indexed = data.shard_records(
         selected, shard_index=args.worker_shard_index, num_shards=args.worker_num_shards
     )
-    stats = reporting.EvalStats(probability_diagnostics_available=False)
+    stats = reporting.EvalStats(probability_diagnostics_available=args.temperature > 0)
     artifacts = []
     progress = WorkerProgress(args.worker_progress_path)
     progress.update(0)
@@ -248,6 +262,8 @@ def evaluate_dataset(path, runner, args, stop_token_ids):
                     "source_index": index,
                     "proposal_lengths": response.proposal_lengths,
                     "accepted_draft_lengths": response.accepted_draft_lengths,
+                    "accept_prob_lists": response.accept_prob_lists,
+                    "support_accept_rate_lists": response.support_accept_rate_lists,
                 }
             )
         progress.update(processed)

@@ -1,4 +1,4 @@
-"""EAGLE3 entrypoint sharing LEAGLE's greedy verification and offline metrics."""
+"""EAGLE3 entrypoint sharing LEAGLE's speculative verification and metrics."""
 
 from pathlib import Path
 

@@ -22,8 +22,8 @@ PYTHON="${PYTHON:-python}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
 NUM_LOOPS="${NUM_LOOPS:-1}"
 DATA_PATH="${DATA_PATH:-../../datasets/open_perfectblend_qwen3_4b_700k}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab}"
-RUN_NAME="leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs}"
+RUN_NAME="leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs"
 VLLM_PORT="${VLLM_PORT:-8003}"
 VLLM_ENDPOINT="http://127.0.0.1:${VLLM_PORT}/v1"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
@@ -51,9 +51,9 @@ WARMUP_RATIO="${WARMUP_RATIO:-0.04}"
 DRAFT_ARCH="qwen3"
 DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-151936}"  # Qwen3-4B full vocabulary.
 TOKEN_FREQ_PATH="$DATA_PATH/token_freq.pt"
-# Qwen3-4B has 36 layers: the default auxiliary slots are 2, 18 and 33.
+# Qwen3-4B has 36 layers: the five auxiliary slots are 1, 9, 17, 25 and 33.
 # server.sh appends final teacher slot 36; do not append it here.
-TARGET_LAYER_IDS=(2 18 33)
+TARGET_LAYER_IDS=(1 9 17 25 33)
 DRAFT_ATTN_IMPL="sdpa"  # Attention backend; independent of LOSS_IMPLEMENTATION.
 TTT_STEPS="${TTT_STEPS:-7}" # Token prediction steps; independent of NUM_LOOPS.
 TTT_STEP_LOSS_DECAY="${TTT_STEP_LOSS_DECAY:-1.0}"

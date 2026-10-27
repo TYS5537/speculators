@@ -51,9 +51,13 @@ def test_default_recipes_resolve_without_changing_training_budget(algorithm):
     assert args["ttt_steps"] == 7
     assert args["num_layers"] == args["num_loops"] == 1
     assert args["draft_vocab_size"] == 151936
-    assert args["target_layer_ids"] == [2, 18, 33]
+    assert args["target_layer_ids"] == (
+        [2, 18, 33] if algorithm == "eagle3" else [1, 9, 17, 25, 33]
+    )
     assert args["full_attention_indices"] == [0]
     assert args["training_recipe"] == "upstream"  # Retain size-keyed vocab caches.
+    assert args["fsdp_shard"] is (algorithm == "leagle")
+    assert args["activation_checkpointing"] is (algorithm == "leagle")
     if algorithm == "eagle3":
         assert args["adam_beta2"] == 0.95
         assert args["max_grad_norm"] == 0.5
@@ -101,6 +105,8 @@ def test_script_memory_retention_and_loss_overrides(algorithm):
         MAX_GRAD_NORM="0.3",
         DRAFT_VOCAB_SIZE="32000",
         LOSS_FN="tv",
+        FSDP_SHARD="1",
+        ACTIVATION_CHECKPOINTING="1",
     )
     args = TrainConfig.resolve(flags).flatten()
     assert args["fsdp_shard"]

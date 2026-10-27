@@ -61,8 +61,8 @@ LOSS_FN="${LOSS_FN:-kl_div}"
 # This changes only the loss implementation, keeping the KL objective.
 LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-eager}"
 
-FSDP_SHARD="${FSDP_SHARD:-1}"
-ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-1}"
+FSDP_SHARD="${FSDP_SHARD:-0}"
+ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-0}"
 RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"  # Print the resolved launch command without loading models.
 

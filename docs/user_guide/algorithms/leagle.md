@@ -42,7 +42,7 @@ LEAGLE 没有并行 mask-token backbone、Markov/RNN correction head、confidenc
 
 ## 训练
 
-从仓库根目录运行。沿用已经准备好的 Qwen3-4B / 70 万数据、5 epochs、seed 42、3072 packing 长度、0.9 训练比例、三个目标特征层 `[2,18,33]` 和 TTT=7。两组默认 `DRAFT_VOCAB_SIZE=151936`，使用 Qwen3-4B 的完整词表。默认目标服务使用 NPU 0–1，训练使用 NPU 2–7，端口 8003。脚本中的模型与数据路径需要与训练机器一致。
+从仓库根目录运行。沿用已经准备好的 Qwen3-4B / 70 万数据、5 epochs、seed 42、3072 packing 长度、0.9 训练比例和 TTT=7。EAGLE3 使用三个目标特征层 `[2,18,33]`，LEAGLE 使用五个目标特征层 `[1,9,17,25,33]`。两组默认 `DRAFT_VOCAB_SIZE=151936`，使用 Qwen3-4B 的完整词表。默认目标服务使用 NPU 0–1，训练使用 NPU 2–7，端口 8003。脚本中的模型与数据路径需要与训练机器一致。
 
 词表切换无需重新生成预处理数据；启动仍要求数据目录中有 `token_freq.pt`，或与词表大小匹配的 `t2d-151936.npy` / `d2t-151936.npy`。原有 32K 映射不会被当成全词表缓存使用。新训练使用独立的 `fullvocab` 输出目录；如需重新做 32K 对照，可设置 `DRAFT_VOCAB_SIZE=32000` 并另指定 `OUTPUT_DIR`。
 
@@ -70,7 +70,7 @@ Qwen3-4B 预设的所有 draft 层使用 full causal attention。脚本根据 `N
 
 LEAGLE 的优化器、loss 与调度参数取自仓库的 [`train_dspark.sh`](../../../examples/train/qwen3_4b_bestarch/train_dspark.sh)。保留 LEAGLE 的层数 / loop、完整词表、目标特征层和 5 epochs，不引入 DSpark 的 Markov / confidence head 及其辅助损失。`training-recipe=upstream` 保留按词表大小命名的缓存和 hidden-state 恢复流程；loss 显式指定 `legacy`，因此使用与 DSpark 相同的 CE / TV 数值实现。两组 attention 均为 SDPA，loss 的实现选项不改变 attention backend。
 
-两份训练脚本默认开启 `FSDP_SHARD=1` 和 `ACTIVATION_CHECKPOINTING=1`，可分别设为 `0` 关闭。EAGLE3 的重算使用独立缓存，避免反向传播重复追加 TTT KV；LEAGLE 按物理层重算全部共享 loop。FSDP 分片按物理层执行。这里的默认配置尚需在实际 NPU 集群验证显存和速度。
+EAGLE3 训练脚本默认 `FSDP_SHARD=0`、`ACTIVATION_CHECKPOINTING=0`；LEAGLE 仍默认两项均为 `1`。两项均可通过同名环境变量设为 `0` 或 `1`。开启重算时，EAGLE3 使用独立缓存，避免反向传播重复追加 TTT KV；LEAGLE 按物理层重算全部共享 loop。FSDP 分片按物理层执行。这里的默认配置尚需在实际 NPU 集群验证显存和速度。
 
 新运行可用环境变量覆盖 `LR`、`WEIGHT_DECAY`、`ADAM_BETA1`、`ADAM_BETA2`、`MAX_GRAD_NORM`、`LOSS_FN`、`LOSS_IMPLEMENTATION`、`EPOCHS`、`SEQ_LENGTH`、`SEED`、`TTT_STEPS`、`TTT_STEP_LOSS_DECAY` 和 scheduler 参数。`LOSS_FN` 也接受仓库已有的加权 JSON，例如 `'{"ce":0.1,"tv":0.9}'`。修改配方时为实验指定新的 `OUTPUT_DIR`，服务端也使用该目录。
 
@@ -82,7 +82,7 @@ DRY_RUN=1 NUM_LAYERS=2 NUM_LOOPS=2 \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 
 # 已停止的训练继续运行；先用相同 OUTPUT_DIR 重启 server.sh。
-RESUME=1 OUTPUT_DIR=./output/leagle_qwen3_4b_700k_5ep_d2_r2_fullvocab \
+RESUME=1 OUTPUT_DIR=./output/leagle_qwen3_4b_700k_5ep_d2_r2_fullvocab_5hs \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
@@ -90,7 +90,7 @@ bash examples/train/leagle_qwen3_4b_700k/train.sh
 
 默认保存每个 epoch（五轮对应 `checkpoints/0` 至 `checkpoints/4`），并维护 validation loss 最优的 `checkpoint_best`。最佳 loss 不保证最佳接受长度；可在独立验证集上评估各 epoch。显式启用底层 `--save-best` 时仅清理旧编号 checkpoint，保留 `run.yaml`、`train_command.txt`、patch 和恢复数据。
 
-两组默认一个物理 decoder 层，LEAGLE 默认 `num_loops=1`；两组均显式使用 full attention。普通 EAGLE-3 保留示例的 Llama decoder 和输入归一化设置；LEAGLE 保留 Qwen3 decoder、输入融合和每层 KV 注入。该实验比较结构及训练配方的组合，接受长度差异不能单独归因于结构或 loop；峰值 LR 已统一，若要隔离结构因素，还需统一 loss、betas、梯度裁剪和 scheduler。
+两组默认一个物理 decoder 层，LEAGLE 默认 `num_loops=1`；两组均显式使用 full attention。普通 EAGLE-3 保留示例的 Llama decoder 和输入归一化设置；LEAGLE 保留 Qwen3 decoder、输入融合和每层 KV 注入。该实验比较结构及训练配方的组合，接受长度差异不能单独归因于结构或 loop；峰值 LR 已统一，若要隔离结构因素，还需统一目标特征层、loss、betas、梯度裁剪和 scheduler。
 
 ```bash
 # 普通 EAGLE-3，终端 1：目标特征服务。
@@ -110,9 +110,9 @@ bash examples/train/leagle_qwen3_4b_700k/server.sh
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-默认输出分别为 `output/eagle3_qwen3_4b_700k_5ep_d1_fullvocab/` 和 `output/leagle_qwen3_4b_700k_5ep_d1_r1_fullvocab/`，配套服务与评估脚本使用相同路径。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。旧 32K 运行不会自动升级词表；续训时在服务和训练脚本中显式设置相同的原 `OUTPUT_DIR`，词表大小仍读取原 `run.yaml`。
+默认输出分别为 `output/eagle3_qwen3_4b_700k_5ep_d1_fullvocab/` 和 `output/leagle_qwen3_4b_700k_5ep_d1_r1_fullvocab_5hs/`，配套服务使用相同路径。两份评估脚本的 checkpoint 路径均手动指定，默认指向各自上述目录。训练日志位于各自的 `logs/`，checkpoint 位于 `checkpoints/`。服务命令带 `--provenance-dir`，vLLM 复现记录保存在对应运行目录的 `server/<时间戳>_<PID>/`；训练的 `train_command.txt` 和 `speculators.patch` 保存在 `checkpoints/`。发布结果时保留这两处复现记录。旧运行不会自动升级词表或特征层；续训时在服务和训练脚本中显式设置相同的原 `OUTPUT_DIR`，并让服务的辅助层列表匹配原 `run.yaml`，训练仍从该文件读取原配方。
 
-模型、数据、输出路径和 NPU 分配可在各自脚本配置区或通过同名环境变量修改。服务与训练脚本的 `MODEL`、`OUTPUT_DIR`、`VLLM_PORT`、`NUM_LAYERS` 和 LEAGLE 的 `NUM_LOOPS` 必须一致；两边均使用目标特征层 `[2,18,33]`，服务另加最后一层 teacher slot 36。`VLLM_NPUS` 与 `TRAIN_NPUS` 应使用互不重叠的设备。重复实验时，为两份脚本指定同一个新的 `OUTPUT_DIR`。
+模型、数据、输出路径和 NPU 分配可在各自脚本配置区或通过同名环境变量修改。服务与训练脚本的 `MODEL`、`OUTPUT_DIR`、`VLLM_PORT`、`NUM_LAYERS` 和 LEAGLE 的 `NUM_LOOPS` 必须一致；辅助目标层列表也必须匹配：EAGLE3 为 `[2,18,33]`，LEAGLE 为 `[1,9,17,25,33]`。服务另加最后一层 teacher slot 36，用于 loss 的 teacher 输出，不作为额外的 draft 输入特征。`VLLM_NPUS` 与 `TRAIN_NPUS` 应使用互不重叠的设备。重复实验时，为两份脚本指定同一个新的 `OUTPUT_DIR`。
 
 测试其他深度和 loop 时，可在两个终端分别指定相同参数，例如：
 
@@ -145,7 +145,7 @@ EAGLE3 / LEAGLE 默认日志采用与 DSpark 对应的紧凑指标，不再输�
 
 ## 参考推理与验证
 
-`LEagleDraftModel.propose()` 提供单条前缀的真实贪心自回归草稿生成：
+`LEagleDraftModel.propose()` 提供单条前缀的真实自回归草稿生成，默认贪心；传入 `temperature=1` 可按分布采样，并将采样 token 喂回下一步：
 
 ```python
 model.eval()
@@ -158,7 +158,7 @@ tokens, logits = model.propose(
 
 `tokens` 为目标词表 ID，`logits` 对应 draft 词表。方法不会调用目标模型验证；每次验证之后，使用更新后的真实前缀再次调用。当前参考实现每次重新投影目标前缀，没有跨验证轮次的缓存优化。
 
-原有 vLLM EAGLE / DSpark speculator 不能直接执行这种模型。这里的 vLLM 脚本仅用于训练数据的目标特征提取；高性能 serving adapter 仍未接入。完整的单链贪心接受长度评估使用下面的离线入口。普通 validation loss、准确率及训练代理长度沿用 teacher-forced TTT，不能直接当作真实接受长度。
+原有 vLLM EAGLE / DSpark speculator 不能直接执行这种模型。这里的 vLLM 脚本仅用于训练数据的目标特征提取；高性能 serving adapter 仍未接入。完整的单链贪心或采样接受长度评估使用下面的离线入口。普通 validation loss、准确率及训练代理长度沿用 teacher-forced TTT，不能直接当作真实接受长度。
 
 ## 离线接受长度评估
 
@@ -167,7 +167,7 @@ tokens, logits = model.propose(
 普通 EAGLE3 使用 `examples/evaluate/eagle3_qwen3_4b_700k.sh`，对应 `scripts/evaluate/eagle3_offline_eval.py`；它与 LEAGLE 共用验证循环。EAGLE3 草稿输入保持训练中的特征/token 错位一位对齐，并使用自己的预测递推。两者与 DSpark 共用 JSONL 处理、选样、prompt 模板和加权统计；完成模板处理后不再额外插入 special tokens。
 
 ```bash
-DATASETS_ROOT=/path/to/eval_jsonl SPEC_TOKENS=7 \
+DATASETS_ROOT=/path/to/eval_jsonl SPEC_TOKENS=7 TEMPERATURE=0 MAX_NEW_TOKENS=512 \
 bash examples/evaluate/eagle3_qwen3_4b_700k.sh
 
 VERIFIER_MODEL=/path/to/Qwen3-4B DRAFT_MODEL=/path/to/dspark/checkpoints/4 \
@@ -175,22 +175,32 @@ DATASETS_ROOT=/path/to/eval_jsonl SPEC_TOKENS=7 TEMPERATURE=0 \
 bash examples/evaluate/dspark_offline_jsonl.sh
 ```
 
-DSpark 的 `--spec-tokens` 只限制实际提议数量，不改变已训练的 block 结构；指定值不能超过 checkpoint 支持的槽位数。三者对照时保持数据、seed、thinking、生成长度和两个 attention backend 相同。DSpark 的 `CHECK_GREEDY=1` 适用于 HF target、temperature=0。
+DSpark 的 `--spec-tokens` 只限制实际提议数量，不改变已训练的 block 结构；指定值不能超过 checkpoint 支持的槽位数。三者对照时保持数据、temperature、seed、thinking、生成长度和两个 attention backend 相同。三者的 `CHECK_GREEDY=1` 均仅适用于 HF target、temperature=0。
 
 从仓库根目录运行，`DATASETS_ROOT` 指向与 DSpark 评估相同的 prompt JSONL 文件或目录，不是训练用的预处理 Arrow 数据。支持 `messages`、`conversations`、`turns`、`prompt` 等已有 DSpark 格式，沿用其样本选择、seed 980406 和默认关闭 thinking 的设置。
 
+EAGLE3 和 LEAGLE 脚本均默认 `TEMPERATURE=1`、`MAX_NEW_TOKENS=2048`、`ASCEND_DEVICES=0,1,2,3,4,5,6,7`，数据目录为 `../../DeepSpec/eval_datasets`，选用 `gsm8k,math500,aime25,humaneval,mbpp,livecodebench,mt-bench,alpaca,arena-hard-v2`。比较结果前应统一这些设置。默认评估使用全部八张卡，需在训练和目标服务退出后运行。
+
 ```bash
 # 先抽少量样本审计：每条生成结果须与 target 单独贪心解码完全一致。
-ASCEND_RT_VISIBLE_DEVICES=0 DATASETS_ROOT=/path/to/eval_jsonl \
-MAX_SAMPLES=8 CHECK_GREEDY=1 \
+ASCEND_DEVICES=0 DATASETS_ROOT=/path/to/eval_jsonl \
+MAX_SAMPLES=8 TEMPERATURE=0 CHECK_GREEDY=1 \
 bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
-# 正式评估；默认每轮 7 个候选 token、最多生成 512 tokens。
-ASCEND_RT_VISIBLE_DEVICES=0 DATASETS_ROOT=/path/to/eval_jsonl \
+# 正式评估；默认温度 1、每轮 7 个候选 token、最多生成 2048 tokens。
+ASCEND_DEVICES=0 DATASETS_ROOT=/path/to/eval_jsonl \
 bash examples/evaluate/leagle_qwen3_4b_700k.sh
+
+# temperature=1 的采样评估，复用原训练 checkpoint，无需重训。
+TEMPERATURE=1 DATASETS_ROOT=/path/to/eval_jsonl \
+bash examples/evaluate/leagle_qwen3_4b_700k.sh
+
+TEMPERATURE=1 DATASETS_ROOT=/path/to/eval_jsonl \
+bash examples/evaluate/eagle3_qwen3_4b_700k.sh
 
 # 读取 2 层 / 3 loops 实验的 checkpoint_best。
-NUM_LAYERS=2 NUM_LOOPS=3 DATASETS_ROOT=/path/to/eval_jsonl \
+DRAFT_MODEL=./output/leagle_qwen3_4b_700k_5ep_d2_r3_fullvocab_5hs/checkpoints/checkpoint_best \
+DATASETS_ROOT=/path/to/eval_jsonl OUTPUT_DIR=eval_leagle_d2_r3_5hs_temp1 \
 bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
 # 多 NPU 按样本分片，每张卡分别加载完整 target + draft。
@@ -198,21 +208,23 @@ ASCEND_DEVICES=0,1,2,3 DATASETS_ROOT=/path/to/eval_jsonl \
 bash examples/evaluate/leagle_qwen3_4b_700k.sh
 ```
 
-`NUM_LAYERS` / `NUM_LOOPS` 仅选择默认 checkpoint 路径；指定任意 epoch 时使用 `DRAFT_MODEL=/path/to/checkpoints/4`。可设置 `MODEL`、`OUTPUT_DIR`、`DATASETS`、`MAX_SAMPLES`、`MAX_NEW_TOKENS`、`SPEC_TOKENS`、`ENABLE_THINKING` 和 `RAW_PROMPT_MODE`。CPU 冒烟测试可设置 `DEVICE=cpu DTYPE=float32`，CUDA 可设置 `DEVICE=cuda:0`。多卡参数 `ASCEND_DEVICES` 要求 `DEVICE=npu:0`；它是样本并行，不是张量并行。
+两份评估脚本的 `RUN_DIR` 均手动填写，修改 `NUM_LAYERS` / `NUM_LOOPS` 不会改变评估路径。指定任意 epoch 时使用 `DRAFT_MODEL=/path/to/checkpoints/4`。可设置 `MODEL`、`OUTPUT_DIR`、`DATASETS`、`MAX_SAMPLES`、`MAX_NEW_TOKENS`、`SPEC_TOKENS`、`TEMPERATURE`、`ENABLE_THINKING` 和 `RAW_PROMPT_MODE`。CPU 冒烟测试可设置 `DEVICE=cpu DTYPE=float32`，CUDA 可设置 `DEVICE=cuda:0`；两份脚本均需追加 `--ascend-devices ""`，覆盖默认八卡设置。多卡参数 `ASCEND_DEVICES` 要求 `DEVICE=npu:0`；它是样本并行，不是张量并行。
 
-评估固定为单链、temperature=0，当前不支持树搜索或随机采样。每轮用 LEAGLE 的真实自回归输出生成最多 K 个候选，target 一次验证，接受连续匹配的最长前缀，并生成拒绝替代 token 或 bonus token。target 的 KV 和特征只保留已验证部分；draft 每轮重新建立上下文和各 `(loop, layer)` 的缓存。
+评估采用单链。`temperature=0` 时 draft/target 取 argmax，接受连续匹配的最长前缀。设置有限的 `temperature>0`（例如脚本默认的 1）时，两者使用同一温度下的 FP32 softmax 分布，不额外启用 top-k/top-p 截断。draft 自回归采样最多 K 个候选；target 一次验证，按 `min(1, p(token)/q(token))` 接受连续前缀，首次拒绝后从归一化的 `max(p-q, 0)` 采样替代 token，全接受时从 target 分布采样 bonus token。缩小词表的 draft 概率映射回完整 target 词表，支持集之外的 q 为零，修正采样可选中这些 token。两种模式下 target 的 KV 和特征都只保留已验证部分；draft 每轮重新建立上下文和各 `(loop, layer)` 的缓存。当前不使用树搜索。
 
-默认结果写入对应训练目录的 `eval_k7_<时间戳>_<PID>/`：
+正温度不能与 `CHECK_GREEDY=1` 同用。采样评估验证目标分布，不要求与 target-only 解码逐 token 相同；相同 seed 下也不保证不同模型或不同分片方式得到相同文本，因为它们消耗随机数的顺序不同。接受 EOS 后不再抽取无用的后续 token。
+
+两份脚本的结果目录均手动指定：EAGLE3 为 `eval_eagle_temp1/`，LEAGLE 为 `eval_leagle_5hs_temp1/`，可修改脚本或设置 `OUTPUT_DIR`；改变温度、层数、loop 次数或 checkpoint 不会自动更改该目录。两者输出文件相同：
 
 - `summary.csv` / `summary.json`：逐数据集统计，字段与 DSpark 离线评估一致。
 - `acceptance_length = 1 + accepted_draft_tokens / proposals`，K=7 时上限 8；`accepted_draft_length` 只计算草稿接受量。
 - `position_accept_rates`：每个位置的连续前缀接受次数除以该位置实际被提议次数。另提供 `position_accept_rates_per_round`，以全部提议轮数为分母，与仓库 vLLM `acceptance_at_pos_i` 的分母一致；跨后端仍须核对尾部和 EOS 规则。
 - `draft_length`：实际平均提议长度。接近生成预算时会缩短草稿，为 target token 留一位；最后的零草稿 target 轮次也计入 proposals，接受 EOS 时截断统计，与 DSpark 的离线尾部规则相同。
-- `artifacts/*.jsonl`：prompt、完整输出 token IDs、各轮提议数和接受数。`--check-greedy` 若发现生成不一致会立即报错。
+- `artifacts/*.jsonl`：prompt、完整输出 token IDs、各轮提议数和接受数；正温度还记录各位置接受概率与分布重叠。`--check-greedy` 若发现贪心生成不一致会立即报错。
 - `eval_command.txt`、`speculators.patch`、`eval_config.json`：命令、版本、git 状态、运行配置及 checkpoint 架构；发布评估结果时与训练复现记录一并保留。
 - `eval_checkpoints.json`、`checkpoint_sha256.txt`、`drafter_checkpoint_sha256.txt`：固定后的 target/draft 路径、epoch、训练 step、配置和权重哈希。开始时解析 `checkpoint_best` 并计算哈希，多进程共用同一份记录；解析后更新 best 指针不会切换正在评估的权重。加载或评估期间文件被删除或替换会报错。哈希计算会增加启动时的磁盘读取开销。
 
-这版用于比较接受长度。日志中的吞吐包含参考实现开销，启用审计还包含 target 单独解码，多卡汇总时间还包含模型加载；这些数值不是 vLLM serving 加速比。逐位置概率分布诊断未计算，结果中相应字段为空并标记 `probability_diagnostics_available=false`。
+这版用于比较接受长度。日志中的吞吐包含参考实现开销，启用审计还包含 target 单独解码，多卡汇总时间还包含模型加载；这些数值不是 vLLM serving 加速比。贪心模式保持概率诊断字段为空并标记 `probability_diagnostics_available=false`；正温度模式输出接受概率与分布重叠诊断，并标记为 true。评估配置记录实际温度与验证模式。
 
 ```bash
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle.py -q

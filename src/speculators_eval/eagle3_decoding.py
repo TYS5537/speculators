@@ -3,14 +3,19 @@
 import torch
 from transformers import DynamicCache
 
+from speculators.proposals.sampling import sample_from_logits, validate_temperature
+
 
 @torch.inference_mode()
-def propose_eagle3(draft, *, hidden_states, input_ids, position_ids, num_tokens):
+def propose_eagle3(
+    draft, *, hidden_states, input_ids, position_ids, num_tokens, temperature=0.0
+):
     """Rebuild the verified prefix, then feed back only our own predicted tokens.
 
     Feature at position i is paired with token i+1, including the target's known
     anchor. This is the same shift and recurrent state used by EAGLE3 training.
     """
+    validate_temperature(temperature)
     if draft.training or draft.uses_sliding_window_attn:
         raise ValueError("EAGLE3 proposals require eval mode and full attention")
     length = hidden_states.shape[1]
@@ -66,7 +71,7 @@ def propose_eagle3(draft, *, hidden_states, input_ids, position_ids, num_tokens)
         normalized = draft.norm(hidden[:, -1:])
         state = normalized if draft.config.norm_output else hidden[:, -1:]
         logits = draft.lm_head(normalized)
-        tokens = logits.argmax(dim=-1)
+        tokens = sample_from_logits(logits, temperature)
         if draft.use_draft_vocab:
             tokens = tokens + draft.d2t[tokens]
         proposals.append(tokens)

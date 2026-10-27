@@ -18,6 +18,7 @@ from speculators.models.leagle.model_definitions import DraftKV, LEagleDecoderLa
 from speculators.models.metrics import resolve_training_loss
 from speculators.models.utils import flatten_rope_parameters, resolve_target_layer_ids
 from speculators.proposals.greedy import GreedyTokenProposalConfig
+from speculators.proposals.sampling import sample_from_logits, validate_temperature
 
 
 @SpeculatorModel.register("leagle")
@@ -284,8 +285,16 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         return predictions
 
     @torch.no_grad()
-    def propose(self, hidden_states, anchor_token, *, position_ids=None, num_tokens=7):
-        """Greedy proposals for one verified prefix, without teacher forcing.
+    def propose(
+        self,
+        hidden_states,
+        anchor_token,
+        *,
+        position_ids=None,
+        num_tokens=7,
+        temperature=0.0,
+    ):
+        """Greedy or sampled proposals for one prefix, without teacher forcing.
 
         hidden_states: [1, context_length, auxiliary_count * hidden_size], up to
         the last verified token. anchor_token: [1, 1], the next known/bonus token.
@@ -293,6 +302,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         logits [1, num_tokens, draft_vocab_size]. Caches are local to this round;
         call again with the newly verified prefix after acceptance/rejection.
         """
+        validate_temperature(temperature)
         if self.training:
             raise ValueError("Call model.eval() before proposing tokens")
         if num_tokens < 1:
@@ -338,7 +348,9 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 masks,
                 caches,
             )
-            tokens = self._target_token_ids(logits)
+            tokens = sample_from_logits(logits, temperature)
+            if self.use_draft_vocab:
+                tokens = tokens + self.d2t[tokens]
             proposals.append(tokens)
             all_logits.append(logits)
         return torch.cat(proposals, dim=1), torch.cat(all_logits, dim=1)
