@@ -122,7 +122,7 @@ class DraftArgs(_Group):
     candidate_head_chunk_size: int = Field(
         default=32,
         gt=0,
-        description="Token rows per recomputed candidate KL chunk; limits memory use.",
+        description="Rows per streamed candidate KL chunk; bounds temporary memory.",
     )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,

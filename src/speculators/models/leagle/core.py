@@ -257,30 +257,42 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         return position_ids
 
     def _candidate_training_step(
-        self, normalized, valid_mask, step_mask, step, *, loss, counts, decay
+        self, normalized, logits, valid_mask, step_mask, step, *, loss, counts, decay
     ):
         if self.candidate_head is None:
             return loss
         width = normalized.shape[1] - step
         candidate_mask = valid_mask[:, :width] & step_mask[:, step:]
-        kl_sum, recall, count = self.candidate_head.distillation_loss(
+        kl_sum, recall, count = loss.add(
             normalized[:, :width],
             self.lm_head.weight,
             candidate_mask,
             top_k=self.config.candidate_head_top_k,
             chunk_size=self.config.candidate_head_chunk_size,
+            teacher_logits=logits[:, :width],
+            normalize=True,
+            loss_scale=decay**step,
         )
         counts["kl"] += kl_sum.detach()
         counts["recall"] += recall
         counts["total"] += count
-        return loss + (decay**step) * kl_sum / count.clamp_min(1)
+        return loss
+
+    def _candidate_loss_accumulator(self):
+        return (
+            None
+            if self.candidate_head is None
+            else self.candidate_head.loss_accumulator()
+        )
 
     def _finish_training(
         self, predictions, loss, candidate_loss, candidate_counts, metrics
     ):
         if self.candidate_head is None:
             return predictions, loss, metrics.finish(loss)
-        total_loss = loss + self.config.candidate_head_loss_weight * candidate_loss
+        total_loss = (
+            loss + self.config.candidate_head_loss_weight * candidate_loss.loss()
+        )
         counts = metrics.finish(total_loss)
         counts.update(
             {
@@ -333,7 +345,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         tokens = input_ids
         predictions = []
         loss = context.new_zeros(())
-        candidate_loss = loss.float()
+        candidate_loss = self._candidate_loss_accumulator()
         candidate_counts = {
             name: loss.float().clone() for name in ("kl", "recall", "total")
         }
@@ -390,6 +402,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 loss = loss + step_loss
                 candidate_loss = self._candidate_training_step(
                     normalized,
+                    logits,
                     valid_mask,
                     step_mask,
                     step,

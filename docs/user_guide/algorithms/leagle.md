@@ -28,11 +28,11 @@ LEAGLE 没有并行 mask-token backbone、Markov/RNN correction head、confidenc
 
 ## 三个独立维度
 
-| 参数 | 含义 | 默认示例 |
-|---|---|---|
-| `--num-layers` | 具有独立参数的物理 decoder 层数 | 1 |
-| `--num-loops` | 每个 token 对同一组层的执行次数 | 1 |
-| `--ttt-steps` | 训练时向前展开的 token 步数 | 7 |
+| 参数           | 含义                            | 默认示例 |
+| -------------- | ------------------------------- | -------- |
+| `--num-layers` | 具有独立参数的物理 decoder 层数 | 1        |
+| `--num-loops`  | 每个 token 对同一组层的执行次数 | 1        |
+| `--ttt-steps`  | 训练时向前展开的 token 步数     | 7        |
 
 有效 decoder 深度 = `num_layers × num_loops`，不包含融合层和输出头。增加 loop 不增加 decoder 参数量，但增加计算量与缓存需求。
 
@@ -54,17 +54,17 @@ Qwen3-4B 预设的所有 draft 层使用 full causal attention。脚本根据 `N
 
 两组沿用上述 70 万数据 / 5 epochs 设置，训练配方分别为：
 
-| 参数 | 普通 EAGLE-3 | LEAGLE |
-|---|---|---|
-| 优化器 | AdamW | AdamW |
-| 峰值 LR | `6e-4` | `6e-4` |
-| Adam betas | `(0.9, 0.95)` | `(0.9, 0.999)` |
-| Weight decay | `0` | `0` |
-| 梯度裁剪 max norm | `0.5` | `1.0` |
-| Loss | KL | `0.1 CE + 0.9 TV` |
-| Loss 实现 | `eager` | `legacy`，与 DSpark 相同 |
-| LR scheduler | linear | cosine |
-| Warmup 比例 | `0.015` | `0.04` |
+| 参数              | 普通 EAGLE-3  | LEAGLE                   |
+| ----------------- | ------------- | ------------------------ |
+| 优化器            | AdamW         | AdamW                    |
+| 峰值 LR           | `6e-4`        | `6e-4`                   |
+| Adam betas        | `(0.9, 0.95)` | `(0.9, 0.999)`           |
+| Weight decay      | `0`           | `0`                      |
+| 梯度裁剪 max norm | `0.5`         | `1.0`                    |
+| Loss              | KL            | `0.1 CE + 0.9 TV`        |
+| Loss 实现         | `eager`       | `legacy`，与 DSpark 相同 |
+| LR scheduler      | linear        | cosine                   |
+| Warmup 比例       | `0.015`       | `0.04`                   |
 
 普通 EAGLE-3 的 AdamW betas、weight decay 和梯度裁剪取自[作者的 EAGLE3 配置](https://github.com/SafeAILab/EAGLE/blob/main/eagle/traineagle3/ds_config.json)，峰值 LR 则按本次实验要求与 LEAGLE 统一为 `6e-4`（作者配置为 `5e-5`）。这里把 `12000 / 800000 = 1.5%` warmup 比例应用到实际 5 epochs 的训练步数，并继续使用仓库的 linear scheduler；这不是原作者 DeepSpeed 训练的完整复现。
 
@@ -131,13 +131,13 @@ NUM_LAYERS=2 NUM_LOOPS=3 bash examples/train/leagle_qwen3_4b_700k/train.sh
 
 EAGLE3 / LEAGLE 默认日志采用与 DSpark 对应的紧凑指标，不再输出各位置的 `loss_i`、`ce_loss_i`、`tv_loss_i` 和重复的 `full_acc_i` / `cond_acc_i`。训练目标、各步 loss 权重及梯度计算保持原样。
 
-| 指标 | 含义 |
-|---|---|
-| `loss` | 原训练目标，仍为各 TTT 步加权 loss 之和 |
-| `full_acc` | 所有有效预测位置的 argmax 匹配率，按有效位置数加权 |
-| `position_0_acc` … `position_6_acc` | 各预测步独立的 argmax 匹配率；位置 0 是第一个草稿 token |
-| `eal` | 每条训练轨迹的连续 argmax 匹配长度 + 1，再按轨迹数求平均 |
-| `accept_len` | 每条轨迹计算 `1 + Σᵢ ∏ⱼ≤ᵢ αⱼ` 的均值，`α` 为 draft/teacher 概率分布的重叠 |
+| 指标                                | 含义                                                                      |
+| ----------------------------------- | ------------------------------------------------------------------------- |
+| `loss`                              | 原训练目标，仍为各 TTT 步加权 loss 之和                                   |
+| `full_acc`                          | 所有有效预测位置的 argmax 匹配率，按有效位置数加权                        |
+| `position_0_acc` … `position_6_acc` | 各预测步独立的 argmax 匹配率；位置 0 是第一个草稿 token                   |
+| `eal`                               | 每条训练轨迹的连续 argmax 匹配长度 + 1，再按轨迹数求平均                  |
+| `accept_len`                        | 每条轨迹计算 `1 + Σᵢ ∏ⱼ≤ᵢ αⱼ` 的均值，`α` 为 draft/teacher 概率分布的重叠 |
 
 一条轨迹从有监督的位置开始；mask 中断、文档边界和序列尾部截断其连续接受前缀。TTT=7 时两个长度指标上限为 8；尾部不足七步时，即使全部匹配也可能低于 8。各卡先合并原始分子、分母，再计算均值，空 mask 不贡献长度样本。分布重叠按 token 分块计算 FP32 概率，不保留全序列概率张量或梯度图。
 
@@ -237,27 +237,29 @@ bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
 训练默认 `CANDIDATE_HEAD=0`，使用完整输出头；设置为 1 时从头创建并训练两个低秩矩阵，直接保存在训练 checkpoint 中。评估默认 `CANDIDATE_HEAD=auto`，按 checkpoint 配置加载并启用，无需转换脚本或另做 SVD。开启候选推理后，每个草稿 token 执行一次候选筛选，物理层数和 loop 次数不改变输出头的调用次数：
 
-| 步骤 | 矩阵与输出维度（单个 token） |
-|---|---|
-| 降维 | `h[1,H] × Bᵀ[H,R] → [1,R]` |
-| 全 draft 词表粗分 | `[1,R] × Aᵀ[R,V] → [1,V]` |
-| 取候选 | 粗分 top-M，得到候选 ID `[1,M]` |
-| 精算 | 从原始 `W[V,H]` 取 `W_C[M,H]`，计算 `h × W_Cᵀ → [1,M]` |
-| 提议 | 使用精算 logits；候选之外的 draft logits 为 `-inf` |
+| 步骤              | 矩阵与输出维度（单个 token）                           |
+| ----------------- | ------------------------------------------------------ |
+| 降维              | `h[1,H] × Bᵀ[H,R] → [1,R]`                             |
+| 全 draft 词表粗分 | `[1,R] × Aᵀ[R,V] → [1,V]`                              |
+| 取候选            | 粗分 top-M，得到候选 ID `[1,M]`                        |
+| 精算              | 从原始 `W[V,H]` 取 `W_C[M,H]`，计算 `h × W_Cᵀ → [1,M]` |
+| 提议              | 使用精算 logits；候选之外的 draft logits 为 `-inf`     |
 
 原始 `lm_head.weight` 保留且冻结，新增 `candidate_head.down_proj.weight[R,H]` 和 `candidate_head.up_proj.weight[V,R]`。全词表 Qwen3-4B 的 `H=2560`、`V=151936`，默认 `R=256`、`M=128`；这两个值是实验起点。`M` 是每个 token 的候选词数量，与 `SPEC_TOKENS=7` 的草稿序列长度独立。缩小词表模型在自己的 draft 词表上筛选，再用原有 d2t 映射到 target ID。
 
 候选头使用随机初始化，与主干同步训练。主干继续用原始完整输出头计算 CE/TV；候选头增加 `KL(softmax(W·stopgrad(h)) || softmax(A·B·stopgrad(h)))`，teacher 是同一个 drafter hidden state 的完整输出分布。辅助损失不向主干或 W 传梯度，top-k 只用于候选召回统计和推理，不直接反传。主干和候选头分别按 `MAX_GRAD_NORM` 裁剪梯度，避免辅助梯度改变主干的裁剪系数；两者沿用同一 LR 与 scheduler，当前脚本为 AdamW、LR=6e-4。使用 Muon 时，候选输出矩阵归入 AdamW 组。
 
-| 环境变量 | 默认值 | 训练参数 |
-|---|---|---|
-| `CANDIDATE_HEAD` | `0` | `--candidate-head` / `--no-candidate-head` |
-| `CANDIDATE_HEAD_RANK` | `256` | `--candidate-head-rank` |
-| `CANDIDATE_TOP_K` | `128` | `--candidate-head-top-k` |
-| `CANDIDATE_HEAD_LOSS_WEIGHT` | `1.0` | `--candidate-head-loss-weight` |
-| `CANDIDATE_HEAD_CHUNK_SIZE` | `32` | `--candidate-head-chunk-size` |
+| 环境变量                     | 默认值 | 训练参数                                   |
+| ---------------------------- | ------ | ------------------------------------------ |
+| `CANDIDATE_HEAD`             | `0`    | `--candidate-head` / `--no-candidate-head` |
+| `CANDIDATE_HEAD_RANK`        | `256`  | `--candidate-head-rank`                    |
+| `CANDIDATE_TOP_K`            | `128`  | `--candidate-head-top-k`                   |
+| `CANDIDATE_HEAD_LOSS_WEIGHT` | `1.0`  | `--candidate-head-loss-weight`             |
+| `CANDIDATE_HEAD_CHUNK_SIZE`  | `32`   | `--candidate-head-chunk-size`              |
 
-YAML 中对应字段放在 `draft` 组。候选 KL 按 token 分块、反向重算，避免额外保存全序列 FP32 词表激活；减小 chunk size 可减少临时显存，但增加调用开销。训练仍需计算完整输出头，额外的 KL 训练也增加计算量。
+YAML 中对应字段放在 `draft` 组。候选 KL 复用同一 TTT 步中主干已经算出的 dense logits，不再为辅助 teacher 重算完整输出投影。每个 token 分块只执行一次低秩前向，并根据 `q-p` 计算两个矩阵的一阶梯度；所有 TTT 步累加到同一组 FP32 缓冲，最终通过一个 autograd 节点传给参数，保留普通梯度同步、loss 权重和裁剪流程。反向不再重算候选头或完整 teacher，不额外保存全序列词表激活，也不在 forward 中调用 backward。该实现仅支持一阶训练梯度。
+
+梯度缓冲大小为 `4 × R × (V+H)` 字节，默认 Qwen3-4B 配置约 151 MiB，不随 token 数或 TTT 步数增加；分块投影、概率和梯度矩阵乘法仍需要临时显存。`CANDIDATE_HEAD_CHUNK_SIZE` 默认保持 32；增大它会减少分块调用，但提高临时显存，实际速度取决于设备。与原实现使用同一全词表 KL、mask、逐步衰减、rank 和候选数；BF16 矩阵乘法形状、梯度累积精度与次序变化可能带来舍入差异。训练仍需原始完整输出头以及新增候选 KL 的计算，推理加速不意味着训练也会比关闭候选头更快。
 
 继续使用原有服务和训练两份脚本。在两个终端中设置相同的 `OUTPUT_DIR`，保证隐藏状态文件路径一致：
 
@@ -301,6 +303,7 @@ PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle.
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/evaluate/test_leagle_offline_eval.py -q
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/evaluate/test_eagle_inference_cache.py -q
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle_candidate_head.py tests/unit/evaluate/test_leagle_candidate_head.py -q
+PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle_candidate_loss.py -q
 ```
 
 测试覆盖共享 loop 与展开独立层的前向 / 梯度等价性、缓存长度、packed document 与未来特征隔离、SDPA / eager、词表映射、真实自回归与并行训练轨迹的一致性，以及 activation checkpointing。评估测试额外覆盖全接受、首位 / 中途拒绝后的 KV 和特征回退、EOS、长度边界、不同深度 / loop / 词表的真实小型 Qwen3 生成一致性，以及保存 checkpoint 到 JSONL 结果的完整链路。

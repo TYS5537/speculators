@@ -9,6 +9,7 @@ from safetensors.torch import load_file, save_file
 from speculators import SpeculatorModel, SpeculatorModelConfig
 from speculators.losses import resolve_loss_config
 from speculators.models.leagle.candidate_head import LowRankCandidateHead
+from speculators.models.leagle.candidate_loss import CandidateLossAccumulator
 from speculators.proposals.sampling import logits_to_probs
 
 from .test_leagle import batch, make_model
@@ -199,14 +200,14 @@ def test_packed_mask_and_ttt_decay_align_candidate_supervision(monkeypatch):
     inputs["loss_mask"] = torch.tensor([[1, 0, 1, 1, 1, 0]])
     inputs["verifier_last_hidden_states"] = torch.randn(1, 6, 16)
     calls = []
-    original = model.candidate_head.distillation_loss
+    original = CandidateLossAccumulator.add
 
-    def record(hidden, weight, mask, **kwargs):
-        result = original(hidden, weight, mask, **kwargs)
+    def record(accumulator, hidden, weight, mask, **kwargs):
+        result = original(accumulator, hidden, weight, mask, **kwargs)
         calls.append((mask.clone(), result))
         return result
 
-    monkeypatch.setattr(model.candidate_head, "distillation_loss", record)
+    monkeypatch.setattr(CandidateLossAccumulator, "add", record)
     _, loss, metrics = model(
         **inputs,
         ttt_steps=7,
@@ -224,7 +225,7 @@ def test_packed_mask_and_ttt_decay_align_candidate_supervision(monkeypatch):
     assert all(torch.isfinite(p.grad).all() for p in model.candidate_head.parameters())
 
 
-def test_auxiliary_checkpoint_does_not_retain_sequence_vocabulary_activations():
+def test_auxiliary_loss_does_not_retain_sequence_vocabulary_activations():
     head = LowRankCandidateHead(8, 128, 4)
     hidden, weight = torch.randn(1, 17, 8), torch.randn(128, 8)
     saved_shapes = []
