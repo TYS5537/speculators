@@ -62,6 +62,26 @@ def _all_reduce_metrics(metrics: dict[str, torch.Tensor]) -> dict[str, torch.Ten
     return dict(zip(keys, stacked, strict=True))
 
 
+def _metrics_to_host(
+    metrics: dict[str, torch.Tensor],
+) -> dict[str, float | int | bool]:
+    """Read scalar metrics with one host transfer per device/dtype group.
+
+    Keep integer counts and floating-point precision intact instead of promoting
+    mixed metrics into one dtype. Validation still accumulates Python values in
+    the original batch order, rather than summing batches on the accelerator.
+    """
+    groups = {}
+    for key, value in metrics.items():
+        group = groups.setdefault((value.device, value.dtype), [])
+        group.append((key, value.detach().reshape(())))
+    result = {}
+    for group in groups.values():
+        keys, values = zip(*group, strict=True)
+        result.update(zip(keys, torch.stack(values).cpu().tolist(), strict=True))
+    return {key: result[key] for key in metrics}
+
+
 def _synchronize_device() -> None:
     """Best-effort device sync for step profiling (CUDA or NPU).
 
@@ -212,6 +232,8 @@ class TrainerConfig(NamedTuple):
     adam_beta1: float = 0.9
     adam_beta2: float = 0.999
     max_grad_norm: float = 1.0
+    leagle_fsdp_keep_forward_params: bool = False
+    leagle_share_output_head: bool = False
 
 
 def _resolve_scheduler_steps(
@@ -510,16 +532,30 @@ class Trainer:
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
         )
 
+        if self.config.leagle_fsdp_keep_forward_params and not self.config.fsdp_shard:
+            raise ValueError("LEAGLE parameter retention requires FSDP")
+        if (
+            self.config.leagle_fsdp_keep_forward_params
+            or self.config.leagle_share_output_head
+        ) and self.model.config.speculators_model_type != "leagle":
+            raise ValueError("LEAGLE runtime optimizations require a LEAGLE model")
+        reference = (
+            self.model.share_output_head()
+            if self.config.leagle_share_output_head
+            else None
+        )
+
         if not self.is_distributed:
             self.model.to(self.local_rank)  # type: ignore[arg-type]
             if load_checkpoint:
                 self.checkpointer.load_model_state_dict(self.model)
-            return
-
-        if self.config.fsdp_shard:
+        elif self.config.fsdp_shard:
             self._setup_model_fsdp(load_checkpoint)
         else:
             self._setup_model_ddp(load_checkpoint)
+        if reference is not None:
+            raw_model = getattr(self.model, "module", self.model)
+            raw_model.validate_shared_output_head(reference)
 
     def _setup_model_fsdp(self, load_checkpoint: bool):
         # Capture full state dict on rank 0 before FSDP sharding
@@ -527,7 +563,14 @@ class Trainer:
         if not load_checkpoint and dist.get_rank() == 0:
             full_state_dict = self.model.state_dict()
 
-        apply_fully_sharded(self.model, param_dtype=self.config.hidden_states_dtype)
+        options = (
+            {"keep_forward_params": True}
+            if self.config.leagle_fsdp_keep_forward_params
+            else {}
+        )
+        apply_fully_sharded(
+            self.model, param_dtype=self.config.hidden_states_dtype, **options
+        )
 
         if load_checkpoint:
             self.checkpointer.load_model_state_dict(self.model)
@@ -631,11 +674,15 @@ class Trainer:
         if count is None:
             mask = batch.get("loss_mask")
             count = mask.sum() if mask is not None else 1
-        local_active = bool(torch.as_tensor(count, device=device).sum().item() > 0)
-        active_ranks = torch.tensor(float(local_active), device=device)
-        if self.is_distributed:
-            dist.all_reduce(active_ranks, op=dist.ReduceOp.SUM)
-        return local_active, int(active_ranks.item())
+        local_active = (torch.as_tensor(count, device=device).sum() > 0).float()
+        if not self.is_distributed:
+            active = local_active.item()
+            return bool(active), int(active)
+        active_ranks = local_active.clone()
+        dist.all_reduce(active_ranks, op=dist.ReduceOp.SUM)
+        # Read both values together, without a host round trip before all_reduce.
+        local, total = torch.stack((local_active, active_ranks)).cpu().tolist()
+        return bool(local), int(total)
 
     @staticmethod
     def _mask_unsupervised_metrics(metrics: dict, local_active: bool) -> dict:
@@ -703,9 +750,7 @@ class Trainer:
         if self.global_step % self.config.log_freq == 0:
             if self.is_distributed:
                 metrics = _all_reduce_metrics(metrics)
-            metrics = normalize_counted_metrics(
-                {k: v.item() for k, v in metrics.items()}, active_ranks
-            )
+            metrics = normalize_counted_metrics(_metrics_to_host(metrics), active_ranks)
             lr_info = (
                 current_lrs
                 if len(current_lrs) > 1
@@ -725,6 +770,25 @@ class Trainer:
                 {"profile": profile, "epoch": epoch, "global_step": self.global_step},
                 extra={"step": self.global_step},
             )
+
+    def _training_call_kwargs(self):
+        call_kwargs = dict(self.config.train_call_kwargs or {})
+        if "collect_metrics" in call_kwargs:
+            call_kwargs["collect_metrics"] = bool(
+                call_kwargs["collect_metrics"]
+                and self.global_step % self.config.log_freq == 0
+            )
+        return call_kwargs
+
+    def _add_error_record_metrics(self, metrics, error_records, device):
+        if self.global_step % self.config.log_freq != 0:
+            return
+        metrics["error_records_sum"] = torch.tensor(
+            error_records, dtype=torch.float32, device=device
+        )
+        metrics["error_records_total"] = torch.tensor(
+            1.0 if self.rank == 0 else 0.0, device=device
+        )
 
     def train_epoch(self, epoch: int):
         self.model.train()
@@ -770,6 +834,9 @@ class Trainer:
             local_step = local_step_rel + skip_steps
             recovery.consume(batch, synchronize=True)
             timer.mark("recovery")
+            # No gradient accumulation: release the preceding step's gradients
+            # before allocating the next forward's activations.
+            self._optimizers_zero_grad()
             error_records = batch.pop("error_records", 0)
             gpu_batch = {
                 k: v.to(self.local_rank, non_blocking=True)
@@ -782,7 +849,7 @@ class Trainer:
                 self.device_type, dtype=self.config.hidden_states_dtype
             ):
                 timer.mark("fetch")
-                call_kwargs = dict(self.config.train_call_kwargs or {})
+                call_kwargs = self._training_call_kwargs()
                 batch_device = next(
                     value.device
                     for value in gpu_batch.values()
@@ -804,7 +871,6 @@ class Trainer:
                 loss, metrics, gpu_batch
             )
             timer.mark("fwd")
-            self._optimizers_zero_grad()
             loss.backward()
             if active_ranks == 0:
                 # Still complete backward on every rank after forward, including
@@ -822,12 +888,7 @@ class Trainer:
                 continue
             self._clip_gradients()
 
-            metrics["error_records_sum"] = torch.tensor(
-                error_records, dtype=torch.float32, device=loss.device
-            )
-            metrics["error_records_total"] = torch.tensor(
-                1.0 if self.rank == 0 else 0.0, device=loss.device
-            )
+            self._add_error_record_metrics(metrics, error_records, loss.device)
             timer.mark("bwd")
             self._optimizers_step()
 
@@ -910,8 +971,8 @@ class Trainer:
             if self.is_distributed:
                 metrics = _all_reduce_metrics(metrics)
 
-            for k, v in metrics.items():
-                val_metrics[k] = val_metrics.get(k, 0.0) + v.item()
+            for k, v in _metrics_to_host(metrics).items():
+                val_metrics[k] = val_metrics.get(k, 0.0) + v
 
         if supervised_rank_batches == 0:
             root_logger.warning("Validation epoch %d has no supervised batches", epoch)

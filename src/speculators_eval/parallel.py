@@ -98,6 +98,16 @@ def _proposal_worker_args(args) -> list[str]:
         result.append("--candidate-head")
     elif getattr(args, "candidate_head", None) is False:
         result.append("--no-candidate-head")
+    for flag in (
+        "leagle_sparse_candidates",
+        "leagle_static_kv",
+        "leagle_reuse_rollout_buffers",
+        "leagle_static_target_kv",
+        "leagle_selective_target_hidden_states",
+        "leagle_share_output_head",
+    ):
+        if getattr(args, flag, False):
+            result.append("--" + flag.replace("_", "-"))
     return result
 
 
@@ -209,6 +219,25 @@ def run_ascend_data_parallel(
     *,
     entrypoint: Path,
 ) -> None:
+    with ExitStack() as suite:
+        pool = None
+        if getattr(args, "persistent_workers", False):
+            from speculators_eval.persistent import PersistentWorkers  # noqa: PLC0415
+
+            pool = suite.enter_context(PersistentWorkers())
+        _run_parallel_datasets(args, entrypoint=entrypoint, pool=pool)
+
+
+def _start_worker(workers, pool, index, cmd, env):
+    if pool is not None:
+        return pool.submit(index, cmd, env)
+    process = subprocess.Popen(cmd, env=env)  # noqa: S603
+    workers.callback(stop_eval_worker, process)
+    return process
+
+
+def _run_parallel_datasets(args, *, entrypoint, pool):
+    wait = wait_eval_workers if pool is None else pool.wait
     devices = split_csv(args.ascend_devices)
     if not devices:
         raise ValueError("--ascend-devices must contain at least one device id")
@@ -265,10 +294,9 @@ def run_ascend_data_parallel(
                 env = os.environ.copy()
                 env["ASCEND_RT_VISIBLE_DEVICES"] = visible_device
                 # A caller-owned Python entrypoint and argv, never shell input.
-                process = subprocess.Popen(cmd, env=env)  # noqa: S603
-                workers.callback(stop_eval_worker, process)
+                process = _start_worker(workers, pool, shard_index, cmd, env)
                 processes.append((shard_index, shard_output_dir, process))
-            wait_eval_workers(processes, dataset, progress=progress)
+            wait(processes, dataset, progress=progress)
         shard_rows = [
             read_worker_row(shard_output_dir) for _, shard_output_dir, _ in processes
         ]

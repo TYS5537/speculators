@@ -66,13 +66,60 @@ def build_parser():
         help="Candidate vocabulary count; defaults to checkpoint (not draft length)",
     )
     parser.add_argument(
+        "--leagle-sparse-candidates",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Experimental compact candidate sampling and exact sparse-q "
+        "rejection correction",
+    )
+    parser.add_argument(
+        "--leagle-static-kv",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Experimental request-local preallocated LEAGLE prefix/rollout KV buffers",
+    )
+    parser.add_argument(
+        "--leagle-reuse-rollout-buffers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Experimental reuse of rollout buffer storage across rounds; "
+        "requires --leagle-static-kv and verified-prefix KV reuse",
+    )
+    parser.add_argument(
         "--check-greedy",
         action="store_true",
         help="Audit every output against target-only HF greedy generation (extra work)",
     )
+    for flag, help_text in (
+        ("leagle-static-target-kv", "Preallocated target KV with speculative rollback"),
+        (
+            "leagle-selective-target-hidden-states",
+            "Capture only the required Qwen3 target states",
+        ),
+        (
+            "leagle-share-output-head",
+            "Share identical frozen draft/teacher output weights",
+        ),
+    ):
+        parser.add_argument(
+            "--" + flag,
+            action=argparse.BooleanOptionalAction,
+            default=False,
+            help=help_text,
+        )
     parser.add_argument(
         "--ascend-devices",
         help="Sample-parallel NPU IDs, e.g. 0,1,2,3; each device holds both models",
+    )
+    parser.add_argument(
+        "--persistent-workers",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Keep each NPU worker's models loaded across datasets; "
+        "reset RNG per dataset",
+    )
+    parser.add_argument(
+        "--worker-job-stream", action="store_true", help=argparse.SUPPRESS
     )
     parser.add_argument("--trust-remote-code", action="store_true")
     parser.add_argument("--d2t-path", type=Path)
@@ -95,7 +142,19 @@ def build_parser():
     return parser
 
 
+def _validate_persistent_workers(args):
+    if args.persistent_workers and (
+        not args.ascend_devices or args.worker_shard_index is not None
+    ):
+        raise ValueError(
+            "--persistent-workers requires a parent --ascend-devices launch"
+        )
+    if args.worker_job_stream and args.worker_shard_index is None:
+        raise ValueError("--worker-job-stream is reserved for sharded workers")
+
+
 def validate_args(args):
+    _validate_persistent_workers(args)
     if args.spec_tokens < 1 or args.max_new_tokens < 0:
         raise ValueError("--spec-tokens must be >= 1 and --max-new-tokens >= 0")
     if not math.isfinite(args.temperature) or args.temperature < 0:
@@ -106,6 +165,7 @@ def validate_args(args):
         raise ValueError("--max-samples must be >= 0")
     if args.log_every < 1 or args.worker_num_shards < 1:
         raise ValueError("--log-every and --worker-num-shards must be positive")
+    optimization_settings(args)
     if (args.d2t_path is None) != (args.t2d_path is None):
         raise ValueError("--d2t-path and --t2d-path must be provided together")
     if args.candidate_top_k is not None and (
@@ -164,6 +224,39 @@ def candidate_head_settings(args, config=None):
     }
 
 
+def optimization_settings(args, config=None):
+    settings = {
+        "sparse_candidates": getattr(args, "leagle_sparse_candidates", False),
+        "static_kv": getattr(args, "leagle_static_kv", False),
+        "reuse_rollout_buffers": getattr(args, "leagle_reuse_rollout_buffers", False),
+        "static_target_kv": getattr(args, "leagle_static_target_kv", False),
+        "selective_target_hidden_states": getattr(
+            args, "leagle_selective_target_hidden_states", False
+        ),
+        "share_output_head": getattr(args, "leagle_share_output_head", False),
+    }
+    if settings["reuse_rollout_buffers"] and (
+        not settings["static_kv"] or getattr(args, "no_draft_kv_reuse", False)
+    ):
+        raise ValueError(
+            "Rollout buffer reuse requires --leagle-static-kv and "
+            "cannot use --no-draft-kv-reuse"
+        )
+    if config and any(settings.values()):
+        if config.get("speculators_model_type") != "leagle":
+            raise ValueError(
+                "LEAGLE inference optimizations cannot be enabled for EAGLE3"
+            )
+        if (
+            settings["sparse_candidates"]
+            and not candidate_head_settings(args, config)["enabled"]
+        ):
+            raise ValueError(
+                "Sparse candidates require an enabled trained candidate head"
+            )
+    return settings
+
+
 def load_models(args):
     import torch  # noqa: PLC0415
     from transformers import AutoModelForCausalLM, AutoTokenizer  # noqa: PLC0415
@@ -182,6 +275,7 @@ def load_models(args):
     if config.speculators_model_type not in ("leagle", "eagle3"):
         raise ValueError("This entrypoint requires an EAGLE3 or LEAGLE checkpoint")
     head_settings = candidate_head_settings(args, config.to_dict())
+    optimizations = optimization_settings(args, config.to_dict())
     config.speculators_config.verifier.name_or_path = args.verifier_model
     config.transformer_layer_config._attn_implementation = args.draft_attn_impl  # noqa: SLF001
     target = (
@@ -233,6 +327,7 @@ def load_models(args):
         draft.load_vocab_mappings(draft.t2d, draft.d2t)
     if config.speculators_model_type == "leagle":
         draft.set_candidate_head(head_settings["enabled"], top_k=head_settings["top_k"])
+        draft.set_inference_optimizations(**optimizations)
     if head_settings["enabled"]:
         logger.info(
             "LEAGLE candidate head enabled: rank=%d candidates=%d (exact rescore)",
@@ -257,7 +352,7 @@ def load_models(args):
     return target, draft, tokenizer
 
 
-def save_provenance(args, draft_config=None):
+def save_provenance(args, draft_config=None, *, argv=None, persistent=False):
     config = draft_config.to_dict() if draft_config is not None else None
     config_path = Path(args.draft_model) / "config.json"
     if config is None and config_path.is_file():
@@ -273,14 +368,25 @@ def save_provenance(args, draft_config=None):
         ),
         "target_kv_reuse": True,
         "candidate_head": candidate_head_settings(args, config),
+        "experimental_optimizations": optimization_settings(args, config),
         "draft_kv_reuse_between_rounds": not args.no_draft_kv_reuse,
         "draft_cache_policy": (
             "rebuild-each-round" if args.no_draft_kv_reuse else "verified-prefix-only"
         ),
         "online_speedup_benchmark": False,
         "probability_diagnostics_available": args.temperature > 0,
+        "persistent_workers": args.persistent_workers
+        or persistent
+        or args.worker_job_stream,
+        "worker_rng_policy": "restore-post-load-per-dataset"
+        if (args.persistent_workers or persistent or args.worker_job_stream)
+        else "fresh-worker-per-dataset"
+        if args.worker_shard_index is not None or args.ascend_devices
+        else "continuous-local-run",
         "timing_scope": (
-            "parallel worker wall time including model loads"
+            "persistent worker wall time; first dataset includes model loads"
+            if args.persistent_workers
+            else "parallel worker wall time including model loads"
             if args.ascend_devices and args.worker_shard_index is None
             else "local generation including target-only greedy audit"
             if args.check_greedy
@@ -290,7 +396,10 @@ def save_provenance(args, draft_config=None):
     if draft_config is not None:
         metadata["draft_config"] = draft_config.to_dict()
         metadata["algorithm"] = draft_config.speculators_model_type
-    provenance.write_eval_provenance(args, metadata)
+    if argv is None:
+        provenance.write_eval_provenance(args, metadata)
+    else:
+        provenance.write_eval_provenance(args, metadata, argv=argv)
 
 
 def evaluate_dataset(path, runner, args, stop_token_ids):
@@ -378,6 +487,15 @@ def run(args, *, entrypoint):
 
     runner = LEagleOfflineRunner(target, draft, tokenizer, args)
     stop_ids = resolve_stop_token_ids(target, tokenizer)
+    if args.worker_job_stream:
+        from speculators_eval.persistent import (  # noqa: PLC0415
+            serve_jobs,
+            validate_worker_models,
+        )
+
+        validate_worker_models(target, draft)
+        serve_jobs(args, runner, stop_ids)
+        return
     rows, artifacts = [], {}
     for path in data.discover_datasets(
         args.datasets_root, data.split_csv(args.datasets) or None

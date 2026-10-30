@@ -30,6 +30,7 @@ from speculators.train.config.schema import (
     TrainConfig,
     nest_flat,
 )
+from speculators.train.leagle_optimizations import resolve_optimization_groups
 
 __all__ = [
     "DECODER_SHAPING_FLAGS",
@@ -391,6 +392,11 @@ def build_from_sources(
         dest: ("flag" if dest in cli else "yaml" if dest in yaml_dests else "default")
         for dest in CONFIG_DESTS
     }
+    # Persist effective group members, including forced-off dependencies, so the
+    # run manifest records the actual execution path as well as the two masters.
+    cfg._provenance.update(
+        dict.fromkeys(resolve_optimization_groups(cfg.flatten()), "group")
+    )
     cfg._argv = list(argv)
 
     # Backend-contributed args: merge YAML (backend: block) and CLI with

@@ -4,6 +4,10 @@ import argparse
 import math
 
 from hs_connectors import HiddenStatesBackend
+from speculators.models.leagle.options import (
+    RUNTIME_DEFAULTS as LEAGLE_RUNTIME_DEFAULTS,
+)
+from speculators.models.leagle.options import TRAINING_DEFAULTS as LEAGLE_DEFAULTS
 from speculators.models.metrics import resolve_loss_config
 from speculators.models.mmuse.config import (
     mmuse_option_defaults,
@@ -12,6 +16,10 @@ from speculators.models.mmuse.config import (
 from speculators.train.config.cli_fields import field_argument_kwargs
 from speculators.train.config.schema import _GROUPS, _ROOT_FIELDS, TrainConfig
 from speculators.train.draft_config import DRAFT_ARCH_CONFIGS
+from speculators.train.leagle_optimizations import (
+    GROUP_DEFAULTS,
+    resolve_optimization_groups,
+)
 from speculators.train.mmuse_args import (
     add_mmuse_backbone_args,
     add_mmuse_correction_args,
@@ -178,6 +186,18 @@ def build_train_parser() -> argparse.ArgumentParser:
             add_mmuse_backbone_args(parser, mmuse_defaults)
         elif name == "markov_head_type":
             add_mmuse_correction_args(parser, mmuse_defaults)
+    for name, default in {
+        **LEAGLE_DEFAULTS,
+        **LEAGLE_RUNTIME_DEFAULTS,
+        **GROUP_DEFAULTS,
+    }.items():
+        flag = "--" + name.replace("_", "-")
+        if isinstance(default, bool) or default is None:
+            parser.add_argument(
+                flag, action=argparse.BooleanOptionalAction, default=default
+            )
+        else:
+            parser.add_argument(flag, type=int, default=default)
     return parser
 
 
@@ -230,6 +250,7 @@ def _apply_leagle_defaults(args: argparse.Namespace, provided: set[str]) -> None
 
 
 def _validate_leagle_args(parser, args) -> None:
+    _validate_leagle_optimizations(parser, args)
     if args.candidate_head and args.speculator_type != "leagle":
         parser.error("--candidate-head is only supported by --speculator-type leagle")
     if (
@@ -255,6 +276,56 @@ def _validate_leagle_args(parser, args) -> None:
             parser.error(
                 "LEAGLE uses FC then RMSNorm target fusion and frozen embeddings"
             )
+
+
+def _validate_leagle_optimizations(parser, args):
+    try:
+        vars(args).update(resolve_optimization_groups(vars(args)))
+    except ValueError as exc:
+        parser.error(str(exc))
+    enabled = (
+        args.leagle_reuse_training_kv
+        or args.leagle_chunked_loss
+        or args.leagle_sparse_attention
+        or args.leagle_candidate_grad_addmm
+        or args.leagle_candidate_backward_recompute
+        or args.leagle_teacher_cache
+        or args.leagle_masked_head
+        or args.leagle_teacher_cache_supervised
+        or args.leagle_shared_loss_normalization
+        or args.leagle_stream_main_loss
+        or args.leagle_align_candidate_chunks
+        or args.leagle_selective_checkpoint
+        or args.leagle_cache_attention_masks
+        or args.leagle_fsdp_keep_forward_params
+        or args.leagle_share_output_head
+    )
+    if enabled and args.speculator_type != "leagle":
+        parser.error("LEAGLE training optimizations require --speculator-type leagle")
+    if (
+        min(
+            args.leagle_loss_chunk_size,
+            args.leagle_attn_chunk_size,
+            args.leagle_teacher_cache_mb,
+            args.leagle_attention_mask_cache_mb,
+        )
+        < 1
+    ):
+        parser.error(
+            "LEAGLE optimization chunk sizes and cache budget must be positive"
+        )
+    if args.leagle_sparse_attention and args.draft_attn_impl != "sdpa":
+        parser.error("LEAGLE sparse attention requires --draft-attn-impl sdpa")
+    if args.leagle_teacher_cache_supervised and not args.leagle_teacher_cache:
+        parser.error("Supervised teacher cache requires --leagle-teacher-cache")
+    if args.leagle_fsdp_keep_forward_params and not args.fsdp_shard:
+        parser.error("LEAGLE parameter retention requires --fsdp-shard")
+    if (
+        args.leagle_selective_checkpoint or args.leagle_cache_attention_masks
+    ) and not args.leagle_sparse_attention:
+        parser.error("Selective checkpoint and mask cache require sparse attention")
+    if args.leagle_selective_checkpoint and not args.activation_checkpointing:
+        parser.error("Selective checkpoint requires activation checkpointing")
 
 
 def _validate_dflash2_args(
@@ -343,6 +414,7 @@ def finalize_train_args(
     # bare DSpark/MMuse runs inherit the DSpark paper training recipe. MMuse's
     # optional architecture extensions remain explicit opt-ins.
     dspark_default_dests = {
+        "ttt_steps",
         "block_size",
         "dflash_decay_gamma",
         "epochs",

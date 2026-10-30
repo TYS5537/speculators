@@ -208,7 +208,9 @@ def test_model_logging_preserves_loss_gradients_updates_and_rng(
         torch.manual_seed(29)
         with monkeypatch.context() as patch:
             if not enabled:
-                patch.setattr(EagleTrainingMetrics, "update", lambda *args: None)
+                patch.setattr(
+                    EagleTrainingMetrics, "update", lambda *args, **kwargs: None
+                )
             _, loss, counts = draft(
                 **inputs,
                 ttt_steps=3,

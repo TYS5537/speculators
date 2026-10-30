@@ -10,6 +10,19 @@ from transformers.models.qwen3.modeling_qwen3 import Qwen3RMSNorm
 
 logger = logging.getLogger(__name__)
 
+
+def validate_kv_reuse_rope(rotary_emb, *, hint: str = "") -> None:
+    """Reject rotations whose cached keys change when the sequence grows."""
+    if getattr(rotary_emb, "rope_type", None) not in {
+        "default",
+        "linear",
+        "yarn",
+        "llama3",
+    }:
+        message = "KV reuse requires position-independent RoPE frequencies"
+        raise ValueError(f"{message}; {hint}" if hint else message)
+
+
 # Verifier families whose final norm follows the Gemma convention
 # `x_norm * (1 + w)` instead of the plain RMSNorm `x_norm * w`. Matched
 # exactly against the verifier's effective `model_type` (after text_config

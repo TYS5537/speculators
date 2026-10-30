@@ -62,6 +62,7 @@ def trainer_module():
         "src/speculators/train/trainer.py": {
             "_synchronize_device",
             "_all_reduce_metrics",
+            "_metrics_to_host",
             "_StepTimer",
             "TrainerConfig",
             "Trainer",
@@ -232,6 +233,53 @@ def test_empty_then_valid_batch_completes_both_backward_lifecycles(
     assert trainer.optimizers[0].state[trainer.model.weight]["step"].item() == 1
 
 
+def test_previous_gradients_are_released_before_each_forward(trainer_module, tmp_path):
+    trainer = _make_trainer(trainer_module, tmp_path, [_batch(), _batch()])
+    trainer.model.weight.square().backward()
+    observed = []
+
+    def before_forward(model, _args):
+        observed.append(model.weight.grad)
+
+    handle = trainer.model.register_forward_pre_hook(before_forward)
+    try:
+        trainer.train_epoch(0)
+    finally:
+        handle.remove()
+    assert observed == [None, None]
+    assert len(trainer.model.backward_grads) == 3
+
+
+def test_metric_scheduling_is_opt_in_and_validation_remains_complete(
+    trainer_module, tmp_path, monkeypatch
+):
+    trainer = _make_trainer(trainer_module, tmp_path, [_batch(), _batch(), _batch()])
+    trainer.config = trainer.config._replace(
+        log_freq=2,
+        train_call_kwargs={"collect_metrics": True},
+        val_call_kwargs={"collect_metrics": True},
+    )
+    observed = []
+    original = trainer.model.forward
+
+    def record(*args, collect_metrics=True, **kwargs):
+        observed.append((trainer.model.training, collect_metrics))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(trainer.model, "forward", record)
+    trainer.train_epoch(0)
+    trainer.val_epoch(0)
+    assert observed == [
+        (True, False),
+        (True, True),
+        (True, False),
+        (False, True),
+        (False, True),
+        (False, True),
+    ]
+    assert trainer.config.train_call_kwargs == {"collect_metrics": True}
+
+
 @pytest.mark.parametrize("local_active", [False, True])
 def test_one_active_rank_keeps_all_ranks_in_backward_and_optimizer_step(
     trainer_module, tmp_path, local_active
@@ -340,6 +388,122 @@ def test_supervision_count_overrides_input_mask_and_legacy_falls_back(
     assert trainer._supervision_status(_batch(0), {}, device) == (False, 0)
     assert trainer._supervision_status(_batch(1), {}, device) == (True, 1)
     assert trainer._supervision_status({}, {}, device) == (True, 1)
+
+
+@pytest.mark.parametrize(
+    ("local_active", "active_ranks"), [(False, 0), (False, 1), (True, 1), (True, 2)]
+)
+def test_distributed_supervision_reads_both_counts_once(
+    trainer_module, tmp_path, monkeypatch, local_active, active_ranks
+):
+    trainer = _make_trainer(trainer_module, tmp_path, [], distributed=True)
+    collective = _set_collectives(trainer_module, [active_ranks])
+    copies = []
+    original_cpu = torch.Tensor.cpu
+
+    def copy_to_host(tensor, *args, **kwargs):
+        copies.append(tensor.shape)
+        return original_cpu(tensor, *args, **kwargs)
+
+    def scalar_read(*_args, **_kwargs):
+        pytest.fail("Distributed supervision read a separate scalar on the host")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "cpu", copy_to_host)
+        patch.setattr(torch.Tensor, "item", scalar_read)
+        result = trainer._supervision_status(
+            _batch(int(local_active)), {}, torch.device("cpu")
+        )
+    assert result == (local_active, active_ranks)
+    assert copies == [(2,)]
+    collective.assert_called_once()
+
+
+def test_metric_transfers_preserve_precision_types_and_key_order(
+    trainer_module, monkeypatch
+):
+    metrics = {
+        "fp32": torch.tensor(0.1, requires_grad=True),
+        "large_count": torch.tensor(2**60 + 1, dtype=torch.int64),
+        "bf16": torch.tensor([0.1], dtype=torch.bfloat16),
+        "fp64": torch.tensor(1.0 + 2**-40, dtype=torch.float64),
+        "second_fp32": torch.tensor([[3.0]]),
+        "flag": torch.tensor(True),
+        "fp16": torch.tensor(0.2, dtype=torch.float16),
+        "negative_count": torch.tensor(-(2**60) + 1, dtype=torch.int64),
+    }
+    expected = {key: value.item() for key, value in metrics.items()}
+    copies = []
+    original_cpu = torch.Tensor.cpu
+
+    def copy_to_host(tensor, *args, **kwargs):
+        assert not tensor.requires_grad
+        copies.append((tensor.dtype, tensor.numel()))
+        return original_cpu(tensor, *args, **kwargs)
+
+    def scalar_read(*_args, **_kwargs):
+        pytest.fail("Metrics were copied to the host one scalar at a time")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(torch.Tensor, "cpu", copy_to_host)
+        patch.setattr(torch.Tensor, "item", scalar_read)
+        actual = trainer_module._metrics_to_host(metrics)
+        assert trainer_module._metrics_to_host({}) == {}
+    assert actual == expected
+    assert list(actual) == list(metrics)
+    assert [type(value) for value in actual.values()] == [
+        type(value) for value in expected.values()
+    ]
+    assert copies == [
+        (torch.float32, 2),
+        (torch.int64, 2),
+        (torch.bfloat16, 1),
+        (torch.float64, 1),
+        (torch.bool, 1),
+        (torch.float16, 1),
+    ]
+    assert metrics["fp32"].requires_grad
+
+
+@pytest.mark.parametrize("distributed", [False, True])
+def test_validation_keeps_original_host_accumulation_order(
+    trainer_module, tmp_path, monkeypatch, distributed
+):
+    values = [2**24, 1.0, 0.5]
+    trainer = _make_trainer(
+        trainer_module, tmp_path, [_batch() for _ in values], distributed=distributed
+    )
+    batches = iter(values)
+
+    def forward(**_kwargs):
+        value = torch.tensor(next(batches), dtype=torch.float32)
+        return None, value, {"loss_sum": value, "loss_total": value.new_ones(())}
+
+    monkeypatch.setattr(trainer.model, "forward", forward)
+    if distributed:
+        _set_collectives(
+            trainer_module,
+            [entry for value in values for entry in (2, [2 * value, 2])],
+        )
+    result = trainer.val_epoch(0)
+    assert result == {"loss_epoch": sum(values) / len(values)}
+
+
+def test_unlogged_steps_do_not_allocate_error_record_metrics(
+    trainer_module, tmp_path, monkeypatch
+):
+    trainer = _make_trainer(trainer_module, tmp_path, [_batch(), _batch(), _batch()])
+    trainer.config = trainer.config._replace(log_freq=2)
+    observed = []
+    original = trainer._log_training_step
+
+    def record(epoch, metrics, *args):
+        observed.append((trainer.global_step, "error_records_sum" in metrics))
+        return original(epoch, metrics, *args)
+
+    monkeypatch.setattr(trainer, "_log_training_step", record)
+    trainer.train_epoch(0)
+    assert observed == [(1, False), (2, True), (3, False)]
 
 
 def test_validation_excludes_empty_batch_from_loss_and_plain_metric(

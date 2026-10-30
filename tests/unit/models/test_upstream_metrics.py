@@ -41,6 +41,31 @@ def test_resolve_eager_implementation(name, eager_fn):
 
 
 class TestLossFunction:
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float64])
+    def test_decay_receives_masked_values_and_preserves_gradients(self, dtype):
+        values = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=dtype, requires_grad=True)
+        mask = torch.tensor([[1, 0, 1], [0, 0, 0]])
+        positions = torch.arange(3).expand(2, -1)
+        observed = []
+
+        def decay(pos_idx, *, elementwise_loss):
+            observed.append(
+                (pos_idx.detach().clone(), elementwise_loss.detach().clone())
+            )
+            return 1 + elementwise_loss.detach()
+
+        loss = loss_function(
+            values, values, mask, positions, loss_fn=lambda x, _: x, decay_fn=decay
+        )
+        loss.backward()
+        masked = values.detach() * mask
+        denominator = mask.to(dtype).sum(-1, keepdim=True) + 1e-5
+        weights = mask * (1 + masked) / denominator / values.shape[0]
+        torch.testing.assert_close(loss, (values.detach() * weights).sum())
+        torch.testing.assert_close(values.grad, weights)
+        torch.testing.assert_close(observed[0][0], positions.to(dtype))
+        torch.testing.assert_close(observed[0][1], masked)
+
     def test_decay_scales_loss(self):
         """Decay at different positions must scale the loss, not cancel out.
 

@@ -35,6 +35,7 @@ EPOCHS="${EPOCHS:-5}"
 SEED="${SEED:-42}"
 TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
 LOGGER="${LOGGER:-tensorboard}"
+LOG_FREQ="${LOG_FREQ:-10}"  # Compute/log training diagnostics every N steps.
 NOISE_STD="${NOISE_STD:-0.05}"
 
 # LEAGLE: Qwen3 KV-conditioned layers, shared loops, and seven AR token steps.
@@ -70,6 +71,38 @@ CANDIDATE_TOP_K="${CANDIDATE_TOP_K:-128}"
 CANDIDATE_HEAD_LOSS_WEIGHT="${CANDIDATE_HEAD_LOSS_WEIGHT:-1.0}"
 CANDIDATE_HEAD_CHUNK_SIZE="${CANDIDATE_HEAD_CHUNK_SIZE:-32}"
 
+# Two optional masters: 0=off, 1=on, empty=use individual/saved settings.
+# A nonempty master overrides its members, including individual CLI flags.
+# Safe alone never enables chunking or sparse attention. Numerical=0 also
+# disables their dependent caches and uses native candidate backward replay.
+LEAGLE_SAFE_OPTIMIZATIONS="${LEAGLE_SAFE_OPTIMIZATIONS:-}"
+LEAGLE_NUMERICAL_OPTIMIZATIONS="${LEAGLE_NUMERICAL_OPTIMIZATIONS:-}"
+# Individual switches: empty means off for a new run and inherit on resume.
+# To control members individually, the resolved master must be null/unset;
+# on resume an empty environment value still inherits a saved master.
+LEAGLE_REUSE_TRAINING_KV="${LEAGLE_REUSE_TRAINING_KV:-}"
+LEAGLE_CHUNKED_LOSS="${LEAGLE_CHUNKED_LOSS:-}"
+LEAGLE_SPARSE_ATTENTION="${LEAGLE_SPARSE_ATTENTION:-}"
+LEAGLE_CANDIDATE_GRAD_ADDMM="${LEAGLE_CANDIDATE_GRAD_ADDMM:-}"
+# Closer native gradients; extra forward/backward teacher projections, default off.
+LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE="${LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE:-}"
+LEAGLE_TEACHER_CACHE="${LEAGLE_TEACHER_CACHE:-}"
+LEAGLE_MASKED_HEAD="${LEAGLE_MASKED_HEAD:-}"
+LEAGLE_TEACHER_CACHE_SUPERVISED="${LEAGLE_TEACHER_CACHE_SUPERVISED:-}"
+LEAGLE_SHARED_LOSS_NORMALIZATION="${LEAGLE_SHARED_LOSS_NORMALIZATION:-}"  # FP32 only; BF16 uses reference losses.
+LEAGLE_STREAM_MAIN_LOSS="${LEAGLE_STREAM_MAIN_LOSS:-}"  # FP32 only; BF16 uses reference chunks.
+LEAGLE_ALIGN_CANDIDATE_CHUNKS="${LEAGLE_ALIGN_CANDIDATE_CHUNKS:-}"
+LEAGLE_SELECTIVE_CHECKPOINT="${LEAGLE_SELECTIVE_CHECKPOINT:-}"
+LEAGLE_CACHE_ATTENTION_MASKS="${LEAGLE_CACHE_ATTENTION_MASKS:-}"
+LEAGLE_ATTENTION_MASK_CACHE_MB="${LEAGLE_ATTENTION_MASK_CACHE_MB:-}"  # New run: 64 MiB/rank.
+LEAGLE_FSDP_KEEP_FORWARD_PARAMS="${LEAGLE_FSDP_KEEP_FORWARD_PARAMS:-}"
+LEAGLE_SHARE_OUTPUT_HEAD="${LEAGLE_SHARE_OUTPUT_HEAD:-}"
+# Persistent teacher probabilities/IDs only; temporary chunk workspace is extra.
+LEAGLE_TEACHER_CACHE_MB="${LEAGLE_TEACHER_CACHE_MB:-}"  # New run: 1024 MiB/rank.
+# Empty uses 128 on a new run, or the saved size on resume.
+LEAGLE_LOSS_CHUNK_SIZE="${LEAGLE_LOSS_CHUNK_SIZE:-}"
+LEAGLE_ATTN_CHUNK_SIZE="${LEAGLE_ATTN_CHUNK_SIZE:-}"
+
 FSDP_SHARD="${FSDP_SHARD:-1}"
 ACTIVATION_CHECKPOINTING="${ACTIVATION_CHECKPOINTING:-1}"
 RESUME="${RESUME:-0}"
@@ -82,6 +115,10 @@ for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN CANDIDATE_HEAD
         exit 2
     fi
 done
+if [[ ! "$LOG_FREQ" =~ ^[1-9][0-9]*$ ]]; then
+    echo "LOG_FREQ must be a positive integer." >&2
+    exit 2
+fi
 if [[ ! "$NUM_LAYERS" =~ ^[1-9][0-9]*$ || ! "$NUM_LOOPS" =~ ^[1-9][0-9]*$ ]]; then
     echo "NUM_LAYERS and NUM_LOOPS must be positive integers." >&2
     exit 2
@@ -157,6 +194,7 @@ TRAIN_ARGS=(
     --log-dir "$OUTPUT_DIR/tensorboard" --run-name "$RUN_NAME" \
     --no-resume-from-checkpoint --checkpoint-freq 1 \
     --seed "$SEED" --epochs "$EPOCHS" --logger "$LOGGER" \
+    --log-freq "$LOG_FREQ" \
     --total-seq-len "$SEQ_LENGTH" --train-data-ratio "$TRAIN_DATA_RATIO" \
     --hidden-states-dtype bfloat16 --noise-std "$NOISE_STD" \
     --speculator-type leagle --num-layers "$NUM_LAYERS" --num-loops "$NUM_LOOPS" \
@@ -172,6 +210,7 @@ if [[ "$RESUME" == 1 ]]; then
     # Architecture, optimizer, loss, schedule and memory settings come from the
     # original run. Endpoint and output paths may change when restarting.
     TRAIN_ARGS=(--config "$OUTPUT_DIR/checkpoints/run.yaml" --resume-from-checkpoint
+        --log-freq "$LOG_FREQ"
         --no-save-best --checkpoint-freq 1
         --save-path "$OUTPUT_DIR/checkpoints" --log-dir "$OUTPUT_DIR/tensorboard"
         --vllm-endpoint "$VLLM_ENDPOINT" --hidden-states-path "$HIDDEN_STATES_PATH")
@@ -186,6 +225,32 @@ else
     if [[ "$ACTIVATION_CHECKPOINTING" == 1 ]]; then TRAIN_ARGS+=(--activation-checkpointing); fi
 fi
 # Use this checkout and the selected Python environment for every worker.
+for setting in LEAGLE_SAFE_OPTIMIZATIONS LEAGLE_NUMERICAL_OPTIMIZATIONS \
+    LEAGLE_REUSE_TRAINING_KV LEAGLE_CHUNKED_LOSS LEAGLE_SPARSE_ATTENTION \
+    LEAGLE_CANDIDATE_GRAD_ADDMM LEAGLE_TEACHER_CACHE LEAGLE_MASKED_HEAD \
+    LEAGLE_TEACHER_CACHE_SUPERVISED LEAGLE_SHARED_LOSS_NORMALIZATION \
+    LEAGLE_STREAM_MAIN_LOSS LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE \
+    LEAGLE_ALIGN_CANDIDATE_CHUNKS LEAGLE_SELECTIVE_CHECKPOINT LEAGLE_CACHE_ATTENTION_MASKS \
+    LEAGLE_FSDP_KEEP_FORWARD_PARAMS LEAGLE_SHARE_OUTPUT_HEAD; do
+    flag="${setting,,}"
+    flag="${flag//_/-}"
+    case "${!setting}" in
+        '') ;;
+        0) TRAIN_ARGS+=("--no-$flag") ;;
+        1) TRAIN_ARGS+=("--$flag") ;;
+        *) echo "$setting must be empty, 0 or 1." >&2; exit 2 ;;
+    esac
+done
+for setting in LEAGLE_LOSS_CHUNK_SIZE LEAGLE_ATTN_CHUNK_SIZE LEAGLE_TEACHER_CACHE_MB \
+    LEAGLE_ATTENTION_MASK_CACHE_MB; do
+    if [[ -n "${!setting}" ]]; then
+        if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
+            echo "$setting must be a positive integer." >&2; exit 2
+        fi
+        flag="${setting,,}"
+        TRAIN_ARGS+=("--${flag//_/-}" "${!setting}")
+    fi
+done
 CMD=(env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS"
     PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     "$PYTHON" -m torch.distributed.run

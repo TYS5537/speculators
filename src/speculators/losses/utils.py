@@ -295,8 +295,16 @@ def loss_function(
     Returns:
         Scalar mean loss across the batch.
     """
-    elementwise_loss = loss_fn(logits, targets)  # shape: [1, seq_len]
+    return reduce_masked_loss(loss_fn(logits, targets), loss_mask, pos_idx, decay_fn)
 
+
+def reduce_masked_loss(
+    elementwise_loss: torch.Tensor,
+    loss_mask: torch.Tensor,
+    pos_idx: torch.Tensor,
+    decay_fn: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Reduce per-position losses in the same order for dense and chunked heads."""
     loss_mask = loss_mask.to(elementwise_loss.dtype)
     elementwise_loss = elementwise_loss * loss_mask
 

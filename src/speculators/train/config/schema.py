@@ -29,7 +29,12 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
 )
 from speculators.losses import resolve_loss_config
+from speculators.models.leagle.options import (
+    RUNTIME_DEFAULTS as LEAGLE_RUNTIME_DEFAULTS,
+)
+from speculators.models.leagle.options import TRAINING_DEFAULTS as LEAGLE_DEFAULTS
 from speculators.models.mmuse.config import MMuseOptions
+from speculators.train.leagle_optimizations import resolve_optimization_groups
 
 # A bool that must render as an argparse ``--x/--no-x`` (``BooleanOptionalAction``)
 # even though it defaults to False. Bools defaulting to True or None get that form
@@ -444,6 +449,125 @@ class SchedulerArgs(_Group):
 
 
 class TrainerArgs(_Group):
+    leagle_safe_optimizations: bool | None = Field(
+        default=None,
+        description="Master for LEAGLE optimizations with no extra gradient changes "
+        "observed in CPU tests. Overrides individual settings; unset preserves them. "
+        "Does not enable numerical prerequisites such as chunking/sparse attention.",
+    )
+    leagle_numerical_optimizations: bool | None = Field(
+        default=None,
+        description="Master for LEAGLE execution optimizations that can change "
+        "floating-point gradients. Overrides individual settings; off also disables "
+        "dependent caches and selects native candidate backward recomputation. "
+        "Does not create a candidate head or change the model architecture.",
+    )
+    leagle_reuse_training_kv: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_reuse_training_kv"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Experimental LEAGLE target KV reuse across TTT and shared loops, "
+        "with gradients.",
+    )
+    leagle_chunked_loss: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_chunked_loss"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Experimental LEAGLE checkpointed vocabulary projection/loss "
+        "chunks.",
+    )
+    leagle_loss_chunk_size: int = Field(
+        default=LEAGLE_DEFAULTS["leagle_loss_chunk_size"], gt=0
+    )
+    leagle_sparse_attention: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_sparse_attention"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Experimental LEAGLE compact trajectory attention; requires "
+        "SDPA and zero dropout.",
+    )
+    leagle_attn_chunk_size: int = Field(
+        default=LEAGLE_DEFAULTS["leagle_attn_chunk_size"], gt=0
+    )
+    leagle_candidate_grad_addmm: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_candidate_grad_addmm"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Experimental FP32 addmm accumulation for candidate-head "
+        "gradients.",
+    )
+    leagle_candidate_backward_recompute: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_candidate_backward_recompute"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Recompute candidate KL chunks in backward with native loss "
+        "scaling and one gradient cast per TTT step. Uses extra projections; "
+        "overrides candidate addmm/compaction, without retaining full logits.",
+    )
+    leagle_teacher_cache: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_teacher_cache"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Experimental bounded teacher-probability cache; uses chunked "
+        "eager CE/TV/forward-KL loss.",
+    )
+    leagle_teacher_cache_mb: int = Field(
+        default=LEAGLE_DEFAULTS["leagle_teacher_cache_mb"],
+        gt=0,
+        description="Persistent teacher probability/ID cache budget in MiB per rank.",
+    )
+    leagle_masked_head: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_masked_head"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Experimental chunked output heads on supervised positions only.",
+    )
+    leagle_teacher_cache_supervised: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_teacher_cache_supervised"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Cache only supervised teacher positions within the memory budget.",
+    )
+    leagle_shared_loss_normalization: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_shared_loss_normalization"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Share normalization across eager CE/TV/KL and candidate KL "
+        "only in FP32; BF16/FP16/autocast use reference loss kernels.",
+    )
+    leagle_align_candidate_chunks: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_align_candidate_chunks"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Enlarge main loss chunks to at least the candidate chunk size; "
+        "automatically enables chunked loss and uses more temporary memory.",
+    )
+    leagle_stream_main_loss: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_stream_main_loss"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Precompute first-order main loss hidden gradients per chunk; "
+        "requires FP32, frozen output heads and eager CE/TV/forward KL; "
+        "BF16/FP16/autocast use reference checkpointed chunks.",
+    )
+    leagle_selective_checkpoint: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_selective_checkpoint"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Recompute only MLPs around checkpointed sparse attention; "
+        "requires sparse attention and activation checkpointing, uses more memory.",
+    )
+    leagle_cache_attention_masks: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_cache_attention_masks"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Reuse bounded sparse attention masks within one forward/backward.",
+    )
+    leagle_attention_mask_cache_mb: int = Field(
+        default=LEAGLE_DEFAULTS["leagle_attention_mask_cache_mb"],
+        gt=0,
+        description="Retained attention mask budget in MiB per rank; workspace extra.",
+    )
+    leagle_fsdp_keep_forward_params: bool = Field(
+        default=LEAGLE_RUNTIME_DEFAULTS["leagle_fsdp_keep_forward_params"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description=(
+            "Retain unsharded LEAGLE layer weights across forward calls; "
+            "uses more device memory."
+        ),
+    )
+    leagle_share_output_head: bool = Field(
+        default=LEAGLE_RUNTIME_DEFAULTS["leagle_share_output_head"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Share exactly identical frozen draft and teacher output weights.",
+    )
     max_grad_norm: float = Field(
         default=1.0,
         gt=0.0,
@@ -930,6 +1054,57 @@ class TrainConfig(BaseSettings):
             raise ValueError(
                 "--candidate-head is only supported by --speculator-type leagle"
             )
+        return self
+
+    @model_validator(mode="after")
+    def _validate_leagle_optimizations(self) -> "TrainConfig":
+        for name, value in resolve_optimization_groups(self.flatten()).items():
+            setattr(self.trainer, name, value)
+        enabled = (
+            self.trainer.leagle_reuse_training_kv
+            or self.trainer.leagle_chunked_loss
+            or self.trainer.leagle_sparse_attention
+            or self.trainer.leagle_candidate_grad_addmm
+            or self.trainer.leagle_candidate_backward_recompute
+            or self.trainer.leagle_teacher_cache
+            or self.trainer.leagle_masked_head
+            or self.trainer.leagle_teacher_cache_supervised
+            or self.trainer.leagle_shared_loss_normalization
+            or self.trainer.leagle_stream_main_loss
+            or self.trainer.leagle_align_candidate_chunks
+            or self.trainer.leagle_selective_checkpoint
+            or self.trainer.leagle_cache_attention_masks
+            or self.trainer.leagle_fsdp_keep_forward_params
+            or self.trainer.leagle_share_output_head
+        )
+        if enabled and self.speculator_type != "leagle":
+            raise ValueError(
+                "LEAGLE training optimizations require --speculator-type leagle"
+            )
+        if (
+            self.trainer.leagle_sparse_attention
+            and self.draft.draft_attn_impl != "sdpa"
+        ):
+            raise ValueError("LEAGLE sparse attention requires --draft-attn-impl sdpa")
+        if (
+            self.trainer.leagle_teacher_cache_supervised
+            and not self.trainer.leagle_teacher_cache
+        ):
+            raise ValueError("Supervised teacher cache requires --leagle-teacher-cache")
+        if self.trainer.leagle_fsdp_keep_forward_params and not self.trainer.fsdp_shard:
+            raise ValueError("LEAGLE parameter retention requires --fsdp-shard")
+        if (
+            self.trainer.leagle_selective_checkpoint
+            or self.trainer.leagle_cache_attention_masks
+        ) and not self.trainer.leagle_sparse_attention:
+            raise ValueError(
+                "Selective checkpoint and mask cache require sparse attention"
+            )
+        if (
+            self.trainer.leagle_selective_checkpoint
+            and not self.trainer.activation_checkpointing
+        ):
+            raise ValueError("Selective checkpoint requires activation checkpointing")
         return self
 
     @model_validator(mode="after")

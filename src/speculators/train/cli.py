@@ -28,6 +28,10 @@ from speculators.train.draft_config import (
     create_transformer_layer_config,
     load_draft_transformer_layer_config,
 )
+from speculators.train.leagle_optimizations import (
+    GROUP_DEFAULTS,
+    apply_runtime_optimization_groups,
+)
 from speculators.train.legacy_cli import (
     DSPARK_PAPER_BLOCK_SIZE,
     DSPARK_PAPER_EPOCHS,
@@ -235,6 +239,16 @@ def main(cfg: TrainConfig):  # noqa: C901
     # migrated to MMuse. Use the resolved class for preprocessing/trainer policy.
     model_class = type(draft_model)
     args.speculator_type = draft_model.config.speculators_model_type
+    apply_runtime_optimization_groups(cfg, args, draft_model)
+    if any(getattr(args, name) is not None for name in GROUP_DEFAULTS):
+        if get_rank() == 0:
+            cfg.save(args.save_path)
+        logger.info(
+            "LEAGLE optimization masters: safe=%s, numerical=%s. "
+            "Effective member settings are recorded in run.yaml.",
+            args.leagle_safe_optimizations,
+            args.leagle_numerical_optimizations,
+        )
 
     if (
         use_dsv4_format
@@ -350,6 +364,8 @@ def main(cfg: TrainConfig):  # noqa: C901
         log_freq=args.log_freq,
         profile_freq=args.profile_freq,
         fsdp_shard=args.fsdp_shard,
+        leagle_fsdp_keep_forward_params=args.leagle_fsdp_keep_forward_params,
+        leagle_share_output_head=args.leagle_share_output_head,
         gradient_checkpointing=args.gradient_checkpointing,
         activation_checkpointing=args.activation_checkpointing,
         activation_checkpoint_layers=args.activation_checkpoint_layers,

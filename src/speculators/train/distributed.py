@@ -195,7 +195,10 @@ def maybe_destroy_distributed() -> None:
 
 
 def apply_fully_sharded(
-    model: torch.nn.Module, param_dtype: torch.dtype = torch.bfloat16
+    model: torch.nn.Module,
+    param_dtype: torch.dtype = torch.bfloat16,
+    *,
+    keep_forward_params: bool = False,
 ):
     """Applies torch FSDP fully_shard to the model, wrapping layers in FSDPModule.
 
@@ -208,8 +211,9 @@ def apply_fully_sharded(
         reduce_dtype=torch.float32,
     )
 
+    options = {"reshard_after_forward": False} if keep_forward_params else {}
     for layer in model.layers:  # type: ignore[union-attr]
-        fully_shard(layer, mp_policy=mp_policy)
+        fully_shard(layer, mp_policy=mp_policy, **options)
 
     fully_shard(model, mp_policy=mp_policy)
 

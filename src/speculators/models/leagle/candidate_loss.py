@@ -9,6 +9,31 @@ import torch
 from torch.autograd.function import once_differentiable
 from torch.nn import functional
 
+from speculators.models.leagle.shared_loss import CandidateTeacher
+
+
+def _prepare_teacher(logits, distribution, shape, collect_recall):
+    if logits is not None:
+        if distribution is not None:
+            raise ValueError("Pass either teacher logits or a shared distribution")
+        if logits.shape != shape:
+            raise ValueError("Candidate teacher logits must align with hidden states")
+        logits = logits.detach().reshape(-1, shape[-1])
+    if distribution is not None:
+        if (
+            distribution.log_probs.shape != shape
+            or distribution.probabilities.shape != shape
+            or (collect_recall and distribution.ids is None)
+            or (distribution.ids is not None and distribution.ids.shape != shape[:-1])
+        ):
+            raise ValueError("Shared candidate teacher must align with hidden states")
+        distribution = CandidateTeacher(
+            distribution.log_probs.detach().reshape(-1, shape[-1]),
+            distribution.probabilities.detach().reshape(-1, shape[-1]),
+            None if distribution.ids is None else distribution.ids.detach().reshape(-1),
+        )
+    return logits, distribution
+
 
 class _CandidateLoss(torch.autograd.Function):
     @staticmethod
@@ -38,13 +63,25 @@ class CandidateLossAccumulator:
     and upstream loss scaling. This does not call backward inside model.forward.
     """
 
-    def __init__(self, head):
+    def __init__(self, head, *, grad_addmm=False, valid_only=False):
         self.head = head
+        self.grad_addmm, self.valid_only = grad_addmm, valid_only
         self.value = head.down_proj.weight.new_zeros((), dtype=torch.float32)
         self.need_down = torch.is_grad_enabled() and head.down_proj.weight.requires_grad
         self.need_up = torch.is_grad_enabled() and head.up_proj.weight.requires_grad
         self.down_grad = None
         self.up_grad = None
+
+    @staticmethod
+    def _addmm(buffer, left, right):
+        # Experimental FP32 accumulation avoids a full [V,R] temporary. This
+        # deliberately changes the BF16 per-chunk rounding boundary, not the KL.
+        with torch.autocast(device_type=left.device.type, enabled=False):
+            if buffer is None:
+                buffer = left.new_zeros(
+                    (left.shape[0], right.shape[1]), dtype=torch.float32
+                )
+            return buffer.addmm_(left.float(), right.float())
 
     def _accumulate_gradients(
         self, hidden, reduced, coarse, log_q, target_p, mask, scale
@@ -56,29 +93,56 @@ class CandidateLossAccumulator:
         grad = log_q.exp().sub_(target_p).mul_(mask[:, None]).mul_(scale)
         grad = grad.to(coarse.dtype)
         if self.need_up:
-            update = grad.transpose(0, 1) @ reduced
-            if self.up_grad is None:
-                self.up_grad = update.float()
+            if self.grad_addmm:
+                self.up_grad = self._addmm(self.up_grad, grad.transpose(0, 1), reduced)
             else:
-                self.up_grad.add_(update)
+                update = grad.transpose(0, 1) @ reduced
+                if self.up_grad is None:
+                    self.up_grad = update.float()
+                else:
+                    self.up_grad.add_(update)
         if self.need_down:
             reduced_grad = grad @ self.head.up_proj.weight
-            update = reduced_grad.transpose(0, 1) @ hidden
-            if self.down_grad is None:
-                self.down_grad = update.float()
+            if self.grad_addmm:
+                self.down_grad = self._addmm(
+                    self.down_grad, reduced_grad.transpose(0, 1), hidden
+                )
             else:
-                self.down_grad.add_(update)
+                update = reduced_grad.transpose(0, 1) @ hidden
+                if self.down_grad is None:
+                    self.down_grad = update.float()
+                else:
+                    self.down_grad.add_(update)
 
-    def _chunk(self, hidden, teacher, mask, top_k, scale):
+    def _chunk(
+        self,
+        hidden,
+        teacher,
+        mask,
+        top_k,
+        scale,
+        collect_recall,
+        teacher_distribution=None,
+    ):
         reduced = self.head.down_proj(hidden)
         coarse = self.head.up_proj(reduced)
         log_q = functional.log_softmax(coarse, dim=-1, dtype=torch.float32)
-        log_p = functional.log_softmax(teacher, dim=-1, dtype=torch.float32)
-        target_p = log_p.exp()
+        if teacher_distribution is None:
+            log_p = functional.log_softmax(teacher, dim=-1, dtype=torch.float32)
+            target_p = log_p.exp()
+        else:
+            log_p, target_p, _ = teacher_distribution
         loss = ((target_p * (log_p - log_q)).sum(-1) * mask).sum()
-        candidates = coarse.topk(top_k, dim=-1, sorted=False).indices
-        recalled = (candidates == teacher.argmax(-1, keepdim=True)).any(-1)
-        recall = (recalled & mask).sum(dtype=torch.float32)
+        recall = None
+        if collect_recall:
+            candidates = coarse.topk(top_k, dim=-1, sorted=False).indices
+            target_ids = (
+                teacher.argmax(-1)
+                if teacher_distribution is None
+                else teacher_distribution.ids
+            )
+            recalled = (candidates == target_ids.unsqueeze(-1)).any(-1)
+            recall = (recalled & mask).sum(dtype=torch.float32)
         self._accumulate_gradients(
             hidden, reduced, coarse, log_q, target_p, mask, scale
         )
@@ -94,14 +158,17 @@ class CandidateLossAccumulator:
         top_k,
         chunk_size,
         teacher_logits=None,
+        teacher_distribution=None,
         normalize=False,
         loss_scale=1.0,
+        collect_recall=True,
     ):
         """Add a step; return raw KL sum, top-1 recall count and valid count.
 
         Pass existing dense draft logits to avoid repeating W h. Their storage
         is read only during this call and is never saved for backward. Standalone
-        callers may omit them to compute W h once per chunk.
+        callers may omit them to compute W h once per chunk. When collect_recall
+        is false, skip diagnostic top-k and return a zero recall placeholder.
         """
         vocab_size = self.head.up_proj.out_features
         if chunk_size < 1 or not 1 <= top_k <= vocab_size:
@@ -112,33 +179,73 @@ class CandidateLossAccumulator:
             raise ValueError(
                 "Candidate loss needs nonempty, aligned hidden states and mask"
             )
-        if teacher_logits is not None:
-            if teacher_logits.shape != (*hidden_states.shape[:-1], vocab_size):
-                raise ValueError(
-                    "Candidate teacher logits must align with hidden states"
-                )
-            teacher_logits = teacher_logits.detach().reshape(-1, vocab_size)
+        teacher_logits, teacher_distribution = _prepare_teacher(
+            teacher_logits,
+            teacher_distribution,
+            (*hidden_states.shape[:-1], vocab_size),
+            collect_recall,
+        )
         count = valid.sum(dtype=torch.float32)
         scale = loss_scale / count.clamp_min(1) if normalize else loss_scale
+        if self.valid_only:
+            indices = valid.nonzero(as_tuple=True)[0]
+            hidden = hidden[indices]
+            if teacher_logits is not None:
+                teacher_logits = teacher_logits[indices]
+            if teacher_distribution is not None:
+                teacher_distribution = CandidateTeacher(
+                    *(
+                        None if value is None else value[indices]
+                        for value in teacher_distribution
+                    )
+                )
+            valid = valid[indices]
         loss_sum = self.value.new_zeros(())
         recall_sum = loss_sum.clone()
         for start in range(0, hidden.shape[0], chunk_size):
             end = start + chunk_size
             teacher = (
-                functional.linear(hidden[start:end], full_weight.detach())
+                None
+                if teacher_distribution is not None
+                else functional.linear(hidden[start:end], full_weight.detach())
                 if teacher_logits is None
                 else teacher_logits[start:end]
             )
             loss, recall = self._chunk(
-                hidden[start:end], teacher, valid[start:end], top_k, scale
+                hidden[start:end],
+                teacher,
+                valid[start:end],
+                top_k,
+                scale,
+                collect_recall,
+                None
+                if teacher_distribution is None
+                else CandidateTeacher(
+                    *(
+                        None if value is None else value[start:end]
+                        for value in teacher_distribution
+                    )
+                ),
             )
             loss_sum.add_(loss)
-            recall_sum.add_(recall)
+            if collect_recall:
+                recall_sum.add_(recall)
         self.value.add_(loss_sum * scale)
         return loss_sum, recall_sum, count
 
     def loss(self):
         """Attach the accumulated first-order gradients once, after all updates."""
+        if self.valid_only:
+            # An empty selection must still produce zero gradients, not None:
+            # optimizer momentum/decay and distributed hooks depend on this.
+            if self.need_down and self.down_grad is None:
+                self.down_grad = torch.zeros_like(
+                    self.head.down_proj.weight, dtype=torch.float32
+                )
+            if self.need_up and self.up_grad is None:
+                self.up_grad = torch.zeros_like(
+                    self.head.up_proj.weight, dtype=torch.float32
+                )
         return _CandidateLoss.apply(
             self.value,
             self.head.down_proj.weight,

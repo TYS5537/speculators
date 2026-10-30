@@ -78,6 +78,128 @@ def test_eagle_script_ignores_leagle_candidate_environment():
     assert not config.draft.candidate_head
 
 
+def test_leagle_master_script_switches_and_resume(tmp_path):
+    config = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            MODEL="model",
+            CANDIDATE_HEAD="1",
+            LEAGLE_SAFE_OPTIMIZATIONS="1",
+            LEAGLE_NUMERICAL_OPTIMIZATIONS="1",
+        )
+    )
+    assert config.trainer.leagle_teacher_cache
+    assert config.trainer.leagle_sparse_attention
+    assert config.trainer.leagle_candidate_grad_addmm
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(config.dump_yaml())
+    inherited = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            RESUME="1",
+            OUTPUT_DIR=tmp_path.as_posix(),
+        )
+    )
+    for name, value in config.trainer.model_dump().items():
+        if name.startswith("leagle_"):
+            assert getattr(inherited.trainer, name) == value
+    assert not inherited.trainer.no_resume_from_checkpoint
+    off = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            RESUME="1",
+            OUTPUT_DIR=tmp_path.as_posix(),
+            LEAGLE_NUMERICAL_OPTIMIZATIONS="0",
+            LEAGLE_SPARSE_ATTENTION="1",
+        )
+    )
+    assert off.trainer.leagle_safe_optimizations
+    assert not off.trainer.leagle_sparse_attention
+    assert not off.trainer.leagle_teacher_cache
+    assert off.trainer.leagle_candidate_backward_recompute
+    assert off.trainer.leagle_share_output_head
+
+
+def test_eagle_script_ignores_leagle_optimization_masters():
+    config = TrainConfig.resolve(
+        launch_args(
+            "eagle3",
+            MODEL="model",
+            LEAGLE_SAFE_OPTIMIZATIONS="1",
+            LEAGLE_NUMERICAL_OPTIMIZATIONS="1",
+        )
+    )
+    assert config.trainer.leagle_safe_optimizations is None
+    assert config.trainer.leagle_numerical_optimizations is None
+
+
+def test_leagle_optimization_script_resume_inherits_or_explicitly_overrides(tmp_path):
+    names = (
+        "LEAGLE_REUSE_TRAINING_KV",
+        "LEAGLE_CHUNKED_LOSS",
+        "LEAGLE_SPARSE_ATTENTION",
+        "LEAGLE_CANDIDATE_GRAD_ADDMM",
+        "LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE",
+        "LEAGLE_TEACHER_CACHE",
+        "LEAGLE_MASKED_HEAD",
+        "LEAGLE_ALIGN_CANDIDATE_CHUNKS",
+        "LEAGLE_SELECTIVE_CHECKPOINT",
+        "LEAGLE_CACHE_ATTENTION_MASKS",
+    )
+    defaults = TrainConfig.resolve(launch_args("leagle", MODEL="model")).flatten()
+    assert all(defaults[name.lower()] is False for name in names)
+    original = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            MODEL="model",
+            **dict.fromkeys(names, "1"),
+            CANDIDATE_HEAD="1",
+            LEAGLE_LOSS_CHUNK_SIZE="256",
+            LEAGLE_ATTN_CHUNK_SIZE="64",
+            LEAGLE_TEACHER_CACHE_MB="512",
+            LEAGLE_ATTENTION_MASK_CACHE_MB="7",
+        )
+    )
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(original.dump_yaml())
+    resumed = TrainConfig.resolve(
+        launch_args("leagle", RESUME="1", OUTPUT_DIR=tmp_path.as_posix())
+    ).flatten()
+    assert all(resumed[name.lower()] is True for name in names)
+    assert resumed["leagle_loss_chunk_size"] == 256
+    assert resumed["leagle_teacher_cache_mb"] == 512
+    assert resumed["leagle_attention_mask_cache_mb"] == 7
+    overridden = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            RESUME="1",
+            OUTPUT_DIR=tmp_path.as_posix(),
+            LEAGLE_CHUNKED_LOSS="0",
+            LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE="0",
+            LEAGLE_ATTN_CHUNK_SIZE="32",
+            LEAGLE_MASKED_HEAD="0",
+            LEAGLE_TEACHER_CACHE_MB="256",
+            LEAGLE_ALIGN_CANDIDATE_CHUNKS="0",
+            LEAGLE_SELECTIVE_CHECKPOINT="0",
+            LEAGLE_CACHE_ATTENTION_MASKS="0",
+            LEAGLE_ATTENTION_MASK_CACHE_MB="3",
+        )
+    ).flatten()
+    assert not overridden["leagle_chunked_loss"]
+    assert not overridden["leagle_candidate_backward_recompute"]
+    assert overridden["leagle_reuse_training_kv"]
+    assert overridden["leagle_sparse_attention"]
+    assert overridden["leagle_attn_chunk_size"] == 32
+    assert not overridden["leagle_masked_head"]
+    assert overridden["leagle_teacher_cache_mb"] == 256
+    assert overridden["leagle_attention_mask_cache_mb"] == 3
+    assert not overridden["leagle_align_candidate_chunks"]
+    assert not overridden["leagle_selective_checkpoint"]
+    assert not overridden["leagle_cache_attention_masks"]
+
+
 @pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])
 def test_default_recipes_resolve_without_changing_training_budget(algorithm):
     flags = launch_args(algorithm, MODEL="model")
@@ -89,6 +211,7 @@ def test_default_recipes_resolve_without_changing_training_budget(algorithm):
     assert args["adam_beta1"] == 0.9
     assert args["epochs"] == 5
     assert args["ttt_steps"] == 7
+    assert args["log_freq"] == (10 if algorithm == "leagle" else 1)
     assert args["num_layers"] == args["num_loops"] == 1
     assert args["draft_vocab_size"] == 151936
     assert args["target_layer_ids"] == (
@@ -228,6 +351,47 @@ def test_memory_flags_can_be_disabled():
     ).flatten()
     assert not args["fsdp_shard"]
     assert not args["activation_checkpointing"]
+
+
+def test_priority_switches_keep_delete_policy_and_resume_overrides(tmp_path):
+    flags = (
+        "LEAGLE_TEACHER_CACHE",
+        "LEAGLE_TEACHER_CACHE_SUPERVISED",
+        "LEAGLE_SHARED_LOSS_NORMALIZATION",
+        "LEAGLE_STREAM_MAIN_LOSS",
+        "LEAGLE_SHARE_OUTPUT_HEAD",
+        "LEAGLE_FSDP_KEEP_FORWARD_PARAMS",
+    )
+    config = TrainConfig.resolve(
+        launch_args(
+            "leagle", MODEL="model", FSDP_SHARD="1", **dict.fromkeys(flags, "1")
+        )
+    )
+    assert all(config.flatten()[name.lower()] for name in flags)
+    assert config.flatten()["on_generate"] == "delete"
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(config.dump_yaml())
+    for overrides, enabled in (({}, True), (dict.fromkeys(flags, "0"), False)):
+        resumed = TrainConfig.resolve(
+            launch_args(
+                "leagle", RESUME="1", OUTPUT_DIR=tmp_path.as_posix(), **overrides
+            )
+        ).flatten()
+        assert all(resumed[name.lower()] is enabled for name in flags)
+        assert resumed["on_generate"] == "delete"
+
+
+def test_leagle_log_frequency_can_be_overridden_on_new_and_resumed_runs(tmp_path):
+    original = TrainConfig.resolve(launch_args("leagle", MODEL="model", LOG_FREQ="3"))
+    assert original.flatten()["log_freq"] == 3
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(original.dump_yaml())
+    resumed = TrainConfig.resolve(
+        launch_args("leagle", RESUME="1", OUTPUT_DIR=tmp_path.as_posix(), LOG_FREQ="1")
+    )
+    assert resumed.flatten()["log_freq"] == 1
 
 
 @pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])

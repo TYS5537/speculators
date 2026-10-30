@@ -10,6 +10,8 @@ from torch import nn
 from torch.nn import functional
 
 from speculators.models.leagle.candidate_loss import CandidateLossAccumulator
+from speculators.models.leagle.candidate_recompute import RecomputedCandidateLoss
+from speculators.models.leagle.sparse_candidates import SparseCandidateLogits
 
 
 class LowRankCandidateHead(nn.Module):
@@ -37,8 +39,16 @@ class LowRankCandidateHead(nn.Module):
     def coarse_logits(self, hidden_states):
         return self.up_proj(self.down_proj(hidden_states))
 
-    def loss_accumulator(self):
-        return CandidateLossAccumulator(self)
+    def loss_accumulator(
+        self, *, grad_addmm=False, valid_only=False, backward_recompute=False
+    ):
+        if backward_recompute:
+            # Replay always accumulates complete-step products in FP32 and keeps
+            # masked rows, regardless of the streamed path's execution options.
+            return RecomputedCandidateLoss(self)
+        return CandidateLossAccumulator(
+            self, grad_addmm=grad_addmm, valid_only=valid_only
+        )
 
     def distillation_loss(self, hidden_states, full_weight, mask, *, top_k, chunk_size):
         """Return summed KL(W h || A B h), top-1 recall count and valid count.
@@ -52,7 +62,7 @@ class LowRankCandidateHead(nn.Module):
         )
         return accumulator.loss(), recall, count
 
-    def forward(self, hidden_states, full_weight, top_k: int):
+    def forward(self, hidden_states, full_weight, top_k: int, *, sparse=False):
         vocab_size = self.up_proj.out_features
         if not 1 <= top_k <= vocab_size:
             raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
@@ -62,6 +72,8 @@ class LowRankCandidateHead(nn.Module):
         # Only M rows of W[V,H] take part in the full-width dot product.
         rows = functional.embedding(candidates, full_weight)
         exact = torch.matmul(rows, hidden_states.unsqueeze(-1)).squeeze(-1)
+        if sparse:
+            return SparseCandidateLogits(candidates, exact, vocab_size)
         logits = hidden_states.new_full(
             (*hidden_states.shape[:-1], vocab_size), -torch.inf
         )

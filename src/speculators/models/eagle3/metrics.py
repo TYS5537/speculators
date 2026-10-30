@@ -62,18 +62,31 @@ class EagleTrainingMetrics:
             self.counts[f"position_{step}_acc_total"] = count.new_zeros(())
 
     @torch.no_grad()
-    def update(self, logits, targets, step):
+    def update(
+        self, logits, targets, step, *, draft_ids=None, target_ids=None, overlap=None
+    ):
+        """Reuse optional full-sequence IDs and an already aligned overlap vector."""
         length = self.valid.shape[1] - step
         if length <= 0:
             return
         logits = logits[:, :length]
         targets = targets[:, step:]
+        draft_ids = logits.argmax(-1) if draft_ids is None else draft_ids[:, :length]
+        target_ids = targets.argmax(-1) if target_ids is None else target_ids[:, step:]
+        if overlap is None:
+            overlap = _distribution_overlap(logits, targets)
+        self.update_aligned(draft_ids, target_ids, overlap, step)
+
+    @torch.no_grad()
+    def update_aligned(self, draft_ids, target_ids, overlap, step):
+        """Accept per-position summaries from a streamed output head."""
+        length = self.valid.shape[1] - step
         valid = (
             self.valid[:, :length]
             & self.valid[:, step:]
             & (self.document_ids[:, :length] == self.document_ids[:, step:])
         )
-        correct = (logits.argmax(-1) == targets.argmax(-1)) & valid
+        correct = (draft_ids == target_ids) & valid
         correct_count = correct.sum(dtype=torch.float32)
         total = valid.sum(dtype=torch.float32)
         self.counts[f"position_{step}_acc_sum"] = correct_count
@@ -84,7 +97,6 @@ class EagleTrainingMetrics:
         # Never restart a prefix after a masked or incorrect intermediate slot.
         self.correct_prefix[:, :length] &= correct
         self.counts["eal_sum"] += self.correct_prefix[:, :length].sum()
-        overlap = _distribution_overlap(logits, targets)
         self.overlap_prefix[:, :length] *= torch.where(valid, overlap, 0.0)
         self.counts["accept_len_sum"] += self.overlap_prefix[:, :length].sum()
 
@@ -139,6 +151,8 @@ def compute_metrics(
     ttt_step: int,
     ttt_step_loss_decay: float,
     loss_config: LossConfig | None = None,
+    *,
+    collect_metrics: bool = True,
 ) -> tuple[torch.Tensor, dict]:
     """Compute metrics for a given ttt_step.
 
@@ -150,6 +164,7 @@ def compute_metrics(
         ttt_step: The current ttt_step.
         ttt_step_loss_decay: The loss decay for the current ttt_step.
         loss_config: Mapping of ``{name: (loss_fn, weight)}``.
+        collect_metrics: False skips legacy accuracy/diagnostic construction.
 
     Effects:
         Modifies prev_correct in place.
@@ -179,6 +194,8 @@ def compute_metrics(
         loss_config=loss_config,
         decay_fn=partial(exp_loss_decay, gamma=ttt_step_loss_decay),
     )
+    if not collect_metrics:
+        return s_loss, {}
 
     pred_ids = torch.argmax(s_logits, dim=-1)
     target_ids = torch.argmax(s_targets, dim=-1)

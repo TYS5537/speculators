@@ -6,6 +6,7 @@ depth (loop, physical layer), even though all loops share the layer weights.
 
 import torch
 from torch import nn
+from torch.utils.checkpoint import checkpoint
 from transformers.models.qwen3.modeling_qwen3 import (
     ALL_ATTENTION_FUNCTIONS,
     Qwen3MLP,
@@ -16,6 +17,11 @@ from transformers.models.qwen3.modeling_qwen3 import (
 from speculators.models.dflash.model_definitions import (
     Qwen3DFlashAttention,
     apply_rotary_pos_emb,
+)
+from speculators.models.leagle.cache import StaticDraftKV
+from speculators.models.leagle.sparse_attention import (
+    TrajectoryAttention,
+    trajectory_attention,
 )
 
 DraftKV = tuple[torch.Tensor, torch.Tensor]
@@ -42,9 +48,10 @@ class LEagleAttention(Qwen3DFlashAttention):
         target_hidden,
         position_embeddings,
         attention_mask,
-        past_draft_kv: DraftKV | None = None,
+        past_draft_kv: DraftKV | StaticDraftKV | None = None,
         context_kv: DraftKV | None = None,
-    ) -> tuple[torch.Tensor, DraftKV]:
+        return_context_kv: bool = False,
+    ):
         batch, query_length = hidden_states.shape[:2]
         context_length = target_hidden.shape[1]
         query = self.q_norm(
@@ -63,26 +70,56 @@ class LEagleAttention(Qwen3DFlashAttention):
                 .transpose(1, 2)
             )
         else:
-            if self.training or torch.is_grad_enabled():
+            if (self.training or torch.is_grad_enabled()) and not return_context_kv:
                 raise ValueError("Precomputed LEAGLE context KV is inference-only")
             context_key, context_value = context_kv
             draft_key = self.k_norm(
                 self.k_proj(hidden_states).view(batch, query_length, -1, self.head_dim)
             ).transpose(1, 2)
             query, draft_key = apply_rotary_pos_emb(
-                query, draft_key, *position_embeddings
+                query,
+                draft_key,
+                *(value[:, -query_length:] for value in position_embeddings),
             )
         draft_value = (
             self.v_proj(hidden_states)
             .view(batch, query_length, -1, self.head_dim)
             .transpose(1, 2)
         )
-        if past_draft_kv is not None:
+        if past_draft_kv is not None and not isinstance(past_draft_kv, StaticDraftKV):
             draft_key = torch.cat([past_draft_kv[0], draft_key], dim=-2)
             draft_value = torch.cat([past_draft_kv[1], draft_value], dim=-2)
-        # The immutable target prefix is never appended to the draft cache.
-        key = torch.cat([context_key, draft_key], dim=-2)
-        value = torch.cat([context_value, draft_value], dim=-2)
+        output, present = self._attend(
+            query,
+            context_key,
+            context_value,
+            draft_key,
+            draft_value,
+            attention_mask,
+            past_draft_kv,
+        )
+        output = self.o_proj(output.reshape(batch, query_length, -1))
+        result = (output, present)
+        return (*result, (context_key, context_value)) if return_context_kv else result
+
+    def _attend(
+        self, query, context_key, context_value, draft_key, draft_value, mask, cache
+    ):
+        if isinstance(mask, TrajectoryAttention):
+            output = trajectory_attention(
+                self, mask, query, context_key, context_value, draft_key, draft_value
+            )
+            return output, (draft_key, draft_value)
+        if isinstance(cache, StaticDraftKV):
+            key, value = cache.append_draft(
+                context_key, context_value, draft_key, draft_value
+            )
+            present = cache
+        else:
+            # The immutable target prefix is never appended to the draft cache.
+            key = torch.cat([context_key, draft_key], dim=-2)
+            value = torch.cat([context_value, draft_value], dim=-2)
+            present = (draft_key, draft_value)
         implementation = self.config._attn_implementation  # noqa: SLF001
         attention = (
             eager_attention_forward
@@ -94,12 +131,11 @@ class LEagleAttention(Qwen3DFlashAttention):
             query,
             key,
             value,
-            attention_mask,
+            mask,
             scaling=self.scaling,
             dropout=self.attention_dropout if self.training else 0.0,
         )
-        output = self.o_proj(output.reshape(batch, query_length, -1))
-        return output, (draft_key, draft_value)
+        return output, present
 
 
 class LEagleDecoderLayer(nn.Module):
@@ -120,17 +156,32 @@ class LEagleDecoderLayer(nn.Module):
         attention_mask,
         past_draft_kv=None,
         context_kv=None,
+        return_context_kv=False,
+        checkpoint_mlp=False,
     ):
-        attention, present = self.self_attn(
+        result = self.self_attn(
             self.input_layernorm(hidden_states),
             target_hidden,
             position_embeddings,
             attention_mask,
             past_draft_kv,
             context_kv,
+            return_context_kv,
         )
+        attention, present = result[:2]
         hidden_states = hidden_states + attention
-        hidden_states = hidden_states + self.mlp(
-            self.post_attention_layernorm(hidden_states)
+        mlp_output = (
+            checkpoint(
+                self._mlp_forward,
+                hidden_states,
+                use_reentrant=False,
+                preserve_rng_state=True,
+            )
+            if checkpoint_mlp and torch.is_grad_enabled()
+            else self._mlp_forward(hidden_states)
         )
-        return hidden_states, present
+        hidden_states = hidden_states + mlp_output
+        return hidden_states, present, *result[2:]
+
+    def _mlp_forward(self, hidden_states):
+        return self.mlp(self.post_attention_layernorm(hidden_states))

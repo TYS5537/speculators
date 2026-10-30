@@ -22,8 +22,11 @@ def deterministic_cpu():
 @pytest.mark.parametrize("precision", ["fp32", "bf16", "autocast"])
 @pytest.mark.parametrize("chunk_size", [2, 32])
 @pytest.mark.parametrize("frozen", [None, "down_proj", "up_proj"])
+@pytest.mark.parametrize(
+    ("grad_addmm", "valid_only"), [(False, False), (True, False), (True, True)]
+)
 def test_streamed_ttt_gradients_match_autograd_with_masks_decay_and_loss_scaling(
-    precision, chunk_size, frozen
+    precision, chunk_size, frozen, grad_addmm, valid_only
 ):
     dtype = torch.bfloat16 if precision == "bf16" else torch.float32
     head = LowRankCandidateHead(16, 24, 4, initializer_range=0.1).to(dtype)
@@ -32,7 +35,7 @@ def test_streamed_ttt_gradients_match_autograd_with_masks_decay_and_loss_scaling
     reference = copy.deepcopy(head)
     weight = torch.randn(24, 16, dtype=dtype, requires_grad=True)
     inputs, teachers = [], []
-    accumulator = head.loss_accumulator()
+    accumulator = head.loss_accumulator(grad_addmm=grad_addmm, valid_only=valid_only)
     expected = torch.zeros(())
     context = (
         torch.autocast("cpu", dtype=torch.bfloat16)

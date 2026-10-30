@@ -168,7 +168,7 @@ def validate_checkpoint_files(args):
                 )
 
 
-def write_eval_provenance(args, metadata=None):
+def write_eval_provenance(args, metadata=None, *, argv=None):
     helpers = _helpers()
     repo = helpers.find_package_repo("speculators")
     command = "\n".join(
@@ -177,7 +177,7 @@ def write_eval_provenance(args, metadata=None):
             f"# Git SHA: {helpers.git_sha(repo)}",
             f"# Python: {sys.executable}",
             *helpers.package_versions(),
-            shlex.join([sys.executable, *sys.argv]),
+            shlex.join([sys.executable, *(sys.argv if argv is None else argv)]),
         ]
     )
     helpers.atomic_write(args.output_dir / "eval_command.txt", command + "\n")
