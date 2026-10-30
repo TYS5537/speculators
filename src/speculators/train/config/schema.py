@@ -510,6 +510,18 @@ class TrainerArgs(_Group):
         gt=0,
         description="Persistent teacher probability/ID cache budget in MiB per rank.",
     )
+    leagle_cache_frozen_head_weights: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_cache_frozen_head_weights"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Reuse frozen FP32 output-weight casts within a chunked autocast "
+        "forward/backward; retains one low-precision copy per distinct weight.",
+    )
+    leagle_cache_teacher_indices: bool = Field(
+        default=LEAGLE_DEFAULTS["leagle_cache_teacher_indices"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Plan teacher cache hit/miss indices once per TTT step and reuse "
+        "them during checkpoint replay; requires teacher cache.",
+    )
     leagle_masked_head: bool = Field(
         default=LEAGLE_DEFAULTS["leagle_masked_head"],
         json_schema_extra=_CLI_BOOL_OPTIONAL,
@@ -567,6 +579,23 @@ class TrainerArgs(_Group):
         default=LEAGLE_RUNTIME_DEFAULTS["leagle_share_output_head"],
         json_schema_extra=_CLI_BOOL_OPTIONAL,
         description="Share exactly identical frozen draft and teacher output weights.",
+    )
+    leagle_ddp_gradient_as_bucket_view: bool = Field(
+        default=LEAGLE_RUNTIME_DEFAULTS["leagle_ddp_gradient_as_bucket_view"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Use DDP gradient bucket views; requires non-FSDP training.",
+    )
+    leagle_ddp_batched_grad_copy: bool = Field(
+        default=LEAGLE_RUNTIME_DEFAULTS["leagle_ddp_batched_grad_copy"],
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="Batch DDP gradient copies/divisions when supported by PyTorch; "
+        "unsupported runtimes warn and record a disabled value.",
+    )
+    leagle_ddp_bucket_cap_mb: int | None = Field(
+        default=LEAGLE_RUNTIME_DEFAULTS["leagle_ddp_bucket_cap_mb"],
+        gt=0,
+        description="Optional DDP bucket size in MiB. Unset uses the PyTorch default; "
+        "the numerical master set to false clears this override.",
     )
     max_grad_norm: float = Field(
         default=1.0,
@@ -1067,6 +1096,8 @@ class TrainConfig(BaseSettings):
             or self.trainer.leagle_candidate_grad_addmm
             or self.trainer.leagle_candidate_backward_recompute
             or self.trainer.leagle_teacher_cache
+            or self.trainer.leagle_cache_frozen_head_weights
+            or self.trainer.leagle_cache_teacher_indices
             or self.trainer.leagle_masked_head
             or self.trainer.leagle_teacher_cache_supervised
             or self.trainer.leagle_shared_loss_normalization
@@ -1076,6 +1107,9 @@ class TrainConfig(BaseSettings):
             or self.trainer.leagle_cache_attention_masks
             or self.trainer.leagle_fsdp_keep_forward_params
             or self.trainer.leagle_share_output_head
+            or self.trainer.leagle_ddp_gradient_as_bucket_view
+            or self.trainer.leagle_ddp_batched_grad_copy
+            or self.trainer.leagle_ddp_bucket_cap_mb is not None
         )
         if enabled and self.speculator_type != "leagle":
             raise ValueError(
@@ -1093,6 +1127,14 @@ class TrainConfig(BaseSettings):
             raise ValueError("Supervised teacher cache requires --leagle-teacher-cache")
         if self.trainer.leagle_fsdp_keep_forward_params and not self.trainer.fsdp_shard:
             raise ValueError("LEAGLE parameter retention requires --fsdp-shard")
+        from speculators.train.ddp_options import validate_ddp_options  # noqa: PLC0415
+
+        validate_ddp_options(self.trainer)
+        if (
+            self.trainer.leagle_cache_teacher_indices
+            and not self.trainer.leagle_teacher_cache
+        ):
+            raise ValueError("Teacher index plans require --leagle-teacher-cache")
         if (
             self.trainer.leagle_selective_checkpoint
             or self.trainer.leagle_cache_attention_masks

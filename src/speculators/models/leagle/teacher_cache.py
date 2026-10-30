@@ -1,5 +1,7 @@
 """Budgeted, forward-local teacher probabilities for eager CE/TV/forward KL."""
 
+from dataclasses import dataclass
+
 import torch
 from torch.nn import functional
 
@@ -36,6 +38,14 @@ def _distribution(hidden, weight, *, shared_normalization=False):
     return probabilities, logits.argmax(-1)
 
 
+@dataclass(frozen=True)
+class TeacherLookupPlan:
+    width: int
+    slots: torch.Tensor
+    hits: torch.Tensor | None = None
+    misses: torch.Tensor | None = None
+
+
 class TeacherCache:
     """Cache a fixed prefix or supervised subset, recomputing uncached positions.
 
@@ -55,8 +65,10 @@ class TeacherCache:
         chunk_size,
         priority_mask=None,
         shared_normalization=False,
+        cache_indices=False,
     ):
         self.shared_normalization = shared_normalization
+        self.cache_indices = cache_indices
         self.slots = None
         positions = None
         if priority_mask is not None:
@@ -92,7 +104,66 @@ class TeacherCache:
             self.ids[:, start:end].copy_(ids)
 
     @torch.no_grad()
-    def get(self, hidden, weight, *, start=0, indices=None):
+    def plan_chunks(self, length, chunk_size, *, start=0, indices=None):
+        """Build immutable lookup indices once per TTT step, outside checkpoint.
+
+        One small device-to-host read replaces per-chunk dynamic nonzero calls.
+        Pack all device indices into one transfer and retain only slice views for
+        backward replay. Prefix queries without compaction already use arithmetic.
+        Plans belong to this forward only; their small metadata is extra workspace
+        outside the probability cache budget.
+        """
+        if not self.cache_indices or (self.slots is None and indices is None):
+            return None
+        if chunk_size < 1 or length < 0:
+            raise ValueError("Teacher lookup plans need valid length and chunk size")
+        values = (
+            self.slots[start : start + length]
+            if indices is None
+            else self.slots[indices]
+            if self.slots is not None
+            else indices
+        ).tolist()
+        if len(values) != length:
+            raise ValueError("Teacher lookup indices must align with the query length")
+        packed, layouts = [], []
+        indexed = self.slots is not None
+        for offset in range(0, length, chunk_size):
+            part = values[offset : offset + chunk_size]
+            hits = [i for i, slot in enumerate(part) if slot >= 0] if indexed else []
+            misses = [i for i, slot in enumerate(part) if slot < 0] if indexed else []
+            slots = (
+                [part[i] for i in hits]
+                if indexed
+                else [i for i in part if i < self.rows]
+            )
+            layouts.append((len(part), len(packed), len(slots), len(misses)))
+            packed.extend(slots)
+            packed.extend(hits)
+            packed.extend(misses)
+        metadata = torch.tensor(packed, device=self.probs.device, dtype=torch.long)
+        return tuple(
+            TeacherLookupPlan(
+                width,
+                metadata[offset : offset + count],
+                metadata[offset + count : offset + 2 * count] if indexed else None,
+                metadata[offset + 2 * count : offset + 2 * count + missing]
+                if indexed
+                else None,
+            )
+            for width, offset, count, missing in layouts
+        )
+
+    @torch.no_grad()
+    def get(self, hidden, weight, *, start=0, indices=None, plan=None):
+        if plan is not None:
+            if plan.width != hidden.shape[1]:
+                raise ValueError("Teacher lookup plan must align with the query length")
+            if plan.hits is not None:
+                return self._indexed_get(hidden, weight, plan=plan)
+            return self._complete_prefix(
+                hidden, weight, self.probs[:, plan.slots], self.ids[:, plan.slots]
+            )
         if self.slots is not None:
             positions = (
                 torch.arange(start, start + hidden.shape[1], device=hidden.device)
@@ -109,6 +180,10 @@ class TeacherCache:
             cached = indices[indices < self.rows]
             count = cached.numel()
             probabilities, ids = self.probs[:, cached], self.ids[:, cached]
+        return self._complete_prefix(hidden, weight, probabilities, ids)
+
+    def _complete_prefix(self, hidden, weight, probabilities, ids):
+        count = probabilities.shape[1]
         if count == hidden.shape[1]:
             return probabilities, ids
         extra_probs, extra_ids = _distribution(
@@ -121,24 +196,28 @@ class TeacherCache:
             torch.cat((ids, extra_ids), dim=1),
         )
 
-    def _indexed_get(self, hidden, weight, positions):
-        slots = self.slots[positions]
-        hits = (slots >= 0).nonzero(as_tuple=True)[0]
-        misses = (slots < 0).nonzero(as_tuple=True)[0]
+    def _indexed_get(self, hidden, weight, positions=None, *, plan=None):
+        if plan is None:
+            slots = self.slots[positions]
+            hits = (slots >= 0).nonzero(as_tuple=True)[0]
+            misses = (slots < 0).nonzero(as_tuple=True)[0]
+            cached = slots[hits] if misses.numel() else slots
+        else:
+            cached, hits, misses = plan.slots, plan.hits, plan.misses
         if not misses.numel():
-            return self.probs[:, slots], self.ids[:, slots]
+            return self.probs[:, cached], self.ids[:, cached]
         extra_probs, extra_ids = _distribution(
             hidden[:, misses], weight, shared_normalization=self.shared_normalization
         )
         if not hits.numel():
             return extra_probs, extra_ids
         probabilities = extra_probs.new_empty(
-            (1, positions.numel(), self.probs.shape[-1])
+            (1, hidden.shape[1], self.probs.shape[-1])
         )
-        ids = self.ids.new_empty((1, positions.numel()))
+        ids = self.ids.new_empty((1, hidden.shape[1]))
         probabilities[:, hits], ids[:, hits] = (
-            self.probs[:, slots[hits]],
-            self.ids[:, slots[hits]],
+            self.probs[:, cached],
+            self.ids[:, cached],
         )
         probabilities[:, misses], ids[:, misses] = extra_probs, extra_ids
         return probabilities, ids

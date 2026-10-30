@@ -84,6 +84,7 @@ def test_numerical_off_overrides_all_members_and_implicit_dependencies(
     assert not any(result[name] for name in NUMERICAL_OPTIONS)
     assert not result["leagle_teacher_cache"]
     assert not result["leagle_teacher_cache_supervised"]
+    assert not result["leagle_cache_frozen_head_weights"]
     assert not result["leagle_selective_checkpoint"]
     assert not result["leagle_cache_attention_masks"]
     assert result["leagle_share_output_head"] is safe
@@ -114,7 +115,13 @@ def test_numerical_on_expands_only_existing_capabilities(parse, candidate, safe)
     assert result["leagle_candidate_grad_addmm"] is candidate
     assert result["leagle_align_candidate_chunks"] is candidate
     assert not result["leagle_candidate_backward_recompute"]
-    assert all(result[name] is safe for name in SAFE_OPTIONS)
+    assert all(
+        result[name] is safe
+        for name in SAFE_OPTIONS
+        if name != "leagle_ddp_gradient_as_bucket_view"
+    )
+    assert not result["leagle_ddp_gradient_as_bucket_view"]
+    assert not result["leagle_ddp_batched_grad_copy"]
     assert result["candidate_head"] is candidate
 
 
@@ -123,10 +130,13 @@ def test_safe_alone_never_enables_chunking_or_sparse_attention(parse):
     result = parse([*BASE, "--leagle-safe-optimizations"])
     assert not any(result[name] for name in NUMERICAL_OPTIONS)
     assert not result["leagle_teacher_cache"]
+    assert not result["leagle_cache_frozen_head_weights"]
+    assert not result["leagle_cache_teacher_indices"]
     assert not result["leagle_cache_attention_masks"]
     assert not result["leagle_selective_checkpoint"]
     assert not result["leagle_fsdp_keep_forward_params"]
     assert result["leagle_share_output_head"]
+    assert result["leagle_ddp_gradient_as_bucket_view"]
 
 
 @pytest.mark.parametrize("parse", [typed, legacy])
@@ -141,6 +151,8 @@ def test_safe_uses_individually_selected_prerequisites(parse):
     )
     assert result["leagle_teacher_cache"]
     assert result["leagle_teacher_cache_supervised"]
+    assert result["leagle_cache_frozen_head_weights"]
+    assert result["leagle_cache_teacher_indices"]
     assert result["leagle_cache_attention_masks"]
     assert not result["leagle_selective_checkpoint"]  # No activation checkpointing.
 

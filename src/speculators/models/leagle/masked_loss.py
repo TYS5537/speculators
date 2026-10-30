@@ -19,6 +19,14 @@ def masked_training_step(objective, hidden, step, step_mask):
     mask = step_mask[:, step:]
     gradients = main_head_gradients(objective, hidden, step, mask)
     indices = mask[0].nonzero(as_tuple=True)[0]
+    all_target_indices = indices + step
+    plans = (
+        objective.teacher_cache.plan_chunks(
+            indices.numel(), objective.chunk_size, indices=all_target_indices
+        )
+        if objective.teacher_cache is not None
+        else None
+    )
     parts = [[] for _ in objective.loss_config]
     ids, labels, overlaps = [], [], []
     candidate_mask = objective.valid[:, :width] & mask
@@ -27,13 +35,16 @@ def masked_training_step(objective, hidden, step, step_mask):
     ).clamp_min(1)
     for start in range(0, indices.numel(), objective.chunk_size):
         selected = indices[start : start + objective.chunk_size]
-        target_indices = selected + step
+        target_indices = all_target_indices[start : start + objective.chunk_size]
         function = partial(
             _project_chunk,
             loss_config=objective.loss_config,
             metrics=objective.collect_metrics,
             candidate=model.candidate_head is not None,
             teacher_cache=objective.teacher_cache,
+            teacher_plan=plans[start // objective.chunk_size]
+            if plans is not None
+            else None,
             target_indices=target_indices,
             predict=objective.collect_metrics,
             shared_normalization=objective.shared_normalization,
@@ -41,8 +52,8 @@ def masked_training_step(objective, hidden, step, step_mask):
         arguments = (
             hidden[:, selected],
             objective.targets[:, target_indices],
-            model.lm_head.weight,
-            model.verifier_lm_head.weight,
+            objective.draft_weight,
+            objective.teacher_weight,
         )
         result = (
             gradients.project(function, arguments, selected)
@@ -90,7 +101,7 @@ def masked_training_step(objective, hidden, step, step_mask):
             step,
         )
     predictions = (
-        predict_chunks(model, hidden, objective.chunk_size)
+        predict_chunks(hidden, objective.draft_weight, objective.chunk_size)
         if objective.need_predictions
         else None
     )

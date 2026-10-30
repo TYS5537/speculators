@@ -134,6 +134,46 @@ def test_eagle_script_ignores_leagle_optimization_masters():
     assert config.trainer.leagle_numerical_optimizations is None
 
 
+def test_ddp_script_options_and_resume(tmp_path):
+    flags = ("LEAGLE_DDP_GRADIENT_AS_BUCKET_VIEW", "LEAGLE_DDP_BATCHED_GRAD_COPY")
+    config = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            MODEL="model",
+            FSDP_SHARD="0",
+            **dict.fromkeys(flags, "1"),
+            LEAGLE_TEACHER_CACHE="1",
+            LEAGLE_CACHE_TEACHER_INDICES="1",
+            LEAGLE_DDP_BUCKET_CAP_MB="64",
+        )
+    )
+    assert all(config.flatten()[name.lower()] for name in flags)
+    assert config.trainer.leagle_cache_teacher_indices
+    assert config.trainer.leagle_ddp_bucket_cap_mb == 64
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(config.dump_yaml())
+    resumed = TrainConfig.resolve(
+        launch_args("leagle", RESUME="1", OUTPUT_DIR=tmp_path.as_posix())
+    )
+    assert resumed.trainer.leagle_ddp_bucket_cap_mb == 64
+    assert resumed.trainer.leagle_cache_teacher_indices
+    assert all(resumed.flatten()[name.lower()] for name in flags)
+    overridden = TrainConfig.resolve(
+        launch_args(
+            "leagle",
+            RESUME="1",
+            OUTPUT_DIR=tmp_path.as_posix(),
+            **dict.fromkeys(flags, "0"),
+            LEAGLE_CACHE_TEACHER_INDICES="0",
+            LEAGLE_DDP_BUCKET_CAP_MB="32",
+        )
+    )
+    assert overridden.trainer.leagle_ddp_bucket_cap_mb == 32
+    assert not overridden.trainer.leagle_cache_teacher_indices
+    assert not any(overridden.flatten()[name.lower()] for name in flags)
+
+
 def test_leagle_optimization_script_resume_inherits_or_explicitly_overrides(tmp_path):
     names = (
         "LEAGLE_REUSE_TRAINING_KV",
@@ -357,6 +397,8 @@ def test_priority_switches_keep_delete_policy_and_resume_overrides(tmp_path):
     flags = (
         "LEAGLE_TEACHER_CACHE",
         "LEAGLE_TEACHER_CACHE_SUPERVISED",
+        "LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS",
+        "LEAGLE_CACHE_TEACHER_INDICES",
         "LEAGLE_SHARED_LOSS_NORMALIZATION",
         "LEAGLE_STREAM_MAIN_LOSS",
         "LEAGLE_SHARE_OUTPUT_HEAD",
@@ -392,6 +434,29 @@ def test_leagle_log_frequency_can_be_overridden_on_new_and_resumed_runs(tmp_path
         launch_args("leagle", RESUME="1", OUTPUT_DIR=tmp_path.as_posix(), LOG_FREQ="1")
     )
     assert resumed.flatten()["log_freq"] == 1
+
+
+def test_leagle_profile_frequency_can_be_overridden_on_new_and_resumed_runs(tmp_path):
+    defaults = TrainConfig.resolve(launch_args("leagle", MODEL="model"))
+    assert defaults.flatten()["profile_freq"] == 0
+    original = TrainConfig.resolve(
+        launch_args("leagle", MODEL="model", PROFILE_FREQ="10")
+    )
+    assert original.flatten()["profile_freq"] == 10
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(original.dump_yaml())
+    for overrides, expected in (
+        ({}, 10),
+        ({"PROFILE_FREQ": "0"}, 0),
+        ({"PROFILE_FREQ": "5"}, 5),
+    ):
+        resumed = TrainConfig.resolve(
+            launch_args(
+                "leagle", RESUME="1", OUTPUT_DIR=tmp_path.as_posix(), **overrides
+            )
+        )
+        assert resumed.flatten()["profile_freq"] == expected
 
 
 @pytest.mark.parametrize("algorithm", ["eagle3", "leagle"])

@@ -192,7 +192,7 @@ def build_train_parser() -> argparse.ArgumentParser:
         **GROUP_DEFAULTS,
     }.items():
         flag = "--" + name.replace("_", "-")
-        if isinstance(default, bool) or default is None:
+        if isinstance(default, bool) or name in GROUP_DEFAULTS:
             parser.add_argument(
                 flag, action=argparse.BooleanOptionalAction, default=default
             )
@@ -279,8 +279,11 @@ def _validate_leagle_args(parser, args) -> None:
 
 
 def _validate_leagle_optimizations(parser, args):
+    from speculators.train.ddp_options import validate_ddp_options  # noqa: PLC0415
+
     try:
         vars(args).update(resolve_optimization_groups(vars(args)))
+        validate_ddp_options(args)
     except ValueError as exc:
         parser.error(str(exc))
     enabled = (
@@ -290,6 +293,8 @@ def _validate_leagle_optimizations(parser, args):
         or args.leagle_candidate_grad_addmm
         or args.leagle_candidate_backward_recompute
         or args.leagle_teacher_cache
+        or args.leagle_cache_frozen_head_weights
+        or args.leagle_cache_teacher_indices
         or args.leagle_masked_head
         or args.leagle_teacher_cache_supervised
         or args.leagle_shared_loss_normalization
@@ -299,6 +304,9 @@ def _validate_leagle_optimizations(parser, args):
         or args.leagle_cache_attention_masks
         or args.leagle_fsdp_keep_forward_params
         or args.leagle_share_output_head
+        or args.leagle_ddp_gradient_as_bucket_view
+        or args.leagle_ddp_batched_grad_copy
+        or args.leagle_ddp_bucket_cap_mb is not None
     )
     if enabled and args.speculator_type != "leagle":
         parser.error("LEAGLE training optimizations require --speculator-type leagle")
@@ -320,6 +328,8 @@ def _validate_leagle_optimizations(parser, args):
         parser.error("Supervised teacher cache requires --leagle-teacher-cache")
     if args.leagle_fsdp_keep_forward_params and not args.fsdp_shard:
         parser.error("LEAGLE parameter retention requires --fsdp-shard")
+    if args.leagle_cache_teacher_indices and not args.leagle_teacher_cache:
+        parser.error("Teacher index plans require --leagle-teacher-cache")
     if (
         args.leagle_selective_checkpoint or args.leagle_cache_attention_masks
     ) and not args.leagle_sparse_attention:

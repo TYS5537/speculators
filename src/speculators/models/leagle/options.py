@@ -12,6 +12,8 @@ TRAINING_DEFAULTS = MappingProxyType(
         "leagle_candidate_grad_addmm": False,
         "leagle_candidate_backward_recompute": False,
         "leagle_teacher_cache": False,
+        "leagle_cache_frozen_head_weights": False,
+        "leagle_cache_teacher_indices": False,
         "leagle_teacher_cache_mb": 1024,
         "leagle_masked_head": False,
         "leagle_teacher_cache_supervised": False,
@@ -28,5 +30,8 @@ RUNTIME_DEFAULTS = MappingProxyType(
     {
         "leagle_fsdp_keep_forward_params": False,
         "leagle_share_output_head": False,
+        "leagle_ddp_gradient_as_bucket_view": False,
+        "leagle_ddp_batched_grad_copy": False,
+        "leagle_ddp_bucket_cap_mb": None,
     }
 )

@@ -36,6 +36,7 @@ SEED="${SEED:-42}"
 TRAIN_DATA_RATIO="${TRAIN_DATA_RATIO:-0.9}"
 LOGGER="${LOGGER:-tensorboard}"
 LOG_FREQ="${LOG_FREQ:-10}"  # Compute/log training diagnostics every N steps.
+PROFILE_FREQ="${PROFILE_FREQ:-}"  # Optional synchronized phase timing; 0 disables it.
 NOISE_STD="${NOISE_STD:-0.05}"
 
 # LEAGLE: Qwen3 KV-conditioned layers, shared loops, and seven AR token steps.
@@ -87,6 +88,10 @@ LEAGLE_CANDIDATE_GRAD_ADDMM="${LEAGLE_CANDIDATE_GRAD_ADDMM:-}"
 # Closer native gradients; extra forward/backward teacher projections, default off.
 LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE="${LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE:-}"
 LEAGLE_TEACHER_CACHE="${LEAGLE_TEACHER_CACHE:-}"
+# Reuse frozen FP32 -> BF16 head casts within a batch; retains a BF16 weight copy.
+LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS="${LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS:-}"
+# Reuse teacher hit/miss indices during checkpoint replay (SAFE group).
+LEAGLE_CACHE_TEACHER_INDICES="${LEAGLE_CACHE_TEACHER_INDICES:-}"
 LEAGLE_MASKED_HEAD="${LEAGLE_MASKED_HEAD:-}"
 LEAGLE_TEACHER_CACHE_SUPERVISED="${LEAGLE_TEACHER_CACHE_SUPERVISED:-}"
 LEAGLE_SHARED_LOSS_NORMALIZATION="${LEAGLE_SHARED_LOSS_NORMALIZATION:-}"  # FP32 only; BF16 uses reference losses.
@@ -97,6 +102,12 @@ LEAGLE_CACHE_ATTENTION_MASKS="${LEAGLE_CACHE_ATTENTION_MASKS:-}"
 LEAGLE_ATTENTION_MASK_CACHE_MB="${LEAGLE_ATTENTION_MASK_CACHE_MB:-}"  # New run: 64 MiB/rank.
 LEAGLE_FSDP_KEEP_FORWARD_PARAMS="${LEAGLE_FSDP_KEEP_FORWARD_PARAMS:-}"
 LEAGLE_SHARE_OUTPUT_HEAD="${LEAGLE_SHARE_OUTPUT_HEAD:-}"
+# DDP only: bucket views are SAFE; batched copies are NUMERICAL and version-gated.
+LEAGLE_DDP_GRADIENT_AS_BUCKET_VIEW="${LEAGLE_DDP_GRADIENT_AS_BUCKET_VIEW:-}"
+LEAGLE_DDP_BATCHED_GRAD_COPY="${LEAGLE_DDP_BATCHED_GRAD_COPY:-}"
+# Empty preserves PyTorch's bucket policy, or the saved value on resume.
+# NUMERICAL=0 resets this to the PyTorch default too.
+LEAGLE_DDP_BUCKET_CAP_MB="${LEAGLE_DDP_BUCKET_CAP_MB:-}"
 # Persistent teacher probabilities/IDs only; temporary chunk workspace is extra.
 LEAGLE_TEACHER_CACHE_MB="${LEAGLE_TEACHER_CACHE_MB:-}"  # New run: 1024 MiB/rank.
 # Empty uses 128 on a new run, or the saved size on resume.
@@ -225,13 +236,22 @@ else
     if [[ "$ACTIVATION_CHECKPOINTING" == 1 ]]; then TRAIN_ARGS+=(--activation-checkpointing); fi
 fi
 # Use this checkout and the selected Python environment for every worker.
+if [[ -n "$PROFILE_FREQ" ]]; then
+    if [[ ! "$PROFILE_FREQ" =~ ^[0-9]+$ ]]; then
+        echo "PROFILE_FREQ must be empty or a nonnegative integer." >&2; exit 2
+    fi
+    TRAIN_ARGS+=(--profile-freq "$PROFILE_FREQ")
+fi
 for setting in LEAGLE_SAFE_OPTIMIZATIONS LEAGLE_NUMERICAL_OPTIMIZATIONS \
     LEAGLE_REUSE_TRAINING_KV LEAGLE_CHUNKED_LOSS LEAGLE_SPARSE_ATTENTION \
-    LEAGLE_CANDIDATE_GRAD_ADDMM LEAGLE_TEACHER_CACHE LEAGLE_MASKED_HEAD \
+    LEAGLE_CANDIDATE_GRAD_ADDMM LEAGLE_TEACHER_CACHE LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS \
+    LEAGLE_CACHE_TEACHER_INDICES \
+    LEAGLE_MASKED_HEAD \
     LEAGLE_TEACHER_CACHE_SUPERVISED LEAGLE_SHARED_LOSS_NORMALIZATION \
     LEAGLE_STREAM_MAIN_LOSS LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE \
     LEAGLE_ALIGN_CANDIDATE_CHUNKS LEAGLE_SELECTIVE_CHECKPOINT LEAGLE_CACHE_ATTENTION_MASKS \
-    LEAGLE_FSDP_KEEP_FORWARD_PARAMS LEAGLE_SHARE_OUTPUT_HEAD; do
+    LEAGLE_FSDP_KEEP_FORWARD_PARAMS LEAGLE_SHARE_OUTPUT_HEAD \
+    LEAGLE_DDP_GRADIENT_AS_BUCKET_VIEW LEAGLE_DDP_BATCHED_GRAD_COPY; do
     flag="${setting,,}"
     flag="${flag//_/-}"
     case "${!setting}" in
@@ -242,7 +262,7 @@ for setting in LEAGLE_SAFE_OPTIMIZATIONS LEAGLE_NUMERICAL_OPTIMIZATIONS \
     esac
 done
 for setting in LEAGLE_LOSS_CHUNK_SIZE LEAGLE_ATTN_CHUNK_SIZE LEAGLE_TEACHER_CACHE_MB \
-    LEAGLE_ATTENTION_MASK_CACHE_MB; do
+    LEAGLE_ATTENTION_MASK_CACHE_MB LEAGLE_DDP_BUCKET_CAP_MB; do
     if [[ -n "${!setting}" ]]; then
         if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
             echo "$setting must be a positive integer." >&2; exit 2

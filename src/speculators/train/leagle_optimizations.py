@@ -16,10 +16,13 @@ GROUP_DEFAULTS = {
 SAFE_OPTIONS = (
     "leagle_teacher_cache",
     "leagle_teacher_cache_supervised",
+    "leagle_cache_frozen_head_weights",
+    "leagle_cache_teacher_indices",
     "leagle_selective_checkpoint",
     "leagle_cache_attention_masks",
     "leagle_fsdp_keep_forward_params",
     "leagle_share_output_head",
+    "leagle_ddp_gradient_as_bucket_view",
 )
 NUMERICAL_OPTIONS = (
     "leagle_reuse_training_kv",
@@ -30,6 +33,7 @@ NUMERICAL_OPTIONS = (
     "leagle_shared_loss_normalization",
     "leagle_stream_main_loss",
     "leagle_align_candidate_chunks",
+    "leagle_ddp_batched_grad_copy",
 )
 _CANDIDATE_OPTIONS = (
     "leagle_candidate_grad_addmm",
@@ -45,7 +49,7 @@ _CHUNKED_OPTIONS = (
 )
 
 
-def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, bool]:
+def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, object]:
     """Return effective member settings without changing model/training recipes.
 
     Safe optimizations never introduce numerical prerequisites themselves. Turning
@@ -65,11 +69,15 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, bool
 
     updates = {}
     candidate = bool(options.get("candidate_head", False))
+    ddp = not bool(options.get("fsdp_shard", False))
     if numerical is not None:
         updates.update(dict.fromkeys(NUMERICAL_OPTIONS, numerical))
         for name in _CANDIDATE_OPTIONS:
             updates[name] = numerical and candidate
         updates["leagle_candidate_backward_recompute"] = candidate and not numerical
+        updates["leagle_ddp_batched_grad_copy"] = numerical and ddp
+        if not numerical:
+            updates["leagle_ddp_bucket_cap_mb"] = None
 
     effective = {**options, **updates}
     chunked = numerical is not False and any(
@@ -80,6 +88,8 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, bool
         updates.update(
             leagle_teacher_cache=safe and chunked,
             leagle_teacher_cache_supervised=safe and chunked,
+            leagle_cache_frozen_head_weights=safe and chunked,
+            leagle_cache_teacher_indices=safe and chunked,
             leagle_selective_checkpoint=(
                 safe and sparse and bool(options.get("activation_checkpointing", False))
             ),
@@ -88,6 +98,7 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, bool
                 safe and bool(options.get("fsdp_shard", False))
             ),
             leagle_share_output_head=safe,
+            leagle_ddp_gradient_as_bucket_view=safe and ddp,
         )
     if numerical is False:
         # Teacher caching implicitly enables chunking in model.forward. The safe
@@ -95,6 +106,8 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, bool
         updates.update(
             leagle_teacher_cache=False,
             leagle_teacher_cache_supervised=False,
+            leagle_cache_frozen_head_weights=False,
+            leagle_cache_teacher_indices=False,
             leagle_selective_checkpoint=False,
             leagle_cache_attention_masks=False,
         )

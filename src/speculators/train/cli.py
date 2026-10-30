@@ -15,6 +15,7 @@ from speculators.models.mtp.data import shift_batch_mtp
 from speculators.models.utils import get_verifier_config
 from speculators.train.config import TrainConfig
 from speculators.train.dataloader import create_train_val_loaders
+from speculators.train.ddp_options import apply_runtime_ddp_options
 from speculators.train.distributed import (
     get_rank,
     is_distributed,
@@ -240,7 +241,8 @@ def main(cfg: TrainConfig):  # noqa: C901
     model_class = type(draft_model)
     args.speculator_type = draft_model.config.speculators_model_type
     apply_runtime_optimization_groups(cfg, args, draft_model)
-    if any(getattr(args, name) is not None for name in GROUP_DEFAULTS):
+    ddp_updated = apply_runtime_ddp_options(cfg, args, distributed=is_distributed())
+    if ddp_updated or any(getattr(args, name) is not None for name in GROUP_DEFAULTS):
         if get_rank() == 0:
             cfg.save(args.save_path)
         logger.info(
@@ -366,6 +368,9 @@ def main(cfg: TrainConfig):  # noqa: C901
         fsdp_shard=args.fsdp_shard,
         leagle_fsdp_keep_forward_params=args.leagle_fsdp_keep_forward_params,
         leagle_share_output_head=args.leagle_share_output_head,
+        leagle_ddp_gradient_as_bucket_view=args.leagle_ddp_gradient_as_bucket_view,
+        leagle_ddp_batched_grad_copy=args.leagle_ddp_batched_grad_copy,
+        leagle_ddp_bucket_cap_mb=args.leagle_ddp_bucket_cap_mb,
         gradient_checkpointing=args.gradient_checkpointing,
         activation_checkpointing=args.activation_checkpointing,
         activation_checkpoint_layers=args.activation_checkpoint_layers,

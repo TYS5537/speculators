@@ -374,6 +374,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         cache_mb,
         *,
         candidate_recompute=False,
+        cache_indices=False,
     ):
         if candidate_addmm and self.candidate_head is None:
             raise ValueError(
@@ -385,6 +386,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         if cache_mb is not None and cache_mb < 1:
             raise ValueError("Teacher cache budget must be positive")
+        if cache_indices and cache_mb is None:
+            raise ValueError("Teacher index plans require --leagle-teacher-cache")
         if reuse_kv:
             validate_kv_reuse_rope(self.rotary_emb)
         if sparse_attention and self._attn_impl != "sdpa":
@@ -435,6 +438,10 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             "leagle_candidate_backward_recompute"
         ],
         leagle_teacher_cache=TRAINING_DEFAULTS["leagle_teacher_cache"],
+        leagle_cache_frozen_head_weights=TRAINING_DEFAULTS[
+            "leagle_cache_frozen_head_weights"
+        ],
+        leagle_cache_teacher_indices=TRAINING_DEFAULTS["leagle_cache_teacher_indices"],
         leagle_teacher_cache_mb=TRAINING_DEFAULTS["leagle_teacher_cache_mb"],
         leagle_masked_head=TRAINING_DEFAULTS["leagle_masked_head"],
         leagle_teacher_cache_supervised=TRAINING_DEFAULTS[
@@ -500,6 +507,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             leagle_candidate_grad_addmm,
             leagle_teacher_cache_mb if leagle_teacher_cache else None,
             candidate_recompute=leagle_candidate_backward_recompute,
+            cache_indices=leagle_cache_teacher_indices,
         )
         positions = self._training_positions(
             hidden_states, input_ids, document_ids, position_ids
@@ -526,6 +534,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 grad_addmm=leagle_candidate_grad_addmm,
                 candidate_backward_recompute=leagle_candidate_backward_recompute,
                 teacher_cache_mb=leagle_teacher_cache_mb if leagle_teacher_cache else 0,
+                cache_frozen_head_weights=leagle_cache_frozen_head_weights,
+                cache_teacher_indices=leagle_cache_teacher_indices,
                 masked_head=leagle_masked_head,
                 need_predictions=return_predictions or not teacher_forcing,
                 cache_supervised=leagle_teacher_cache_supervised,

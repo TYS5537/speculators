@@ -50,6 +50,7 @@ def _project_chunk(
     metrics,
     candidate,
     teacher_cache=None,
+    teacher_plan=None,
     target_start=0,
     target_indices=None,
     predict=True,
@@ -63,6 +64,7 @@ def _project_chunk(
                 teacher_weight,
                 start=target_start,
                 indices=target_indices,
+                plan=teacher_plan,
             )
         else:
             with torch.no_grad():
@@ -81,7 +83,11 @@ def _project_chunk(
         )
     if teacher_cache is not None:
         probabilities, target_ids = teacher_cache.get(
-            teacher_hidden, teacher_weight, start=target_start, indices=target_indices
+            teacher_hidden,
+            teacher_weight,
+            start=target_start,
+            indices=target_indices,
+            plan=teacher_plan,
         )
         terms, overlap = cached_terms(
             logits, probabilities, target_ids, loss_config, metrics
@@ -126,12 +132,10 @@ def _reduce_terms(parts, loss_config, mask, step, decay):
 
 
 @torch.no_grad()
-def predict_chunks(model, hidden, chunk_size):
+def predict_chunks(hidden, weight, chunk_size):
     return torch.cat(
         [
-            functional.linear(
-                hidden[:, start : start + chunk_size], model.lm_head.weight
-            ).argmax(-1)
+            functional.linear(hidden[:, start : start + chunk_size], weight).argmax(-1)
             for start in range(0, hidden.shape[1], chunk_size)
         ],
         dim=1,
@@ -141,6 +145,11 @@ def predict_chunks(model, hidden, chunk_size):
 def chunked_training_step(objective, hidden, step, step_mask):
     model = objective.model
     width = hidden.shape[1] - step
+    plans = (
+        objective.teacher_cache.plan_chunks(width, objective.chunk_size, start=step)
+        if objective.teacher_cache is not None
+        else None
+    )
     gradients = main_head_gradients(objective, hidden, step, step_mask[:, step:])
     parts = [[] for _ in objective.loss_config]
     predictions, target_ids, overlaps = [], [], []
@@ -163,6 +172,9 @@ def chunked_training_step(objective, hidden, step, step_mask):
                 function,
                 teacher_cache=objective.teacher_cache,
                 target_start=start + step,
+                teacher_plan=plans[start // objective.chunk_size]
+                if plans is not None
+                else None,
             )
             if objective.teacher_cache is not None
             else function
@@ -170,8 +182,8 @@ def chunked_training_step(objective, hidden, step, step_mask):
         arguments = (
             hidden[:, start:end],
             objective.targets[:, start + step : end + step],
-            model.lm_head.weight,
-            model.verifier_lm_head.weight,
+            objective.draft_weight,
+            objective.teacher_weight,
         )
         result = (
             gradients.project(project, arguments, slice(start, end))
@@ -207,7 +219,9 @@ def chunked_training_step(objective, hidden, step, step_mask):
         )
     if step and objective.need_predictions:
         predictions.append(
-            predict_chunks(model, hidden[:, width:], objective.chunk_size)
+            predict_chunks(
+                hidden[:, width:], objective.draft_weight, objective.chunk_size
+            )
         )
     loss = _reduce_terms(
         parts, objective.loss_config, step_mask[:, step:], step, objective.decay

@@ -29,6 +29,7 @@ from speculators.train.checkpointer import (
     SingleGPUCheckpointer,
     _rank0_only,
 )
+from speculators.train.ddp_options import resolve_ddp_options, validate_ddp_options
 from speculators.train.distributed import (
     apply_fully_sharded,
     get_local_rank,
@@ -234,6 +235,9 @@ class TrainerConfig(NamedTuple):
     max_grad_norm: float = 1.0
     leagle_fsdp_keep_forward_params: bool = False
     leagle_share_output_head: bool = False
+    leagle_ddp_gradient_as_bucket_view: bool = False
+    leagle_ddp_batched_grad_copy: bool = False
+    leagle_ddp_bucket_cap_mb: int | None = None
 
 
 def _resolve_scheduler_steps(
@@ -527,6 +531,7 @@ class Trainer:
     def setup_model(self):
         SpeculatorModel.verify_training_compatible(self.model)
         self._setup_activation_checkpointing()
+        validate_ddp_options(self.config)
 
         load_checkpoint = (
             self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1
@@ -537,6 +542,9 @@ class Trainer:
         if (
             self.config.leagle_fsdp_keep_forward_params
             or self.config.leagle_share_output_head
+            or self.config.leagle_ddp_gradient_as_bucket_view
+            or self.config.leagle_ddp_batched_grad_copy
+            or self.config.leagle_ddp_bucket_cap_mb is not None
         ) and self.model.config.speculators_model_type != "leagle":
             raise ValueError("LEAGLE runtime optimizations require a LEAGLE model")
         reference = (
@@ -601,7 +609,14 @@ class Trainer:
             dist.barrier()
 
         # DDP constructor broadcasts rank 0's params to all ranks
-        self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
+        options, updates = resolve_ddp_options(
+            self.config, constructor=DistributedDataParallel
+        )
+        if updates:
+            self.config = self.config._replace(**updates)
+        if options:
+            root_logger.info("LEAGLE DDP constructor options: %s", options)
+        self.model = DistributedDataParallel(self.model, **options)  # type: ignore[assignment]
 
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the

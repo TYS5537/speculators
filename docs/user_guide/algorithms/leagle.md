@@ -143,6 +143,8 @@ EAGLE3 / LEAGLE 默认日志采用与 DSpark 对应的紧凑指标，不再输�
 
 LEAGLE 训练脚本默认 `LOG_FREQ=10`，仅在日志步计算训练接受长度、准确率和候选召回率；验证集每个 batch 都计算完整指标。设为 `LOG_FREQ=1` 可恢复逐步统计，续训也支持此覆盖。所有步骤仍计算相同的主损失与候选 KL，并正常更新参数；没有统计的步骤不会写入虚假的零召回率。直接调用模型时默认保留指标，训练器按日志频率传入 `collect_metrics`。
 
+排查训练耗时时可设置 `PROFILE_FREQ=10`，将已有训练器的分阶段计时透传到新训练或续训。空值沿用配置（新训练默认关闭），`0` 明确关闭；日志中的 `fetch_ms`、`fwd_ms`、`bwd_ms`、`opt_ms` 可区分取数、前向、反向及优化器耗时。采样步会同步设备，本身有额外开销，正式吞吐对比应关闭 profiling，并在相同数据、卡数和计算配置下跳过启动预热。
+
 LEAGLE 使用已知的 TV 损失实现时，直接从其逐位置结果提取 `1 - TV` 供接受长度统计使用，避免再次计算全词表 softmax；其他目标及自定义损失保留原概率重叠计算。该观察只保存 detach 后的逐位置向量，不改变损失值、mask、权重或反向图。训练也复用 draft/target argmax，省去旧指标的重复构造。训练器在新一轮 forward 前释放上一轮梯度，降低激活与梯度同时驻留的显存；不改变优化器更新顺序。
 
 训练器将日志和验证的标量指标按设备及 dtype 分组合并拷回 CPU，避免逐指标 `.item()` 的多次小传输，同时保留整数计数和浮点精度。验证仍按原 batch 顺序在 CPU 累加。每步的有效监督判断在跨卡归约后一次读取本卡状态与有效卡数，保留空监督跳步及梯度缩放规则；非日志步也不再创建仅供日志使用的错误计数张量。这些公共训练器优化同样适用于 EAGLE 等模型。
@@ -155,18 +157,18 @@ LEAGLE 使用已知的 TV 损失实现时，直接从其逐位置结果提取 `1
 
 | 环境变量 | CLI | 管理范围 |
 | --- | --- | --- |
-| `LEAGLE_SAFE_OPTIMIZATIONS` | `--leagle-safe-optimizations` / `--no-leagle-safe-optimizations` | teacher 缓存、监督位置缓存、选择性 checkpoint、mask 缓存、FSDP 前向参数驻留、相同冻结输出头共享 |
-| `LEAGLE_NUMERICAL_OPTIMIZATIONS` | `--leagle-numerical-optimizations` / `--no-leagle-numerical-optimizations` | 训练 KV 复用、稀疏注意力、分块 loss、有效位置输出头、候选块对齐、候选梯度 addmm、共享 loss 归一化、主 loss 流式梯度，以及候选流式/反向重算路径选择 |
+| `LEAGLE_SAFE_OPTIMIZATIONS` | `--leagle-safe-optimizations` / `--no-leagle-safe-optimizations` | teacher 缓存、监督位置缓存、teacher 命中/缺失索引复用、冻结输出权重的批次内 autocast 转换复用、选择性 checkpoint、mask 缓存、FSDP 前向参数驻留、相同冻结输出头共享、DDP 梯度桶视图 |
+| `LEAGLE_NUMERICAL_OPTIMIZATIONS` | `--leagle-numerical-optimizations` / `--no-leagle-numerical-optimizations` | 训练 KV 复用、稀疏注意力、分块 loss、有效位置输出头、候选块对齐、候选梯度 addmm、共享 loss 归一化、主 loss 流式梯度、DDP 批量梯度拷贝，以及候选流式/反向重算路径选择 |
 
 `SAFE` 指在已有 CPU 对照中，相对同一前置计算路径没有发现额外梯度差异，不保证所有 NPU 内核逐元素一致。共享归一化与主 loss 流式梯度放在数值组，是因为其 FP32 优化仍改变运算顺序；BF16 下两项仍按原有规则回退。
 
 - `1`：启用本组满足前置条件的成员；`0`：停用本组。总开关优先于单项设置，无关参数顺序，包括命令行单项覆盖与旧 YAML 中的成员值。
 - 留空：新训练使用已有单项配置；续训继承 `run.yaml` 中的总开关及成员。若要从已启用总开关的运行切回单项控制，将对应 YAML 总开关设为 `null`，而非 `false`。数值组的 `false` 是主动关闭，不是释放控制权。
-- 安全组不主动启用数值前置条件：未使用分块头时不启用 teacher 缓存；未启用稀疏注意力时不启用选择性 checkpoint / mask 缓存；未启用 activation checkpointing 或 FSDP 时，相应优化自动跳过。
+- 安全组不主动启用数值前置条件：未使用分块头时不启用 teacher 缓存和冻结输出权重转换复用；未启用稀疏注意力时不启用选择性 checkpoint / mask 缓存；未启用 activation checkpointing 或 FSDP 时，相应优化自动跳过。
 - 数值组明确关闭时，也关闭会隐式引入分块的 teacher 缓存以及依赖稀疏注意力的两项优化。分块 loss 关闭可能显著增加显存。即使安全组开启，也不会绕过此限制。
 - 已有候选头时，数值组 `0` 选择 `LEAGLE_CANDIDATE_BACKWARD_RECOMPUTE=1`，用较慢的原生反向重算代替原有流式候选梯度；数值组 `1` 选择流式路径并开启候选 addmm / 块对齐。未启用候选头时跳过这些成员。两组均不创建候选头或修改层数、loop、LR、loss 配方。
 
-最终成员值与总开关一起写入 `run.yaml`。从完整 checkpoint 初始化时，会根据实际存在的候选头重新解析，并更新运行记录。输出头共享仍要求两份权重完全相同且冻结；数值组中的稀疏注意力仍要求 SDPA，loss 优化仍遵循各自的内置 loss 支持范围。上述总开关仅管理训练执行选项，离线评估开关仍在评估脚本配置；日志降频、指标复用等已合入的公共优化不回滚。
+最终成员值与总开关一起写入训练的 `run.yaml`，**不写入模型的 `config.json`，不增加 checkpoint 权重**。从完整 checkpoint 初始化时，会根据实际存在的候选头重新解析，并更新运行记录。输出头共享仍要求两份权重完全相同且冻结；数值组中的稀疏注意力仍要求 SDPA，loss 优化仍遵循各自的内置 loss 支持范围。上述总开关仅管理训练执行选项，离线评估开关仍在评估脚本配置；日志降频、指标复用等已合入的公共优化不回滚。
 
 ```bash
 # 仅允许安全组；停用有数值变化的路径及其依赖，显存需求可能增加。
@@ -189,6 +191,10 @@ bash examples/train/leagle_qwen3_4b_700k/train.sh
 | 训练 | `LEAGLE_SPARSE_ATTENTION`      | `--leagle-sparse-attention`      | SDPA 按 query 块读取目标前缀和本块轨迹，省去其他轨迹的无效 KV；保留 packed document、padding 和窗口边界           |
 | 训练 | `LEAGLE_CANDIDATE_GRAD_ADDMM`  | `--leagle-candidate-grad-addmm`  | 候选头梯度直接以 FP32 `addmm_` 累加，省去逐块 `[V,R]` 梯度临时矩阵；要求已有候选头                                |
 | 训练 | `LEAGLE_TEACHER_CACHE`         | `--leagle-teacher-cache`         | 在容量预算内缓存当前 forward 的 teacher 概率与标签，供 TTT 和反向重算复用                                         |
+| 训练 | `LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS` | `--leagle-cache-frozen-head-weights` | 分块 loss 在当前 forward/backward 内复用冻结 FP32 输出权重的 BF16/FP16 转换；不修改参数或 checkpoint |
+| 训练 | `LEAGLE_CACHE_TEACHER_INDICES` | `--leagle-cache-teacher-indices` | 每个 TTT step 预建 teacher 缓存命中/缺失索引，在各块反向重算中复用；要求 teacher cache |
+| 训练 | `LEAGLE_DDP_GRADIENT_AS_BUCKET_VIEW` | `--leagle-ddp-gradient-as-bucket-view` | 将梯度作为 DDP 通信桶的视图，减少额外梯度存储；仅 DDP |
+| 训练 | `LEAGLE_DDP_BATCHED_GRAD_COPY` | `--leagle-ddp-batched-grad-copy` | 批量执行梯度到通信桶的拷贝和除法，减少逐参数调度；仅支持该参数的 PyTorch DDP |
 | 训练 | `LEAGLE_MASKED_HEAD`           | `--leagle-masked-head`           | 主输出头只投影有监督位置，候选头进一步使用自己的有效 mask；保留原归一化                                           |
 | 评估 | `LEAGLE_SPARSE_CANDIDATES`     | `--leagle-sparse-candidates`     | 保留候选 IDs 和分数，在候选集采样；接受概率与残差校正使用真实 q，拒绝后仍可选到候选集外的 target token            |
 | 评估 | `LEAGLE_STATIC_KV`             | `--leagle-static-kv`             | 预分配请求内的 verified-prefix KV 和每轮、每个逻辑深度的 rollout KV；全注意力且所有 context 均可见时省去全真 mask |
@@ -203,6 +209,21 @@ bash examples/train/leagle_qwen3_4b_700k/train.sh
 新增的输出头优化保持默认关闭，也保存在 `trainer` 配置组。`LEAGLE_TEACHER_CACHE` 和 `LEAGLE_MASKED_HEAD` 自动采用分块输出头，共用 `LEAGLE_LOSS_CHUNK_SIZE`；无需同时开启 `LEAGLE_CHUNKED_LOSS`。teacher 缓存仅支持 eager 的 CE、TV、forward KL 及其组合，CPU/NPU 上也兼容脚本默认的 `legacy`；CUDA 使用缓存时应明确设置 `LOSS_IMPLEMENTATION=eager`。不支持 fused/custom loss 时明确报错，不静默切换损失实现。
 
 `LEAGLE_TEACHER_CACHE_MB` / `--leagle-teacher-cache-mb` 默认 **1024 MiB/卡**，限制常驻 FP32 teacher 概率与 int64 标签的合计容量，临时投影、softmax 和 loss 工作区另计。缓存只覆盖当前 batch 能放下的固定前缀，其余位置仍分块计算，避免有限容量 LRU 在每轮完整遍历中反复失效。缓存不跨 batch、优化器更新或 checkpoint 持久化。全词表 3072 长度的一份完整 FP32 概率约为 1.74 GiB，调大预算前应留出工作区显存。
+
+`LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS` 仅在已启用分块输出头、权重冻结且为 FP32、并使用 BF16/FP16 autocast 时生效。DDP 保留 FP32 参数，而 autocast 不缓存冻结参数，原先每个小块及其反向重算都可能重新转换整张词表矩阵；此选项在当前 loss 图内每份权重只转换一次。共享 draft/teacher 参数时只保留一份转换结果；权重已是 BF16、没有低精度 autocast 或参数可训练时直接使用原权重。它不主动启用分块，也不跨批次缓存。代价是每份不同输出矩阵额外保留低精度副本：Qwen3-4B 全词表约 **742 MiB**，未共享的两份约 **1.45 GiB**，不计入 teacher 概率缓存预算。FSDP 使用 BF16 计算权重时不增加这份副本。
+
+`LEAGLE_CACHE_TEACHER_INDICES` 不改变缓存容量、投影位置和矩阵形状。对于监督子集或压缩后的位置，每个 TTT step 只读取一次短索引向量，并一次性传回打包后的索引；各块 forward/backward 不再反复执行动态 `nonzero`。普通连续前缀查询仍使用原来的算术切片。索引只属于当前 forward 的 loss 图，额外占用少量元数据空间，不计入 teacher 概率缓存预算。CPU 的分块、有效位置、部分命中、候选头、FP32/BF16 autocast 对照保持 loss、梯度和更新一致；NPU 上的同步和索引开销收益需实测。
+
+DDP 下，安全组自动启用 `gradient_as_bucket_view`；数值组请求 `batched_grad_copy`。当前优化器的 `zero_grad()` 保持原行为，不改成持久化梯度或低精度通信。批量拷贝可能改变浮点除法的舍入，因此归入数值组。运行时检查当前 PyTorch 的实际 DDP 参数：不支持的选项会输出明确警告，并在 `run.yaml` 记录为关闭。FSDP 下两项自动跳过；显式单独启用 DDP 参数同时使用 FSDP 会报错。未启动分布式训练时也会关闭 DDP 参数并记录实际配置。
+
+`LEAGLE_DDP_BUCKET_CAP_MB` / `--leagle-ddp-bucket-cap-mb` 可手动设置正整数通信桶容量（MiB）。留空时，新运行不传该参数、保留 PyTorch 默认分桶行为；续训继承原值。数值组设为 `0` 时会恢复默认分桶，避免自定义桶改变归约顺序；数值组设为 `1` 不会擅自调整桶容量。桶越大不保证越快，应根据通信与反向的重叠情况实测。新 DDP 运行示例：
+
+```bash
+FSDP_SHARD=0 LEAGLE_SAFE_OPTIMIZATIONS=1 LEAGLE_NUMERICAL_OPTIMIZATIONS=1 \
+bash examples/train/leagle_qwen3_4b_700k/train.sh
+```
+
+如需试验桶大小，在上面增加 `LEAGLE_DDP_BUCKET_CAP_MB=64`。续训仍从 `run.yaml` 读取 FSDP/DDP 策略，脚本的 `FSDP_SHARD` 环境变量只选择新运行策略。`PROFILE_FREQ=10` 可采样输出取数、前向、反向和优化器分段耗时；计时时会同步设备，测稳定吞吐前应设回 `PROFILE_FREQ=0`。上述控制无需候选头，且不修改层数、loop、TTT、loss 或 LR；实际整体收益取决于目标 NPU 上的瓶颈。
 
 有效位置输出头保持主 loss 的目标位置 mask、候选 KL 的源/目标联合 mask，以及每个 TTT 步的原始分母。LEAGLE 训练器在所有输出头路径都设置 `return_predictions=False`：不记录指标且使用 teacher forcing 时跳过无用的 draft argmax；分块路径也跳过仅用于补齐预测的尾部投影。日志与验证指标仍正常计算。模型直接调用仍默认返回完整预测；自回归训练即使不返回预测，也保留递推所需的预测。空监督路径保留零梯度及正常分布式反向，不把零梯度改成缺失梯度。
 

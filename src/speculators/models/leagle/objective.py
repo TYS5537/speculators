@@ -11,6 +11,7 @@ from speculators.models.leagle.chunked_loss import (
 )
 from speculators.models.leagle.head_gradients import supports_fp32_head
 from speculators.models.leagle.masked_loss import masked_training_step
+from speculators.models.leagle.output_head import training_output_weights
 from speculators.models.leagle.shared_loss import CandidateTeacher
 from speculators.models.leagle.teacher_cache import TeacherCache, validate_teacher_cache
 from speculators.models.leagle.training import TVOverlapProbe
@@ -33,6 +34,8 @@ class TrainingObjective:
         grad_addmm=False,
         candidate_backward_recompute=False,
         teacher_cache_mb=0,
+        cache_frozen_head_weights=False,
+        cache_teacher_indices=False,
         masked_head=False,
         need_predictions=True,
         cache_supervised=False,
@@ -49,6 +52,9 @@ class TrainingObjective:
         self.candidate_backward_recompute = candidate_backward_recompute
         self.masked_head, self.need_predictions = masked_head, need_predictions
         self.collect_metrics, self.chunk_size = collect, chunk_size
+        self.draft_weight, self.teacher_weight = training_output_weights(
+            model, cache_autocast=cache_frozen_head_weights and bool(chunk_size)
+        )
         self.loss_config = (
             {"kl_div": (kl_div_loss, 1.0)} if loss_config is None else loss_config
         )
@@ -87,11 +93,12 @@ class TrainingObjective:
             validate_teacher_cache(self.loss_config, teacher_hidden.device)
             self.teacher_cache = TeacherCache(
                 self.targets,
-                model.verifier_lm_head.weight,
+                self.teacher_weight,
                 budget_bytes=teacher_cache_mb * 1024 * 1024,
                 chunk_size=chunk_size,
                 priority_mask=self.valid if cache_supervised else None,
                 shared_normalization=self.shared_normalization,
+                cache_indices=cache_teacher_indices,
             )
         self.target_ids = (
             self.targets.argmax(-1) if collect and not chunk_size else None
@@ -107,7 +114,7 @@ class TrainingObjective:
             if not self.need_predictions:
                 return None
             return (
-                predict_chunks(self.model, hidden, self.chunk_size)
+                predict_chunks(hidden, self.draft_weight, self.chunk_size)
                 if logits is None
                 else logits.argmax(-1)
             )
@@ -128,7 +135,7 @@ class TrainingObjective:
             width = hidden.shape[1] - step
             counts = self.candidate_loss.add(
                 hidden[:, :width],
-                self.model.lm_head.weight,
+                self.draft_weight,
                 self.valid[:, :width] & mask[:, step:],
                 top_k=self.model.config.candidate_head_top_k,
                 chunk_size=self.model.config.candidate_head_chunk_size,
@@ -177,7 +184,7 @@ class TrainingObjective:
             return
         counts = self.candidate_loss.add(
             hidden,
-            self.model.lm_head.weight,
+            self.draft_weight,
             mask,
             top_k=self.model.config.candidate_head_top_k,
             chunk_size=self.model.config.candidate_head_chunk_size,
