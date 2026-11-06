@@ -59,8 +59,9 @@ _LEGACY_FIELDS = """
     train_data_ratio no_resume_from_checkpoint logger total_seq_len log_freq
     profile_freq
     log_dir run_name num_layers num_loops draft_arch draft_hidden_act
-    candidate_head candidate_head_rank candidate_head_top_k
+    candidate_head candidate_rerank candidate_head_rank candidate_head_top_k
     candidate_head_loss_weight candidate_head_chunk_size
+    candidate_head_train_stride
     draft_mrope_full_head_hack
     target_layer_ids target_hidden_state_format dsv4_external_arrow token_freq_path
     draft_vocab_size d2t_path t2d_path mask_token_id ttt_steps num_speculative_steps
@@ -251,17 +252,24 @@ def _apply_leagle_defaults(args: argparse.Namespace, provided: set[str]) -> None
 
 def _validate_leagle_args(parser, args) -> None:
     _validate_leagle_optimizations(parser, args)
-    if args.candidate_head and args.speculator_type != "leagle":
+    if (
+        args.candidate_head
+        or not args.candidate_rerank
+        or args.candidate_head_train_stride > 1
+    ) and args.speculator_type != "leagle":
         parser.error("--candidate-head is only supported by --speculator-type leagle")
     if (
         min(
             args.candidate_head_rank,
             args.candidate_head_top_k,
             args.candidate_head_chunk_size,
+            args.candidate_head_train_stride,
         )
         < 1
     ):
-        parser.error("Candidate head rank, top-k and chunk-size must be positive")
+        parser.error(
+            "Candidate head rank, top-k, chunk-size and train-stride must be positive"
+        )
     if (
         not math.isfinite(args.candidate_head_loss_weight)
         or args.candidate_head_loss_weight <= 0

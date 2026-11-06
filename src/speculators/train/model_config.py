@@ -24,6 +24,7 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
 PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "num_loops": "--num-loops",
     "candidate_head": "--candidate-head",
+    "candidate_rerank": "--candidate-rerank",
     "candidate_head_rank": "--candidate-head-rank",
     "candidate_head_top_k": "--candidate-head-top-k",
     "candidate_head_loss_weight": "--candidate-head-loss-weight",

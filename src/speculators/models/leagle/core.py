@@ -28,6 +28,7 @@ from speculators.models.leagle.sparse_attention import (
     TrajectoryMaskCache,
 )
 from speculators.models.leagle.sparse_candidates import SparseCandidateLogits
+from speculators.models.leagle.svd_head import SVDCandidateHead
 from speculators.models.metrics import resolve_training_loss
 from speculators.models.utils import (
     flatten_rope_parameters,
@@ -99,6 +100,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     initializer_range=decoder.initializer_range,
                 )
         self.candidate_head_enabled = config.candidate_head
+        self.svd_candidate_head = None
+        self.candidate_rerank = config.candidate_rerank
         self.candidate_top_k = config.candidate_head_top_k
         self.sparse_candidates = False
         self.static_kv = False
@@ -119,6 +122,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
     ):
         if sparse_candidates and not self.candidate_head_enabled:
             raise ValueError("Sparse candidates require an enabled candidate head")
+        if sparse_candidates and not self.candidate_rerank:
+            raise ValueError("Sparse candidates require candidate reranking")
         if static_kv:
             validate_kv_reuse_rope(self.rotary_emb)
         if reuse_rollout_buffers and not static_kv:
@@ -140,28 +145,67 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
     def target_layer_ids(self) -> list[int]:
         return self.config.aux_hidden_state_layer_ids
 
+    @property
+    def low_rank_main(self) -> bool:
+        """Training architecture, independent of inference-time scoring overrides."""
+        return self.config.candidate_head and not self.config.candidate_rerank
+
     def share_output_head(self):
         return share_output_head(self)
 
     def validate_shared_output_head(self, reference):
         validate_shared_output_head(self, reference)
 
-    def set_candidate_head(self, enabled: bool, *, top_k: int | None = None):
-        """Override proposal retrieval; training uses the checkpoint's architecture."""
+    def set_svd_candidate_head(self, rank: int, *, top_k: int = 128):
+        """Derive an inference head without changing model config or saved weights."""
+        if self.training:
+            raise ValueError("SVD candidate heads require model.eval(); inference only")
+        if type(top_k) is not int or not 1 <= top_k <= self.draft_vocab_size:
+            raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
+        self.svd_candidate_head = SVDCandidateHead(self.lm_head.weight, rank).eval()
+        self.set_candidate_head(True, top_k=top_k, rerank=True)
+
+    def set_candidate_head(
+        self,
+        enabled: bool,
+        *,
+        top_k: int | None = None,
+        rerank: bool | None = None,
+    ):
+        """Select proposal scoring without changing the saved training architecture."""
+        selected_rerank = self.candidate_rerank if rerank is None else rerank
+        if rerank is True and not enabled:
+            raise ValueError("Candidate reranking requires an enabled candidate head")
+        if enabled and not selected_rerank:
+            if top_k is not None:
+                raise ValueError("Candidate top_k requires candidate reranking")
+            if self.sparse_candidates:
+                raise ValueError("Sparse candidates require candidate reranking")
         if enabled:
-            if self.candidate_head is None:
+            head = (
+                self.svd_candidate_head
+                if self.svd_candidate_head is not None
+                else self.candidate_head
+            )
+            if head is None:
                 raise ValueError(
                     "Checkpoint has no candidate head. "
                     "Train LEAGLE with --candidate-head."
                 )
-            selected = self.config.candidate_head_top_k if top_k is None else top_k
+            default_top_k = (
+                self.candidate_top_k
+                if self.svd_candidate_head is not None
+                else self.config.candidate_head_top_k
+            )
+            selected = default_top_k if top_k is None else top_k
             if not 1 <= selected <= self.draft_vocab_size:
                 raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
-            self.candidate_head.validate_weights()
+            head.validate_weights()
             self.candidate_top_k = selected
         elif top_k is not None:
             raise ValueError("Candidate top_k requires an enabled candidate head")
         self.candidate_head_enabled = enabled
+        self.candidate_rerank = selected_rerank
 
     def _prepare_missing_checkpoint_weights(self, loading_info):
         if self.candidate_head is None:
@@ -186,7 +230,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
 
     def gradient_clip_groups(self):
         """Clip the auxiliary head separately so it cannot rescale backbone updates."""
-        if self.candidate_head is None:
+        if self.candidate_head is None or self.low_rank_main:
             return [list(self.parameters())]
         backbone = [
             p
@@ -235,6 +279,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         training_context_cache=None,
         compute_logits=True,
         selective_checkpoint=False,
+        low_rank_output=False,
     ):
         embeddings = self.embed_tokens(token_ids)
         hidden = self.input_fc(
@@ -297,7 +342,9 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 next_caches.append(present)
         normalized = self.norm(hidden)
         logits = (
-            self._output_logits(normalized, use_candidate_head)
+            self.candidate_head.coarse_logits(normalized)
+            if compute_logits and low_rank_output
+            else self._output_logits(normalized, use_candidate_head)
             if compute_logits
             else None
         )
@@ -306,11 +353,17 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
 
     def _output_logits(self, normalized, use_candidate_head):
         if use_candidate_head:
-            return self.candidate_head(
+            head = (
+                self.svd_candidate_head
+                if self.svd_candidate_head is not None
+                else self.candidate_head
+            )
+            return head(
                 normalized,
                 self.lm_head.weight,
                 self.candidate_top_k,
                 sparse=self.sparse_candidates,
+                rerank=self.candidate_rerank,
             )
         return self.lm_head(normalized)
 
@@ -375,14 +428,24 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         *,
         candidate_recompute=False,
         cache_indices=False,
+        candidate_train_stride=1,
     ):
-        if candidate_addmm and self.candidate_head is None:
+        auxiliary_head = self.candidate_head is not None and not self.low_rank_main
+        if not isinstance(candidate_train_stride, int) or candidate_train_stride < 1:
+            raise ValueError("Candidate head train stride must be a positive integer")
+        if candidate_train_stride > 1 and not auxiliary_head:
             raise ValueError(
-                "Candidate gradient addmm requires a trained candidate head"
+                "Candidate head train stride requires auxiliary distillation"
             )
-        if candidate_recompute and self.candidate_head is None:
+        if candidate_addmm and not auxiliary_head:
             raise ValueError(
-                "Candidate backward recomputation requires a candidate head"
+                "Candidate gradient addmm requires a trained candidate head "
+                "with auxiliary distillation"
+            )
+        if candidate_recompute and not auxiliary_head:
+            raise ValueError(
+                "Candidate backward recomputation requires a candidate head "
+                "with auxiliary distillation"
             )
         if cache_mb is not None and cache_mb < 1:
             raise ValueError("Teacher cache budget must be positive")
@@ -402,8 +465,11 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         sparse_attention,
     ):
         if align_candidates:
-            if self.candidate_head is None:
-                raise ValueError("Candidate chunk alignment requires a candidate head")
+            if self.candidate_head is None or self.low_rank_main:
+                raise ValueError(
+                    "Candidate chunk alignment requires a candidate head "
+                    "with auxiliary distillation"
+                )
             if chunk_size < 1:
                 raise ValueError("LEAGLE optimization chunk sizes must be positive")
             chunk_size = max(chunk_size, self.config.candidate_head_chunk_size)
@@ -428,6 +494,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         loss_config=None,
         teacher_forcing=None,
         collect_metrics=True,
+        candidate_head_train_stride=1,
         leagle_reuse_training_kv=TRAINING_DEFAULTS["leagle_reuse_training_kv"],
         leagle_chunked_loss=TRAINING_DEFAULTS["leagle_chunked_loss"],
         leagle_loss_chunk_size=TRAINING_DEFAULTS["leagle_loss_chunk_size"],
@@ -508,6 +575,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             leagle_teacher_cache_mb if leagle_teacher_cache else None,
             candidate_recompute=leagle_candidate_backward_recompute,
             cache_indices=leagle_cache_teacher_indices,
+            candidate_train_stride=candidate_head_train_stride,
         )
         positions = self._training_positions(
             hidden_states, input_ids, document_ids, position_ids
@@ -541,6 +609,9 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 cache_supervised=leagle_teacher_cache_supervised,
                 shared_normalization=leagle_shared_loss_normalization,
                 stream_main_loss=leagle_stream_main_loss,
+                candidate_train_stride=candidate_head_train_stride
+                if self.training
+                else 1,
             )
             if return_loss
             else None
@@ -570,6 +641,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 training_context_cache=context_cache,
                 compute_logits=not chunked_head,
                 selective_checkpoint=leagle_selective_checkpoint,
+                low_rank_output=self.low_rank_main,
             )
             draft_ids = (
                 objective.step(logits, normalized, step)
@@ -748,6 +820,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             num_loops=kwargs.get("num_loops", 1),
             norm_output=kwargs.get("norm_output", True),
             candidate_head=kwargs.get("candidate_head", False),
+            candidate_rerank=kwargs.get("candidate_rerank", True),
             candidate_head_rank=kwargs.get("candidate_head_rank", 256),
             candidate_head_top_k=kwargs.get("candidate_head_top_k", 128),
             candidate_head_loss_weight=kwargs.get("candidate_head_loss_weight", 1.0),
@@ -794,6 +867,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             "loss_config": resolve_training_loss(**kwargs),
             "teacher_forcing": True,
             "collect_metrics": True,
+            "candidate_head_train_stride": kwargs.get("candidate_head_train_stride", 1),
             # Predictions are unused by the trainer, even on metric steps.
             "return_predictions": False,
             **{
@@ -809,6 +883,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             )
         if (
             kwargs.get("candidate_head", False)
+            and kwargs.get("candidate_rerank", True)
             and not call_kwargs["leagle_candidate_backward_recompute"]
             and not call_kwargs["leagle_align_candidate_chunks"]
             and any(
@@ -830,4 +905,17 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 "this increases temporary device memory.",
                 call_kwargs["leagle_loss_chunk_size"],
             )
-        return call_kwargs, dict(call_kwargs)
+        if call_kwargs["candidate_head_train_stride"] > 1:
+            if not kwargs.get("candidate_head", False) or not kwargs.get(
+                "candidate_rerank", True
+            ):
+                raise ValueError(
+                    "Candidate head train stride requires auxiliary distillation"
+                )
+            logger.info(
+                "Candidate KL training uses every %d-th eligible position, "
+                "rotating across TTT steps. Main supervision and validation "
+                "remain complete; candidate recall may change.",
+                call_kwargs["candidate_head_train_stride"],
+            )
+        return call_kwargs, {**call_kwargs, "candidate_head_train_stride": 1}

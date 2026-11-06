@@ -14,7 +14,6 @@ from speculators.models.leagle.chunked_loss import (
 
 
 def masked_training_step(objective, hidden, step, step_mask):
-    model = objective.model
     width = hidden.shape[1] - step
     mask = step_mask[:, step:]
     gradients = main_head_gradients(objective, hidden, step, mask)
@@ -29,7 +28,7 @@ def masked_training_step(objective, hidden, step, step_mask):
     )
     parts = [[] for _ in objective.loss_config]
     ids, labels, overlaps = [], [], []
-    candidate_mask = objective.valid[:, :width] & mask
+    candidate_mask = objective.step_candidate_mask
     candidate_scale = objective.decay**step / candidate_mask.sum(
         dtype=torch.float32
     ).clamp_min(1)
@@ -40,7 +39,7 @@ def masked_training_step(objective, hidden, step, step_mask):
             _project_chunk,
             loss_config=objective.loss_config,
             metrics=objective.collect_metrics,
-            candidate=model.candidate_head is not None,
+            candidate=objective.candidate_loss is not None,
             teacher_cache=objective.teacher_cache,
             teacher_plan=plans[start // objective.chunk_size]
             if plans is not None
@@ -54,6 +53,7 @@ def masked_training_step(objective, hidden, step, step_mask):
             objective.targets[:, target_indices],
             objective.draft_weight,
             objective.teacher_weight,
+            objective.down_weight,
         )
         result = (
             gradients.project(function, arguments, selected)
@@ -90,7 +90,10 @@ def masked_training_step(objective, hidden, step, step_mask):
     else:
         # Keep zero gradients connected to the whole backbone and LM head. Empty
         # selections must not skip distributed backward or change optimizer state.
-        loss = (hidden[:, :1].sum() + model.lm_head.weight[:1, :1].sum()).float() * 0.0
+        loss = hidden[:, :1].sum() + objective.draft_weight[:1, :1].sum()
+        if objective.down_weight is not None:
+            loss = loss + objective.down_weight[:1, :1].sum()
+        loss = loss.float() * 0.0
     if gradients is not None:
         loss = gradients.attach(loss)
     if objective.collect_metrics:
@@ -101,7 +104,9 @@ def masked_training_step(objective, hidden, step, step_mask):
             step,
         )
     predictions = (
-        predict_chunks(hidden, objective.draft_weight, objective.chunk_size)
+        predict_chunks(
+            hidden, objective.draft_weight, objective.chunk_size, objective.down_weight
+        )
         if objective.need_predictions
         else None
     )

@@ -2,6 +2,14 @@
 
 import torch
 from torch.distributed.tensor import DTensor
+from torch.nn import functional
+
+
+def project_output(hidden, weight, down_weight=None):
+    """Project the trained dense or factorized head with native autograd."""
+    if down_weight is not None:
+        hidden = functional.linear(hidden, down_weight)
+    return functional.linear(hidden, weight)
 
 
 def training_output_weights(model, *, cache_autocast=False):
@@ -12,7 +20,12 @@ def training_output_weights(model, *, cache_autocast=False):
     replay. Never change model parameters or cache across optimizer steps. Shared
     heads reuse one copy; already low-precision and trainable weights stay intact.
     """
-    weights = (model.lm_head.weight, model.verifier_lm_head.weight)
+    weights = (
+        model.candidate_head.up_proj.weight
+        if getattr(model, "low_rank_main", False)
+        else model.lm_head.weight,
+        model.verifier_lm_head.weight,
+    )
     if not cache_autocast:
         return weights
     copies = {}

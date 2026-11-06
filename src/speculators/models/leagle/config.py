@@ -27,6 +27,11 @@ class LEagleSpeculatorConfig(SpeculatorModelConfig):
     candidate_head: bool = Field(
         default=False, description="Train a low-rank candidate head."
     )
+    candidate_rerank: bool = Field(
+        default=True,
+        description="With a candidate head: true trains auxiliary retrieval for "
+        "exact rescoring; false trains the low-rank head as the main output.",
+    )
     candidate_head_rank: int = Field(default=256, gt=0)
     candidate_head_top_k: int = Field(default=128, gt=0)
     candidate_head_loss_weight: float = Field(default=1.0, gt=0, allow_inf_nan=False)

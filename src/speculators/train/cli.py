@@ -240,9 +240,13 @@ def main(cfg: TrainConfig):  # noqa: C901
     # migrated to MMuse. Use the resolved class for preprocessing/trainer policy.
     model_class = type(draft_model)
     args.speculator_type = draft_model.config.speculators_model_type
-    apply_runtime_optimization_groups(cfg, args, draft_model)
+    architecture_updated = apply_runtime_optimization_groups(cfg, args, draft_model)
     ddp_updated = apply_runtime_ddp_options(cfg, args, distributed=is_distributed())
-    if ddp_updated or any(getattr(args, name) is not None for name in GROUP_DEFAULTS):
+    if (
+        architecture_updated
+        or ddp_updated
+        or any(getattr(args, name) is not None for name in GROUP_DEFAULTS)
+    ):
         if get_rank() == 0:
             cfg.save(args.save_path)
         logger.info(

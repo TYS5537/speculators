@@ -300,6 +300,38 @@ def test_checkpoint_candidate_capability_is_resolved_before_trainer_kwargs(numer
     assert saved["leagle_candidate_backward_recompute"] is not numerical
 
 
+@pytest.mark.parametrize("numerical", [None, False, True])
+def test_primary_checkpoint_restores_training_mode_and_applicable_groups(numerical):
+    flags = [*BASE, "--loss-implementation", "eager"]
+    if numerical is not None:
+        flags += [
+            "--leagle-safe-optimizations",
+            "--leagle-numerical-optimizations"
+            if numerical
+            else "--no-leagle-numerical-optimizations",
+        ]
+    config = TrainConfig.resolve(flags)
+    args = Namespace(**config.flatten())
+    model = make_model(candidate_head=True, candidate_rerank=False)
+    assert apply_runtime_optimization_groups(config, args, model)
+    assert args.candidate_head
+    assert args.candidate_rerank is False
+    assert config.draft.candidate_rerank is False
+    assert not apply_runtime_optimization_groups(config, args, model)
+    train, val = LEagleDraftModel.get_trainer_kwargs(**vars(args))
+    for call in (train, val):
+        for name in (
+            "leagle_candidate_backward_recompute",
+            "leagle_candidate_grad_addmm",
+            "leagle_align_candidate_chunks",
+            "leagle_stream_main_loss",
+        ):
+            assert not call[name]
+    saved = yaml.safe_load(config.dump_yaml())["train"]["draft"]
+    assert saved["candidate_head"]
+    assert saved["candidate_rerank"] is False
+
+
 def test_groups_do_not_modify_architecture_optimizer_or_loss():
     config = TrainConfig.resolve([*BASE, "--num-layers", "3", "--num-loops", "2"])
     grouped = TrainConfig.resolve(

@@ -41,6 +41,25 @@ def test_coarse_selection_then_exact_rescore_and_conditional_probabilities():
     assert probs[..., 2:].count_nonzero() == 0
 
 
+def test_low_rank_only_skips_retrieval_and_original_weights(monkeypatch):
+    head = LowRankCandidateHead(2, 4, 1)
+    with torch.no_grad():
+        head.down_proj.weight.copy_(torch.tensor([[1.0, 0.0]]))
+        head.up_proj.weight.copy_(torch.tensor([[3.0], [4.0], [2.0], [1.0]]))
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("Low-rank-only proposals must not retrieve or rescore candidates")
+
+    monkeypatch.setattr(torch.Tensor, "topk", forbidden)
+    monkeypatch.setattr(torch.nn.functional, "embedding", forbidden)
+    logits = head(torch.tensor([[[1.0, 0.0]]]), None, top_k=2, rerank=False)
+    torch.testing.assert_close(logits, torch.tensor([[[3.0, 4.0, 2.0, 1.0]]]))
+    assert logits.argmax(-1).item() == 1
+    assert torch.all(logits_to_probs(logits, 1.0) > 0)
+    with pytest.raises(ValueError, match="reranking"):
+        head(torch.zeros(1, 1, 2), None, top_k=2, sparse=True, rerank=False)
+
+
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("empty", [False, True])
 def test_chunked_distillation_matches_full_kl_and_gradients_without_backbone_gradient(
@@ -103,10 +122,12 @@ def test_distillation_updates_both_factors_and_reduces_loss():
 
 @pytest.mark.parametrize("reduced", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rerank", [False, True])
 def test_propose_skips_dense_projection_and_returns_actual_sampling_support(
-    reduced, dtype, monkeypatch
+    reduced, dtype, rerank, monkeypatch
 ):
     model = make_model(loops=3, reduced=reduced, candidate_head=True).to(dtype).eval()
+    model.set_candidate_head(True, rerank=rerank)
     seen = []
     hook = model.candidate_head.register_forward_pre_hook(
         lambda _m, args: seen.append(args[0].clone())
@@ -126,9 +147,14 @@ def test_propose_skips_dense_projection_and_returns_actual_sampling_support(
     finally:
         hook.remove()
     assert len(seen) == 4
-    full = torch.nn.functional.linear(torch.cat(seen, dim=1), model.lm_head.weight)
+    hidden = torch.cat(seen, dim=1)
+    full = (
+        torch.nn.functional.linear(hidden, model.lm_head.weight)
+        if rerank
+        else model.candidate_head.coarse_logits(hidden)
+    )
     support = torch.isfinite(logits)
-    assert torch.all(support.sum(-1) == 3)
+    assert torch.all(support.sum(-1) == (3 if rerank else model.draft_vocab_size))
     torch.testing.assert_close(logits[support], full[support], atol=0.03, rtol=0.02)
     probs = logits_to_probs(logits, 1.0)
     torch.testing.assert_close(probs.sum(-1), torch.ones(1, 4))
@@ -142,14 +168,16 @@ def test_propose_skips_dense_projection_and_returns_actual_sampling_support(
 @pytest.mark.parametrize("training", [False, True])
 @pytest.mark.parametrize("checkpointed", [False, True])
 @pytest.mark.parametrize("loss_fn", ["kl_div", '{"ce": 0.1, "tv": 0.9}'])
+@pytest.mark.parametrize("rerank", [False, True])
 def test_joint_objective_preserves_dense_initialization_gradients_and_clipped_updates(
-    training, checkpointed, loss_fn
+    training, checkpointed, loss_fn, rerank
 ):
     torch.manual_seed(71)
     dense = make_model().train(training)
     dense_rng = torch.get_rng_state()
     torch.manual_seed(71)
     joint = make_model(candidate_head=True).train(training)
+    joint.set_candidate_head(True, rerank=rerank)
     assert torch.equal(dense_rng, torch.get_rng_state())
     for name, weight in dense.state_dict().items():
         torch.testing.assert_close(weight, joint.state_dict()[name], atol=0, rtol=0)
@@ -255,20 +283,25 @@ def test_train_save_reload_and_runtime_switch(tmp_path, reduced):
     )
     loss.backward()
     torch.optim.AdamW(model.parameters(), lr=0.01).step()
+    config_before = model.config.to_dict()
+    model.set_candidate_head(True, rerank=False)
+    assert model.config.to_dict() == config_before
+    assert config_before["candidate_rerank"] is True
     model.eval().save_pretrained(tmp_path)
     restored = SpeculatorModel.from_pretrained(
         tmp_path, attn_implementation="eager"
     ).eval()
     assert restored.config.candidate_head
     assert restored.candidate_head_enabled
+    assert restored.candidate_rerank is True
     assert all(p.requires_grad for p in restored.candidate_head.parameters())
     for name, parameter in model.candidate_head.state_dict().items():
         torch.testing.assert_close(
             parameter, restored.candidate_head.state_dict()[name]
         )
-    for enabled in (False, True):
-        model.set_candidate_head(enabled)
-        restored.set_candidate_head(enabled)
+    for enabled, rerank in ((False, False), (True, False), (True, True)):
+        model.set_candidate_head(enabled, rerank=rerank)
+        restored.set_candidate_head(enabled, rerank=rerank)
         a = model.propose(
             inputs["hidden_states"], inputs["input_ids"][:, -1:], num_tokens=3
         )
@@ -277,6 +310,26 @@ def test_train_save_reload_and_runtime_switch(tmp_path, reduced):
         )
         for actual, expected in zip(a, b, strict=True):
             torch.testing.assert_close(actual, expected)
+
+
+def test_low_rank_only_rejects_inapplicable_reranking_options():
+    model = make_model(candidate_head=True).eval()
+    with pytest.raises(ValueError, match="enabled candidate head"):
+        model.set_candidate_head(False, rerank=True)
+    with pytest.raises(ValueError, match="top_k requires candidate reranking"):
+        model.set_candidate_head(True, rerank=False, top_k=2)
+    model.set_candidate_head(True, rerank=False)
+    with pytest.raises(
+        ValueError, match="Sparse candidates require candidate reranking"
+    ):
+        model.set_inference_optimizations(sparse_candidates=True)
+    model.set_candidate_head(True, rerank=True)
+    model.set_inference_optimizations(sparse_candidates=True)
+    with pytest.raises(
+        ValueError, match="Sparse candidates require candidate reranking"
+    ):
+        model.set_candidate_head(True, rerank=False)
+    assert model.candidate_rerank is True
 
 
 @pytest.mark.parametrize("corruption", ["missing", "nonfinite", "shape"])

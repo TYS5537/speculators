@@ -38,11 +38,13 @@ def launch_args(algorithm, **overrides):
     return command[command.index("speculators.train") + 1 :]
 
 
-def test_candidate_head_train_switch_reaches_model_config_and_resume(tmp_path):
+@pytest.mark.parametrize("rerank", ["0", "1"])
+def test_candidate_head_train_switch_reaches_model_config_and_resume(tmp_path, rerank):
     flags = launch_args(
         "leagle",
         MODEL="model",
         CANDIDATE_HEAD="1",
+        CANDIDATE_RERANK=rerank,
         CANDIDATE_HEAD_RANK="64",
         CANDIDATE_TOP_K="32",
         CANDIDATE_HEAD_LOSS_WEIGHT="0.5",
@@ -50,6 +52,7 @@ def test_candidate_head_train_switch_reaches_model_config_and_resume(tmp_path):
     )
     config = TrainConfig.resolve(flags)
     assert config.draft.candidate_head
+    assert config.draft.candidate_rerank is (rerank == "1")
     assert config.draft.candidate_head_rank == 64
     assert config.draft.candidate_head_top_k == 32
     assert config.draft.candidate_head_loss_weight == 0.5
@@ -67,6 +70,7 @@ def test_candidate_head_train_switch_reaches_model_config_and_resume(tmp_path):
         )
     )
     assert resumed.draft.candidate_head
+    assert resumed.draft.candidate_rerank is (rerank == "1")
     assert resumed.draft.candidate_head_rank == 64
     assert resumed.draft.candidate_head_loss_weight == 0.5
 
@@ -76,6 +80,30 @@ def test_eagle_script_ignores_leagle_candidate_environment():
         launch_args("eagle3", MODEL="model", CANDIDATE_HEAD="1")
     )
     assert not config.draft.candidate_head
+
+
+def test_candidate_training_stride_new_run_resume_and_explicit_override(tmp_path):
+    config = TrainConfig.resolve(
+        launch_args(
+            "leagle", MODEL="model", CANDIDATE_HEAD="1", CANDIDATE_HEAD_TRAIN_STRIDE="8"
+        )
+    )
+    assert config.draft.candidate_head_train_stride == 8
+    path = tmp_path / "checkpoints"
+    path.mkdir()
+    (path / "run.yaml").write_text(config.dump_yaml())
+    for override, expected in (("", 8), ("1", 1), ("16", 16)):
+        resumed = TrainConfig.resolve(
+            launch_args(
+                "leagle",
+                RESUME="1",
+                OUTPUT_DIR=tmp_path.as_posix(),
+                CANDIDATE_HEAD_TRAIN_STRIDE=override,
+            )
+        )
+        assert resumed.draft.candidate_head_train_stride == expected
+        assert resumed.draft.candidate_head
+        assert resumed.draft.candidate_rerank
 
 
 def test_leagle_master_script_switches_and_resume(tmp_path):

@@ -61,9 +61,25 @@ def build_parser():
         help="LEAGLE candidate output head; by default follow the trained checkpoint",
     )
     parser.add_argument(
+        "--candidate-rerank",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Rescore low-rank top-k candidates with the original output weights "
+        "(default: follow the checkpoint). Disable to sample directly from "
+        "low-rank logits over the full draft vocabulary; inference only.",
+    )
+    parser.add_argument(
+        "--candidate-svd-rank",
+        type=int,
+        help="LEAGLE inference only: derive a rank-R candidate head from the loaded "
+        "dense LM head at startup, without training or changing config.json. "
+        "Enables candidates; default is off. Uses a chunked FP64 CPU decomposition.",
+    )
+    parser.add_argument(
         "--candidate-top-k",
         type=int,
-        help="Candidate vocabulary count; defaults to checkpoint (not draft length)",
+        help="Candidate vocabulary count for exact rescoring; defaults to 128 for "
+        "SVD or the trained checkpoint value (not draft length)",
     )
     parser.add_argument(
         "--leagle-sparse-candidates",
@@ -153,8 +169,28 @@ def _validate_persistent_workers(args):
         raise ValueError("--worker-job-stream is reserved for sharded workers")
 
 
+def _validate_candidate_args(args):
+    svd_rank = getattr(args, "candidate_svd_rank", None)
+    if svd_rank is not None and (svd_rank < 1 or args.candidate_head is False):
+        raise ValueError(
+            "--candidate-svd-rank must be positive and cannot use --no-candidate-head"
+        )
+    if args.candidate_top_k is not None and (
+        args.candidate_head is False or args.candidate_top_k < 1
+    ):
+        raise ValueError(
+            "--candidate-top-k must be positive and requires --candidate-head"
+        )
+    rerank = getattr(args, "candidate_rerank", None)
+    if rerank is True and args.candidate_head is False:
+        raise ValueError("--candidate-rerank requires an enabled candidate head")
+    if rerank is False and args.candidate_top_k is not None:
+        raise ValueError("--candidate-top-k requires candidate reranking")
+
+
 def validate_args(args):
     _validate_persistent_workers(args)
+    _validate_candidate_args(args)
     if args.spec_tokens < 1 or args.max_new_tokens < 0:
         raise ValueError("--spec-tokens must be >= 1 and --max-new-tokens >= 0")
     if not math.isfinite(args.temperature) or args.temperature < 0:
@@ -168,12 +204,6 @@ def validate_args(args):
     optimization_settings(args)
     if (args.d2t_path is None) != (args.t2d_path is None):
         raise ValueError("--d2t-path and --t2d-path must be provided together")
-    if args.candidate_top_k is not None and (
-        args.candidate_head is False or args.candidate_top_k < 1
-    ):
-        raise ValueError(
-            "--candidate-top-k must be positive and requires --candidate-head"
-        )
     if args.ascend_devices:
         devices = data.split_csv(args.ascend_devices)
         if (
@@ -191,17 +221,32 @@ def validate_args(args):
 def candidate_head_settings(args, config=None):
     """Validate the switch without initializing Torch in the NPU parent process."""
     config = config or {}
+    svd_rank = getattr(args, "candidate_svd_rank", None)
+    if svd_rank is not None:
+        _validate_candidate_args(args)
     enabled = (
-        config.get("candidate_head", False)
+        (svd_rank is not None or config.get("candidate_head", False))
         if args.candidate_head is None
         else args.candidate_head
     )
     rank = (
-        config.get("candidate_head_rank")
+        svd_rank
+        if svd_rank is not None
+        else config.get("candidate_head_rank")
         if config.get("candidate_head", False)
         else None
     )
-    top_k = args.candidate_top_k or config.get("candidate_head_top_k")
+    top_k = args.candidate_top_k or (
+        128 if svd_rank is not None else config.get("candidate_head_top_k")
+    )
+    requested_rerank = getattr(args, "candidate_rerank", None)
+    rerank = enabled and (
+        (True if svd_rank is not None else config.get("candidate_rerank", True))
+        if requested_rerank is None
+        else requested_rerank
+    )
+    if requested_rerank is True and not enabled:
+        raise ValueError("--candidate-rerank requires an enabled candidate head")
     if enabled and config:
         if config.get("speculators_model_type") != "leagle":
             raise ValueError(
@@ -209,18 +254,37 @@ def candidate_head_settings(args, config=None):
             )
         if rank is None:
             raise ValueError(
-                "Checkpoint has no candidate head. Train LEAGLE with --candidate-head."
+                "Checkpoint has no candidate head. Train LEAGLE with --candidate-head "
+                "or use --candidate-svd-rank for inference-only retrieval."
             )
-        if top_k is None or not 1 <= top_k <= config["draft_vocab_size"]:
+        if svd_rank is not None and svd_rank > min(
+            config["draft_vocab_size"],
+            config["transformer_layer_config"]["hidden_size"],
+        ):
+            raise ValueError(
+                "SVD rank must be in [1, min(hidden_size, draft_vocab_size)]"
+            )
+        if rerank and (top_k is None or not 1 <= top_k <= config["draft_vocab_size"]):
             raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
     if not enabled and args.candidate_top_k is not None:
         raise ValueError("--candidate-top-k requires an enabled candidate head")
+    if not rerank and args.candidate_top_k is not None:
+        raise ValueError("--candidate-top-k requires candidate reranking")
     return {
         "enabled": enabled,
+        "source": "svd" if svd_rank is not None else "checkpoint",
+        "svd_method": "cpu-fp64-gram-eigh" if svd_rank is not None else None,
         "rank": rank,
-        "top_k": top_k if enabled else None,
-        "scoring": "low-rank-retrieval-exact-rescore" if enabled else "dense",
-        "proposal_support": "retrieved-candidates" if enabled else "draft-vocabulary",
+        "rerank": rerank,
+        "top_k": top_k if rerank else None,
+        "scoring": (
+            "low-rank-retrieval-exact-rescore"
+            if rerank
+            else "low-rank"
+            if enabled
+            else "dense"
+        ),
+        "proposal_support": "retrieved-candidates" if rerank else "draft-vocabulary",
     }
 
 
@@ -251,10 +315,30 @@ def optimization_settings(args, config=None):
             settings["sparse_candidates"]
             and not candidate_head_settings(args, config)["enabled"]
         ):
-            raise ValueError(
-                "Sparse candidates require an enabled trained candidate head"
-            )
+            raise ValueError("Sparse candidates require an enabled candidate head")
+        if (
+            settings["sparse_candidates"]
+            and not candidate_head_settings(args, config)["rerank"]
+        ):
+            raise ValueError("Sparse candidates require candidate reranking")
     return settings
+
+
+def _initialize_svd_head(draft, settings):
+    if settings["source"] != "svd":
+        return
+    logger.info(
+        "Building LEAGLE SVD candidate head on CPU: rank=%d; "
+        "one-time initialization, no training or checkpoint changes",
+        settings["rank"],
+    )
+    started = time.perf_counter()
+    draft.set_svd_candidate_head(
+        settings["rank"], top_k=settings["top_k"] or min(128, draft.draft_vocab_size)
+    )
+    logger.info(
+        "LEAGLE SVD initialization finished in %.3f s", time.perf_counter() - started
+    )
 
 
 def load_models(args):
@@ -314,24 +398,27 @@ def load_models(args):
             "d2t": torch.load(args.d2t_path, map_location="cpu", weights_only=True),
             "t2d": torch.load(args.t2d_path, map_location="cpu", weights_only=True),
         }
-    draft = (
-        SpeculatorModel.from_pretrained(
-            args.draft_model, config=config, torch_dtype=target.dtype, **mappings
-        )
-        .to(device=device, dtype=target.dtype)
-        .eval()
-    )
+    draft = SpeculatorModel.from_pretrained(
+        args.draft_model, config=config, torch_dtype=target.dtype, **mappings
+    ).eval()
+    _initialize_svd_head(draft, head_settings)
+    draft = draft.to(device=device, dtype=target.dtype)
     if draft.use_draft_vocab:
         # Validate checkpoint-resident offsets too: zero placeholders would
         # otherwise silently propose the wrong target-vocabulary token IDs.
         draft.load_vocab_mappings(draft.t2d, draft.d2t)
     if config.speculators_model_type == "leagle":
-        draft.set_candidate_head(head_settings["enabled"], top_k=head_settings["top_k"])
+        draft.set_candidate_head(
+            head_settings["enabled"],
+            top_k=head_settings["top_k"],
+            rerank=head_settings["rerank"],
+        )
         draft.set_inference_optimizations(**optimizations)
     if head_settings["enabled"]:
         logger.info(
-            "LEAGLE candidate head enabled: rank=%d candidates=%d (exact rescore)",
+            "LEAGLE candidate head enabled: rank=%d scoring=%s candidates=%s",
             head_settings["rank"],
+            head_settings["scoring"],
             head_settings["top_k"],
         )
     tokenizer = AutoTokenizer.from_pretrained(

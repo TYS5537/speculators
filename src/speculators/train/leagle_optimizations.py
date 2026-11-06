@@ -68,7 +68,10 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, obje
         raise ValueError("LEAGLE optimization groups require --speculator-type leagle")
 
     updates = {}
-    candidate = bool(options.get("candidate_head", False))
+    low_rank_main = bool(options.get("candidate_head", False)) and not options.get(
+        "candidate_rerank", True
+    )
+    candidate = bool(options.get("candidate_head", False)) and not low_rank_main
     ddp = not bool(options.get("fsdp_shard", False))
     if numerical is not None:
         updates.update(dict.fromkeys(NUMERICAL_OPTIONS, numerical))
@@ -78,6 +81,13 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, obje
         updates["leagle_ddp_batched_grad_copy"] = numerical and ddp
         if not numerical:
             updates["leagle_ddp_bucket_cap_mb"] = None
+    if low_rank_main:
+        # The main head uses ordinary autograd for both trainable factors.
+        updates.update(dict.fromkeys(_CANDIDATE_OPTIONS, False))
+        updates.update(
+            leagle_candidate_backward_recompute=False,
+            leagle_stream_main_loss=False,
+        )
 
     effective = {**options, **updates}
     chunked = numerical is not False and any(
@@ -116,8 +126,18 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, obje
 
 def apply_runtime_optimization_groups(config, args, model):
     """Resolve checkpoint capabilities and record the effective runtime settings."""
+    architecture_updated = False
+    if model.config.speculators_model_type == "leagle":
+        # Inherit the loaded output architecture before resolving runtime groups,
+        # even when neither master was explicitly supplied on the command line.
+        for name in ("candidate_head", "candidate_rerank"):
+            value = getattr(model.config, name, name == "candidate_rerank")
+            architecture_updated |= getattr(config.draft, name) != value
+            setattr(args, name, value)
+            setattr(config.draft, name, value)
+            config._provenance[name] = "checkpoint"  # noqa: SLF001
     if all(getattr(args, name, None) is None for name in GROUP_DEFAULTS):
-        return
+        return architecture_updated
     candidate = bool(getattr(model.config, "candidate_head", False))
     updates = resolve_optimization_groups(
         {
@@ -126,12 +146,8 @@ def apply_runtime_optimization_groups(config, args, model):
             "candidate_head": candidate,
         }
     )
-    # get_trainer_kwargs resolves the masters too; it must see checkpoint-owned
-    # capabilities rather than an unset CLI default. This records, never creates,
-    # the already loaded auxiliary head.
-    args.candidate_head = config.draft.candidate_head = candidate
-    config._provenance["candidate_head"] = "checkpoint"  # noqa: SLF001
     for name, value in updates.items():
         setattr(args, name, value)
         setattr(config.trainer, name, value)
         config._provenance[name] = "group"  # noqa: SLF001 -- resolved run manifest.
+    return architecture_updated

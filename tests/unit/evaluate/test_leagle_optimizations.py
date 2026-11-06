@@ -24,16 +24,19 @@ def deterministic_cpu():
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 @pytest.mark.parametrize("reduced", [False, True])
-@pytest.mark.parametrize("sparse", [False, True])
+@pytest.mark.parametrize(
+    ("sparse", "rerank"), [(False, False), (False, True), (True, True)]
+)
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize("reuse_buffers", [False, True])
 def test_static_kv_matches_dynamic_for_dense_and_compact_proposals(
-    temperature, reduced, sparse, dtype, reuse_buffers
+    temperature, reduced, sparse, dtype, reuse_buffers, rerank
 ):
     target, draft = make_real_models(
         layers=2, loops=2, reduced=reduced, candidate_head=True
     )
     target, draft = target.to(dtype), draft.to(dtype)
+    draft.set_candidate_head(True, rerank=rerank)
     inputs = torch.tensor([[5, 9, 2]])
     responses = []
     for static in (False, True):

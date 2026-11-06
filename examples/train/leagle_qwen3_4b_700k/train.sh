@@ -65,12 +65,14 @@ LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
 LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-legacy}"
 
 # Optional candidate head, created and trained from scratch with the draft.
-# Its detached forward-KL objective trains only the two retrieval matrices.
+# RERANK=0 trains it directly through the main loss; RERANK=1 adds detached KL.
 CANDIDATE_HEAD="${CANDIDATE_HEAD:-0}"
+CANDIDATE_RERANK="${CANDIDATE_RERANK:-1}"  # 0: low-rank main loss; 1: dense main loss + auxiliary retrieval KL.
 CANDIDATE_HEAD_RANK="${CANDIDATE_HEAD_RANK:-256}"
 CANDIDATE_TOP_K="${CANDIDATE_TOP_K:-128}"
 CANDIDATE_HEAD_LOSS_WEIGHT="${CANDIDATE_HEAD_LOSS_WEIGHT:-1.0}"
-CANDIDATE_HEAD_CHUNK_SIZE="${CANDIDATE_HEAD_CHUNK_SIZE:-32}"
+CANDIDATE_HEAD_CHUNK_SIZE="${CANDIDATE_HEAD_CHUNK_SIZE:-32}"  # Auxiliary KL only; main loss uses LEAGLE_LOSS_CHUNK_SIZE.
+CANDIDATE_HEAD_TRAIN_STRIDE="${CANDIDATE_HEAD_TRAIN_STRIDE:-}"  # Empty: 1 on a new run, inherit on resume. 8 trains about 1/8 of candidate positions.
 
 # Two optional masters: 0=off, 1=on, empty=use individual/saved settings.
 # A nonempty master overrides its members, including individual CLI flags.
@@ -120,7 +122,7 @@ RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"  # Print the resolved launch command without loading models.
 
 # ============ Launch ============
-for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN CANDIDATE_HEAD; do
+for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN CANDIDATE_HEAD CANDIDATE_RERANK; do
     if [[ "${!setting}" != 0 && "${!setting}" != 1 ]]; then
         echo "$setting must be 0 or 1." >&2
         exit 2
@@ -231,6 +233,11 @@ else
             --candidate-head-top-k "$CANDIDATE_TOP_K"
             --candidate-head-loss-weight "$CANDIDATE_HEAD_LOSS_WEIGHT"
             --candidate-head-chunk-size "$CANDIDATE_HEAD_CHUNK_SIZE")
+        if [[ "$CANDIDATE_RERANK" == 0 ]]; then
+            TRAIN_ARGS+=(--no-candidate-rerank)
+        else
+            TRAIN_ARGS+=(--candidate-rerank)
+        fi
     fi
     if [[ "$FSDP_SHARD" == 1 ]]; then TRAIN_ARGS+=(--fsdp-shard); fi
     if [[ "$ACTIVATION_CHECKPOINTING" == 1 ]]; then TRAIN_ARGS+=(--activation-checkpointing); fi
@@ -262,7 +269,7 @@ for setting in LEAGLE_SAFE_OPTIMIZATIONS LEAGLE_NUMERICAL_OPTIMIZATIONS \
     esac
 done
 for setting in LEAGLE_LOSS_CHUNK_SIZE LEAGLE_ATTN_CHUNK_SIZE LEAGLE_TEACHER_CACHE_MB \
-    LEAGLE_ATTENTION_MASK_CACHE_MB LEAGLE_DDP_BUCKET_CAP_MB; do
+    LEAGLE_ATTENTION_MASK_CACHE_MB LEAGLE_DDP_BUCKET_CAP_MB CANDIDATE_HEAD_TRAIN_STRIDE; do
     if [[ -n "${!setting}" ]]; then
         if [[ ! "${!setting}" =~ ^[1-9][0-9]*$ ]]; then
             echo "$setting must be a positive integer." >&2; exit 2

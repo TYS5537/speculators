@@ -86,6 +86,7 @@ def _proposal_worker_args(args) -> list[str]:
         "target_attn_impl",
         "checkpoint_manifest",
         "candidate_top_k",
+        "candidate_svd_rank",
     ):
         value = getattr(args, name, None)
         if value is not None:
@@ -94,10 +95,13 @@ def _proposal_worker_args(args) -> list[str]:
         result.append("--check-greedy")
     if getattr(args, "no_draft_kv_reuse", False):
         result.append("--no-draft-kv-reuse")
-    if getattr(args, "candidate_head", None) is True:
-        result.append("--candidate-head")
-    elif getattr(args, "candidate_head", None) is False:
-        result.append("--no-candidate-head")
+    for setting in ("candidate_head", "candidate_rerank"):
+        value = getattr(args, setting, None)
+        flag = setting.replace("_", "-")
+        if value is True:
+            result.append(f"--{flag}")
+        elif value is False:
+            result.append(f"--no-{flag}")
     for flag in (
         "leagle_sparse_candidates",
         "leagle_static_kv",

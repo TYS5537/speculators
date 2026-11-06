@@ -484,9 +484,56 @@ bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
 这版用于比较接受长度。日志中的吞吐包含参考实现开销，启用审计还包含 target 单独解码，多卡汇总时间还包含模型加载；这些数值不是 vLLM serving 加速比。贪心模式保持概率诊断字段为空并标记 `probability_diagnostics_available=false`；正温度模式输出接受概率与分布重叠诊断，并标记为 true。评估配置记录实际温度与验证模式。
 
-### 可选低秩候选输出头（仅 LEAGLE）
+### 无需训练的 SVD 候选头（仅 LEAGLE 推理）
 
-训练默认 `CANDIDATE_HEAD=0`，使用完整输出头；设置为 1 时从头创建并训练两个低秩矩阵，直接保存在训练 checkpoint 中。评估默认 `CANDIDATE_HEAD=auto`，按 checkpoint 配置加载并启用，无需转换脚本或另做 SVD。开启候选推理后，每个草稿 token 执行一次候选筛选，物理层数和 loop 次数不改变输出头的调用次数：
+已有 LEAGLE checkpoint 即使没有训练过候选头，也可在评估加载时从原始
+`lm_head.weight` 构造低秩粗筛头，再取原始输出头的候选行精算。训练入口、loss、
+优化器和已训练权重不变；默认关闭。两个大小参数都通过评估命令传入，不写入模型
+`config.json`，也不向 checkpoint 添加 SVD 权重：
+
+| 脚本环境变量 | 评估参数 | 含义 |
+| --- | --- | --- |
+| `CANDIDATE_SVD_RANK=256` | `--candidate-svd-rank 256` | SVD 保留的 rank；空值关闭，指定正整数自动启用运行时候选头 |
+| `CANDIDATE_TOP_K=128` | `--candidate-top-k 128` | 取原始 W 行精算的 token 数；SVD 模式默认 128 |
+
+两者分别受 `min(hidden_size, draft_vocab_size)` 和 `draft_vocab_size` 限制，
+与 `SPEC_TOKENS=7` 的草稿长度无关。路径继续手动指定：
+
+```bash
+DRAFT_MODEL=/path/to/existing/leagle/checkpoint \
+CANDIDATE_HEAD=auto CANDIDATE_RERANK=auto \
+CANDIDATE_SVD_RANK=256 CANDIDATE_TOP_K=128 \
+OUTPUT_DIR=eval_leagle_svd_r256_k128 \
+bash examples/evaluate/leagle_qwen3_4b_700k.sh
+```
+
+实现按词表行分块，在 CPU FP64 中累积 `WᵀW`，分解得到最大的 R 个右奇异方向 Q，
+构造 `A=WQ`、`B=Qᵀ`。不会创建完整左奇异矩阵或完整 FP64 词表权重副本，不使用随机
+初始化，也不需要 NPU 的 FP64 分解算子。SVD 仍有一次性启动计算和 CPU 工作空间开销，
+日志单独打印初始化秒数。每个 worker 加载模型时分解一次；启用 `PERSISTENT_WORKERS=1`
+后跨数据集复用，重启 worker 则重新计算。默认不写磁盘缓存。
+
+原始 W 保留用于精算，额外两个矩阵只作为运行时 buffer，跟随模型移动设备/转换 dtype。
+以 V=151936、H=2560、R=256 为例，BF16 因子占约 75.4 MiB。保存模型时这两个 buffer
+不进入权重文件，原始模型配置不变；评估命令、实际 rank、精筛数量和分解方法记录在
+`eval_command.txt` / `eval_config.json` 等复现材料中。
+
+指定 SVD rank 会优先使用新分解的运行时头，包括 checkpoint 已有训练候选头的情况；
+不指定则保持原有行为。不能同时指定 `CANDIDATE_HEAD=0`。默认使用精算，仍可显式设
+`CANDIDATE_RERANK=0` 对照纯低秩输出，但此时不能指定精筛数量或开启稀疏候选采样。
+SVD 不保证候选召回率或接受长度与完整头相同，应在相同模型、数据和温度下对照。
+
+### 可选低秩候选输出头训练（仅 LEAGLE）
+
+训练默认 `CANDIDATE_HEAD=0`，使用完整输出头；设置为 1 时从头创建并训练两个低秩矩阵，直接保存在 checkpoint 中，无需转换脚本或另做 SVD。`CANDIDATE_RERANK` 将两种训练方式分开：
+
+| `CANDIDATE_HEAD` | `CANDIDATE_RERANK` | 主 loss 的输出 | 额外候选 KL | 默认推理 |
+| --- | --- | --- | --- | --- |
+| `0` | 任意 | 原始完整输出头 `h × Wᵀ` | 无 | 完整头 |
+| `1` | `0` | 低秩头 `h × Bᵀ × Aᵀ` | 无 | 直接使用全 draft 词表低秩 logits |
+| `1` | `1`（训练默认） | 原始完整输出头 `h × Wᵀ` | 有，仅训练低秩头 | 低秩筛选后精算候选 |
+
+评估的两个开关均默认 `auto`，未指定 SVD rank 时跟随 checkpoint 的训练设置；旧 checkpoint 没有 `candidate_rerank` 时按 `true` 处理，保留原来的行为。物理层数和 loop 次数不改变每个草稿 token 的输出头调用次数。开启精算时执行：
 
 | 步骤              | 矩阵与输出维度（单个 token）                           |
 | ----------------- | ------------------------------------------------------ |
@@ -496,21 +543,46 @@ bash examples/evaluate/leagle_qwen3_4b_700k.sh
 | 精算              | 从原始 `W[V,H]` 取 `W_C[M,H]`，计算 `h × W_Cᵀ → [1,M]` |
 | 提议              | 使用精算 logits；候选之外的 draft logits 为 `-inf`     |
 
+两个评估开关支持以下对照，均可使用同一份训练好的候选头 checkpoint：
+
+| `CANDIDATE_HEAD` | `CANDIDATE_RERANK` | 推理输出 |
+| --- | --- | --- |
+| `0` | `0` 或 `auto` | 原始完整输出头 `h × Wᵀ` |
+| `1` | `0` | 直接使用 `h × Bᵀ × Aᵀ` 的全 draft 词表 logits，不取 top-k、不读取候选 W 行 |
+| `1` | `1` | 低秩 top-k 筛选，再用原始 W 行精算 |
+| `auto` | `auto` | 跟随 checkpoint 的训练设置 |
+
+评估时 `CANDIDATE_HEAD=0 CANDIDATE_RERANK=1` 会报错；关闭精算时也不能指定 `CANDIDATE_TOP_K` 或启用 `LEAGLE_SPARSE_CANDIDATES`，避免隐式截断低秩分布。训练的 `candidate_rerank` 决定主输出和梯度路径，因此保存在模型 `config.json` 中；评估覆盖值仅记录在 `eval_config.json` 与评估命令中，不修改 checkpoint。SAFE / NUMERICAL 等执行优化开关仍不写入模型配置。
+
 原始 `lm_head.weight` 保留且冻结，新增 `candidate_head.down_proj.weight[R,H]` 和 `candidate_head.up_proj.weight[V,R]`。全词表 Qwen3-4B 的 `H=2560`、`V=151936`，默认 `R=256`、`M=128`；这两个值是实验起点。`M` 是每个 token 的候选词数量，与 `SPEC_TOKENS=7` 的草稿序列长度独立。缩小词表模型在自己的 draft 词表上筛选，再用原有 d2t 映射到 target ID。
 
-候选头使用随机初始化，与主干同步训练。主干继续用原始完整输出头计算 CE/TV；候选头增加 `KL(softmax(W·stopgrad(h)) || softmax(A·B·stopgrad(h)))`，teacher 是同一个 drafter hidden state 的完整输出分布。辅助损失不向主干或 W 传梯度，top-k 只用于候选召回统计和推理，不直接反传。主干和候选头分别按 `MAX_GRAD_NORM` 裁剪梯度，避免辅助梯度改变主干的裁剪系数；两者沿用同一 LR 与 scheduler，当前脚本为 AdamW、LR=6e-4。使用 Muon 时，候选输出矩阵归入 AdamW 组。
+两个低秩矩阵均随机初始化。`CANDIDATE_HEAD=1 CANDIDATE_RERANK=0` 时，低秩 logits 直接参与原配置的主 CE/TV 或 KL，梯度同时更新 decoder 和两个低秩矩阵，不再计算辅助候选 KL。训练仍需要 target 的输出分布监督；去掉的是模仿 draft 完整输出头的额外目标。主干与低秩头按一个参数组裁剪梯度。原始 W 保留且冻结，供推理对照或精算使用，不执行 draft 的主训练投影。
+
+`CANDIDATE_HEAD=1 CANDIDATE_RERANK=1` 保留原辅助训练：主干用完整输出头计算主 loss；候选头增加 `KL(softmax(W·stopgrad(h)) || softmax(A·B·stopgrad(h)))`，teacher 是同一个 drafter hidden state 的完整输出分布。辅助损失不向主干或 W 传梯度，top-k 只用于召回统计和推理，不直接反传。主干和候选头分别按 `MAX_GRAD_NORM` 裁剪梯度，避免辅助梯度改变主干的裁剪系数。两种模式均沿用原 LR 与 scheduler，当前脚本为 AdamW、LR=6e-4；使用 Muon 时，低秩输出矩阵归入 AdamW 组。
+
+两种训练都不执行候选 W 行的精算。原辅助模式的额外开销来自低秩全词表投影、FP32 softmax/KL、参数梯度和分块调度；小块会降低矩阵乘法利用率。`256 → 151936` 的矩阵约 3889.6 万参数，远大于 `2560 → 256` 的降维矩阵（65.5 万参数）。新的低秩主输出模式去掉辅助 KL，并将 draft 的完整主投影换成两次低秩投影；仍有全词表 loss、可训练低秩权重梯度和 target 输出开销，实际训练速度和接受长度需要实测。
 
 | 环境变量                     | 默认值 | 训练参数                                   |
 | ---------------------------- | ------ | ------------------------------------------ |
 | `CANDIDATE_HEAD`             | `0`    | `--candidate-head` / `--no-candidate-head` |
+| `CANDIDATE_RERANK`           | `1`    | `--candidate-rerank` / `--no-candidate-rerank` |
 | `CANDIDATE_HEAD_RANK`        | `256`  | `--candidate-head-rank`                    |
 | `CANDIDATE_TOP_K`            | `128`  | `--candidate-head-top-k`                   |
 | `CANDIDATE_HEAD_LOSS_WEIGHT` | `1.0`  | `--candidate-head-loss-weight`             |
 | `CANDIDATE_HEAD_CHUNK_SIZE`  | `32`   | `--candidate-head-chunk-size`              |
+| `CANDIDATE_HEAD_TRAIN_STRIDE` | 空（新训练为 `1`，续训继承） | `--candidate-head-train-stride` |
 
-YAML 中对应字段放在 `draft` 组。候选 KL 复用同一 TTT 步中主干已经算出的 dense logits，不再为辅助 teacher 重算完整输出投影。每个 token 分块只执行一次低秩前向，并根据 `q-p` 计算两个矩阵的一阶梯度；所有 TTT 步累加到同一组 FP32 缓冲，最终通过一个 autograd 节点传给参数，保留普通梯度同步、loss 权重和裁剪流程。反向不再重算候选头或完整 teacher，不额外保存全序列词表激活，也不在 forward 中调用 backward。该实现仅支持一阶训练梯度。
+YAML 中对应字段放在 `draft` 组。低秩主输出模式沿用原生 autograd，支持现有分块主 loss、有效位置投影和 teacher 缓存；分块尺寸由 `LEAGLE_LOSS_CHUNK_SIZE` 控制，新训练默认 128。`CANDIDATE_HEAD_LOSS_WEIGHT` 和 `CANDIDATE_HEAD_CHUNK_SIZE` 只控制辅助 KL，对低秩主输出模式无效；`CANDIDATE_TOP_K` 只用于可选的推理精算。两组优化总开关会自动停用辅助候选梯度、候选块对齐和要求输出矩阵冻结的 `stream_main_loss`；单独强制启用这些不适用的路径会报错。
+
+以下梯度缓冲说明仅适用于原辅助模式的默认前向累积路径：候选 KL 复用同一 TTT 步中主干已经算出的 dense logits，不再为辅助 teacher 重算完整输出投影。每个 token 分块只执行一次低秩前向，并根据 `q-p` 计算两个矩阵的一阶梯度；所有 TTT 步累加到同一组 FP32 缓冲，最终通过一个 autograd 节点传给参数，保留普通梯度同步、loss 权重和裁剪流程。反向不再重算候选头或完整 teacher，不额外保存全序列词表激活，也不在 forward 中调用 backward。该辅助实现仅支持一阶训练梯度；选择 `leagle_candidate_backward_recompute` 则改为原生反向重算路径。
 
 梯度缓冲大小为 `4 × R × (V+H)` 字节，默认 Qwen3-4B 配置约 151 MiB，不随 token 数或 TTT 步数增加；分块投影、概率和梯度矩阵乘法仍需要临时显存。`CANDIDATE_HEAD_CHUNK_SIZE` 默认保持 32；增大它会减少分块调用，但提高临时显存，实际速度取决于设备。与原实现使用同一全词表 KL、mask、逐步衰减、rank 和候选数；BF16 矩阵乘法形状、梯度累积精度与次序变化可能带来舍入差异。训练仍需原始完整输出头以及新增候选 KL 的计算，推理加速不意味着训练也会比关闭候选头更快。
+
+需要保留「低秩粗筛 → top-k → 原始 W 行精算」时，可以保留完整头主监督，并减少候选辅助监督的位置数：`CANDIDATE_HEAD=1 CANDIDATE_RERANK=1 CANDIDATE_HEAD_TRAIN_STRIDE=8`。默认 `1` 保留全部位置；`8` 在每个 TTT 步的有效候选位置中每隔 8 个取一个，并随 TTT 步轮换起点。有效位置已排除 padding、跨文档预测和无监督位置；非空的短步至少取一个。抽样不使用随机数，不改变主干的 mask、主 loss 或独立梯度裁剪。辅助 KL 按本步实际抽取的位置数归一化，保留原 loss 权重。流式和反向重算两条候选路径都会跳过未抽取位置的低秩投影，空监督进程保留零参数梯度，支持 DDP/FSDP。
+
+这是改变候选训练数据量的可选实验，不是与全量 KL 等价的数值优化；SAFE / NUMERICAL 不会自动启用或覆盖它。候选召回率和接受长度可能变化。训练日志里的 `candidate_kl` / `candidate_recall` 对应抽取的位置，主干指标仍覆盖全部有效位置；验证始终使用全量候选监督，保持验证 loss 和 `checkpoint_best` 的比较口径。该参数只保存在 `run.yaml` 的 `draft` 组及训练命令中，不写入模型 `config.json`，不影响推理开关。续训可显式设为 `1` 恢复全量，空值继承保存配置；低秩主输出模式没有辅助 KL，不接受大于 1 的候选训练间隔。
+
+长序列下，间隔 8 将候选投影、KL 和相关梯度的 token 工作量减少到约 1/8；主干、target 输出、主 loss、固定参数梯度缓冲和通信仍保留。实际提速还取决于分块大小和设备利用率，不能据此承诺整步提速 8 倍或达到 MMuse 的耗时。改变 chunk 大小只改变执行方式，改变 train stride 则减少监督，两者独立。
 
 继续使用原有服务和训练两份脚本。在两个终端中设置相同的 `OUTPUT_DIR`，保证隐藏状态文件路径一致：
 
@@ -519,35 +591,40 @@ OUTPUT_DIR=./output/leagle_candidate_r256 \
 bash examples/train/leagle_qwen3_4b_700k/server.sh
 
 OUTPUT_DIR=./output/leagle_candidate_r256 CANDIDATE_HEAD=1 \
-CANDIDATE_HEAD_RANK=256 CANDIDATE_TOP_K=128 \
+CANDIDATE_RERANK=1 CANDIDATE_HEAD_RANK=256 CANDIDATE_TOP_K=128 \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-不带候选头的对照实验设置 `CANDIDATE_HEAD=0`，使用另一组匹配的服务/训练输出目录。其余数据、seed、层数、loop、LR 和 epoch 保持一致。同 seed 下候选头初始化不会消耗主干初始化或训练随机数。`RESUME=1` 从原 `run.yaml` 恢复开关及参数；不能在同一次训练的中途增删候选头或改变 rank。新 checkpoint 的权重和配置可直接加载，不支持把已有 dense checkpoint 自动转成候选头模型。
+测试低秩主输出时，换一组匹配的服务/训练输出目录，并设 `CANDIDATE_HEAD=1 CANDIDATE_RERANK=0`。不带候选头的对照实验设置 `CANDIDATE_HEAD=0`。其余数据、seed、层数、loop、LR 和 epoch 保持一致。同 seed 下候选头初始化不会消耗主干初始化或训练随机数。`RESUME=1` 从原 `run.yaml` 恢复开关及参数；不能在同一次训练中途增删候选头、改变 rank 或切换主输出训练方式。新 checkpoint 的权重和配置可直接加载；训练入口不自动转换已有 dense checkpoint，纯推理可使用上面的 SVD 运行时头。
 
-增加三项聚合日志：`draft_loss` 为原主干 loss，`candidate_kl` 为有效 token 上的平均辅助 KL，`candidate_recall` 为候选集包含完整输出头 top-1 的比例。`loss` 是主干 loss 加上加权候选损失，候选损失沿用 TTT 的逐步衰减；普通验证同样报告这些指标。`checkpoint_best` 仍按验证 `loss` 选择，开启候选头时该值包含辅助项。原 `accept_len/eal` 指标仍来自 dense、teacher-forced 轨迹；真实候选接受长度需要离线评估。
+辅助模式增加三项聚合日志：`draft_loss` 为原主干 loss，`candidate_kl` 为有效 token 上的平均辅助 KL，`candidate_recall` 为候选集包含完整输出头 top-1 的比例。`loss` 是主干 loss 加上加权候选损失，候选损失沿用 TTT 的逐步衰减；普通验证同样报告这些指标。低秩主输出模式没有这三项辅助日志，`loss` 仅含主 loss。`checkpoint_best` 仍按验证 `loss` 选择。`accept_len/eal` 来自实际训练输出头的 teacher-forced 轨迹：辅助模式用完整头，低秩主输出模式用低秩头；真实接受长度仍需离线评估。
 
-同一个训练 checkpoint 可以切换 dense / candidate 推理，评估路径仍手动指定：
+同一个训练 checkpoint 可以切换 dense / low-rank / candidate 推理，评估路径仍手动指定：
 
 ```bash
 # Dense 对照：明确关闭训练好的候选头。
 DRAFT_MODEL=/path/to/checkpoints/4 CANDIDATE_HEAD=0 \
 OUTPUT_DIR=eval_leagle_dense bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
-# 默认自动读取 checkpoint 开关、rank 和候选数，温度默认 1。
+# 仅低秩输出：不筛选候选、不用原始 W 精算。
+DRAFT_MODEL=/path/to/checkpoints/4 CANDIDATE_HEAD=1 CANDIDATE_RERANK=0 \
+OUTPUT_DIR=eval_leagle_lowrank bash examples/evaluate/leagle_qwen3_4b_700k.sh
+
+# 强制低秩检索 + W 精算；温度默认 1。
 DRAFT_MODEL=/path/to/checkpoints/4 \
-OUTPUT_DIR=eval_leagle_candidate128 bash examples/evaluate/leagle_qwen3_4b_700k.sh
+CANDIDATE_HEAD=1 CANDIDATE_RERANK=1 OUTPUT_DIR=eval_leagle_candidate128 \
+bash examples/evaluate/leagle_qwen3_4b_700k.sh
 
 # 改候选数无需重训；改 rank 需要新建训练实验。
-DRAFT_MODEL=/path/to/checkpoints/4 CANDIDATE_TOP_K=256 \
+DRAFT_MODEL=/path/to/checkpoints/4 CANDIDATE_RERANK=1 CANDIDATE_TOP_K=256 \
 OUTPUT_DIR=eval_leagle_candidate256 bash examples/evaluate/leagle_qwen3_4b_700k.sh
 ```
 
-直接调用评估入口时，默认按 checkpoint 决定是否开启；用 `--no-candidate-head` 强制关闭，`--candidate-head` 强制开启，`--candidate-top-k M` 覆盖候选数。参数传递到每个 NPU worker，`eval_config.json` 记录实际开关、rank、候选数和概率支持集。没有候选头的模型强制开启会报错；缺失、尺寸不匹配或非有限低秩权重也会被拒绝。EAGLE3 不支持此开关。
+直接调用评估入口时，默认按 checkpoint 决定是否开启；用 `--no-candidate-head` 强制关闭，`--candidate-head` 强制开启，`--no-candidate-rerank` 直接使用低秩 logits，`--candidate-rerank` 启用候选精算，`--candidate-top-k M` 覆盖精算候选数。参数传递到每个 NPU worker，`eval_config.json` 记录实际开关、rank、候选数和概率支持集。没有候选头的模型强制开启会报错；缺失、尺寸不匹配或非有限低秩权重也会被拒绝。EAGLE3 不支持开启候选头。
 
-`temperature>0` 时，q 是候选内的精算 logits 按温度重新归一化后的分布；候选外 q=0，验证使用这一真实 q 做接受和残差修正，因此 target 仍可生成候选集合外的 token。`temperature=0` 时仍用 target 贪心验证纠正候选错误。候选遗漏可能降低接受长度；固定 seed 也不保证与 dense draft 生成相同的采样文本。评估开关只改变提议路径，不改变 checkpoint 内的训练配置。
+`temperature>0` 且启用精算时，q 是候选内的精算 logits 按温度重新归一化后的分布，候选外 q=0；直接低秩模式的 q 则来自全 draft 词表的低秩 logits。验证始终使用实际 q 做接受和残差修正，因此 target 仍可生成 draft 支持集之外的 token。`temperature=0` 时仍用 target 贪心验证纠正候选错误。候选遗漏或低秩分数误差可能降低接受长度；固定 seed 也不保证与 dense draft 生成相同的采样文本。评估开关只改变提议路径，不改变 checkpoint 内的训练配置。
 
-**这是从头联合训练的实验设置，与 EAGLE4 先训练主干、再冻结主干专门训练候选头的两阶段流程不同。** 候选头跟随训练中不断变化的 hidden-state 分布学习，效果需通过候选召回和实际接受长度验证。本实现保留完整输出矩阵，候选模式额外持有两组低秩权重；采用 PyTorch 的投影、top-k、gather 和散射，仍保留全词表形状的 logits。尚未实测 NPU 训练显存或推理吞吐。
+两种模式都是从头联合训练的实验。低秩主输出不是完整头的数值等价优化，会改变训练梯度和 draft 分布；接受长度需要分别测量。同一个 checkpoint 可以切换推理方式，但主输出训练并未约束低秩分数接近 W 的分数，切回 W 精算或 dense 不保证效果更好。本实现保留完整输出矩阵，额外持有两组低秩权重；采用 PyTorch 投影，默认仍保留全词表形状的 logits。尚未实测 NPU 训练显存或推理吞吐。
 
 ```bash
 PYTHONPATH=src:hs_connectors/src python -m pytest tests/unit/models/test_leagle.py -q

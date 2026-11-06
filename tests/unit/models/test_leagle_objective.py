@@ -12,7 +12,7 @@ from .test_leagle import make_model
 from .test_leagle_training_diagnostics import packed_batch
 
 
-def explicit_objective(model, states, inputs, decay):
+def explicit_objective(model, states, inputs, decay, candidate_stride=1):
     """Independent hard CE + TV and auxiliary KL, with whole-step denominators."""
     with torch.no_grad():
         teacher = model.verifier_lm_head(
@@ -51,6 +51,12 @@ def explicit_objective(model, states, inputs, decay):
             -1
         )
         candidate_mask = valid[:, :width] & mask
+        if candidate_stride > 1:
+            eligible = candidate_mask[0].nonzero(as_tuple=True)[0]
+            candidate_mask = torch.zeros_like(candidate_mask)
+            if eligible.numel():
+                phase = step % min(candidate_stride, eligible.numel())
+                candidate_mask[0, eligible[phase::candidate_stride]] = True
         auxiliary = auxiliary + (
             kl * candidate_mask
         ).sum() * decay**step / candidate_mask.sum().clamp_min(1)

@@ -17,6 +17,20 @@ from speculators.models.leagle.teacher_cache import TeacherCache, validate_teach
 from speculators.models.leagle.training import TVOverlapProbe
 
 
+def select_candidate_positions(mask, stride, step):
+    """Select every Nth eligible position, rotating the phase across TTT steps.
+
+    Count eligible positions rather than padding/prompt positions. Short nonempty
+    steps retain at least one sample; no RNG state is consumed or checkpointed.
+    This is a deterministic subsampled objective, not full-KL equivalence.
+    """
+    if stride == 1:
+        return mask
+    ordinal = mask.long().cumsum(-1) - 1
+    phase = step % mask.sum(-1, keepdim=True).clamp(min=1, max=stride)
+    return mask & (ordinal.remainder(stride) == phase)
+
+
 class TrainingObjective:
     def __init__(
         self,
@@ -41,6 +55,7 @@ class TrainingObjective:
         cache_supervised=False,
         shared_normalization=False,
         stream_main_loss=False,
+        candidate_train_stride=1,
     ):
         self.model, self.docs, self.decay = model, docs, decay
         # Combining CE/TV adjoints before a low-precision cast changes gradients.
@@ -50,10 +65,14 @@ class TrainingObjective:
         )
         self.stream_main_loss = stream_main_loss
         self.candidate_backward_recompute = candidate_backward_recompute
+        self.candidate_train_stride = candidate_train_stride
         self.masked_head, self.need_predictions = masked_head, need_predictions
         self.collect_metrics, self.chunk_size = collect, chunk_size
         self.draft_weight, self.teacher_weight = training_output_weights(
             model, cache_autocast=cache_frozen_head_weights and bool(chunk_size)
+        )
+        self.down_weight = (
+            model.candidate_head.down_proj.weight if model.low_rank_main else None
         )
         self.loss_config = (
             {"kl_div": (kl_div_loss, 1.0)} if loss_config is None else loss_config
@@ -62,10 +81,10 @@ class TrainingObjective:
         self.candidate_loss = (
             model.candidate_head.loss_accumulator(
                 grad_addmm=grad_addmm,
-                valid_only=masked_head,
+                valid_only=masked_head or candidate_train_stride > 1,
                 backward_recompute=candidate_backward_recompute,
             )
-            if model.candidate_head is not None
+            if model.candidate_head is not None and not model.low_rank_main
             else None
         )
         self.candidate_counts = {
@@ -80,7 +99,7 @@ class TrainingObjective:
         if shared_normalization or stream_main_loss:
             validate_teacher_cache(self.loss_config, teacher_hidden.device)
         if stream_main_loss and (
-            model.lm_head.weight.requires_grad
+            self.draft_weight.requires_grad
             or model.verifier_lm_head.weight.requires_grad
         ):
             raise ValueError("Streaming main loss requires frozen output matrices")
@@ -114,13 +133,19 @@ class TrainingObjective:
             if not self.need_predictions:
                 return None
             return (
-                predict_chunks(hidden, self.draft_weight, self.chunk_size)
+                predict_chunks(
+                    hidden, self.draft_weight, self.chunk_size, self.down_weight
+                )
                 if logits is None
                 else logits.argmax(-1)
             )
         mask = self.valid.clone()
         if step:
             mask[:, step:] &= self.docs[:, step:] == self.docs[:, :-step]
+        width = hidden.shape[1] - step
+        self.step_candidate_mask = select_candidate_positions(
+            self.valid[:, :width] & mask[:, step:], self.candidate_train_stride, step
+        )
         ids, loss = (
             masked_training_step(self, hidden, step, mask)
             if self.masked_head
@@ -132,11 +157,19 @@ class TrainingObjective:
         if self.candidate_backward_recompute:
             # A complete TTT step owns one candidate backward, independently of
             # the main loss chunks/compaction. Do not retain their dense logits.
-            width = hidden.shape[1] - step
+            candidate_hidden = hidden[:, :width]
+            candidate_mask = self.step_candidate_mask
+            if self.candidate_train_stride > 1:
+                indices = candidate_mask[0].nonzero(as_tuple=True)[0]
+                # One masked placeholder keeps distributed parameter gradients
+                # connected when this rank has no candidate supervision.
+                selected = indices if indices.numel() else slice(0, 1)
+                candidate_hidden = candidate_hidden[:, selected]
+                candidate_mask = candidate_mask[:, selected]
             counts = self.candidate_loss.add(
-                hidden[:, :width],
+                candidate_hidden,
                 self.draft_weight,
-                self.valid[:, :width] & mask[:, step:],
+                candidate_mask,
                 top_k=self.model.config.candidate_head_top_k,
                 chunk_size=self.model.config.candidate_head_chunk_size,
                 normalize=True,
@@ -173,7 +206,7 @@ class TrainingObjective:
         self.add_candidate(
             hidden[:, :width],
             logits[:, :width],
-            self.valid[:, :width] & mask[:, step:],
+            self.step_candidate_mask,
             normalize=True,
             loss_scale=self.decay**step,
         )

@@ -24,14 +24,15 @@ def deterministic_cpu():
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
 @pytest.mark.parametrize("reduced", [False, True])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize("rerank", [False, True])
 def test_candidate_head_with_cache_matches_rebuild_and_target_greedy(
-    temperature, reduced, dtype
+    temperature, reduced, dtype, rerank
 ):
     target, draft = make_real_models(
         layers=2, loops=3, reduced=reduced, candidate_head=True
     )
     target, draft = target.to(dtype), draft.to(dtype)
-    draft.set_candidate_head(True)
+    draft.set_candidate_head(True, rerank=rerank)
     inputs = torch.tensor([[5, 9, 2]])
     responses = []
     for reuse in (False, True):
@@ -93,12 +94,26 @@ def test_real_candidate_q_and_residual_recover_tokens_outside_candidates(
 
 
 @pytest.mark.parametrize("temperature", [0.0, 1.0])
-@pytest.mark.parametrize("switch", [None, False, True])
+@pytest.mark.parametrize("training_rerank", [False, True])
+@pytest.mark.parametrize(
+    ("switch", "rerank"),
+    [
+        (None, None),
+        (False, None),
+        (True, None),
+        (None, False),
+        (True, False),
+        (False, False),
+        (True, True),
+    ],
+)
 def test_training_checkpoint_and_eval_workers_and_provenance(
-    tmp_path, temperature, switch
+    tmp_path, temperature, switch, rerank, training_rerank
 ):
     args = save_fixture(tmp_path)
-    _, draft = make_real_models(layers=2, loops=3, candidate_head=True)
+    _, draft = make_real_models(
+        layers=2, loops=3, candidate_head=True, candidate_rerank=training_rerank
+    )
     draft.train()
     _, loss, _ = draft(
         hidden_states=torch.randn(1, 4, 32),
@@ -113,7 +128,11 @@ def test_training_checkpoint_and_eval_workers_and_provenance(
     draft.save_pretrained(args.draft_model)
     assert SpeculatorModel.from_pretrained(args.draft_model).candidate_head_enabled
     args.candidate_head = switch
-    args.candidate_top_k = 2 if switch is not False else None
+    args.candidate_rerank = rerank
+    uses_reranking = switch is not False and (
+        training_rerank if rerank is None else rerank
+    )
+    args.candidate_top_k = 2 if uses_reranking else None
     args.temperature, args.check_greedy = temperature, temperature == 0
     entrypoint = Path("scripts/evaluate/leagle_offline_eval.py")
     worker = parallel.worker_command(
@@ -126,15 +145,26 @@ def test_training_checkpoint_and_eval_workers_and_provenance(
     )
     child = leagle.build_parser().parse_args(worker[2:])
     assert child.candidate_head is switch
+    assert child.candidate_rerank is rerank
     assert child.candidate_top_k == args.candidate_top_k
     leagle.run(args, entrypoint=entrypoint)
     metadata = json.loads((args.output_dir / "eval_config.json").read_text())
     assert metadata["candidate_head"]["enabled"] is (switch is not False)
     assert metadata["candidate_head"]["rank"] == 4
+    assert metadata["candidate_head"]["rerank"] is uses_reranking
     assert metadata["candidate_head"]["top_k"] == args.candidate_top_k
     assert metadata["candidate_head"]["proposal_support"] == (
-        "retrieved-candidates" if switch is not False else "draft-vocabulary"
+        "retrieved-candidates" if uses_reranking else "draft-vocabulary"
     )
+    assert metadata["candidate_head"]["scoring"] == (
+        "low-rank-retrieval-exact-rescore"
+        if uses_reranking
+        else "low-rank"
+        if switch is not False
+        else "dense"
+    )
+    saved_config = json.loads((Path(args.draft_model) / "config.json").read_text())
+    assert saved_config["candidate_rerank"] is training_rerank
     summary = json.loads((args.output_dir / "summary.json").read_text())
     assert summary[0]["num_requests"] == 2
     assert 1 <= summary[0]["acceptance_length"] <= 8
@@ -165,3 +195,30 @@ def test_auto_switch_follows_dense_checkpoint_and_rejects_candidate_count(tmp_pa
     args.candidate_top_k = 2
     with pytest.raises(ValueError, match="requires an enabled"):
         leagle.candidate_head_settings(args, config)
+
+
+def test_reranking_flags_reject_incompatible_modes_before_loading(tmp_path):
+    args = save_fixture(tmp_path)
+    _, draft = make_real_models(candidate_head=True)
+    config = draft.config.to_dict()
+    args.candidate_rerank = False
+    args.candidate_top_k = 2
+    with pytest.raises(ValueError, match="requires candidate reranking"):
+        leagle.validate_args(args)
+    with pytest.raises(ValueError, match="requires candidate reranking"):
+        leagle.candidate_head_settings(args, config)
+    args.candidate_top_k = None
+    args.leagle_sparse_candidates = True
+    with pytest.raises(
+        ValueError, match="Sparse candidates require candidate reranking"
+    ):
+        leagle.optimization_settings(args, config)
+    args.leagle_sparse_candidates = False
+    args.candidate_head, args.candidate_rerank = False, True
+    with pytest.raises(ValueError, match="requires an enabled candidate head"):
+        leagle.validate_args(args)
+    with pytest.raises(ValueError, match="requires an enabled candidate head"):
+        leagle.candidate_head_settings(args, config)
+    args.candidate_head = None
+    with pytest.raises(ValueError, match="requires an enabled candidate head"):
+        leagle.candidate_head_settings(args, {**config, "candidate_head": False})

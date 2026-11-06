@@ -19,6 +19,7 @@ from speculators.models.leagle.head_gradients import (
     FrozenHeadGradients,
     supports_fp32_head,
 )
+from speculators.models.leagle.output_head import project_output
 from speculators.models.leagle.shared_loss import normalized_distribution, shared_terms
 from speculators.models.leagle.teacher_cache import cached_terms
 from speculators.models.leagle.training import TVOverlapProbe
@@ -45,6 +46,7 @@ def _project_chunk(
     teacher_hidden,
     weight,
     teacher_weight,
+    down_weight=None,
     *,
     loss_config,
     metrics,
@@ -56,7 +58,7 @@ def _project_chunk(
     predict=True,
     shared_normalization=False,
 ):
-    logits = functional.linear(hidden, weight)
+    logits = project_output(hidden, weight, down_weight)
     if shared_normalization:
         if teacher_cache is not None:
             probabilities, target_ids = teacher_cache.get(
@@ -132,10 +134,12 @@ def _reduce_terms(parts, loss_config, mask, step, decay):
 
 
 @torch.no_grad()
-def predict_chunks(hidden, weight, chunk_size):
+def predict_chunks(hidden, weight, chunk_size, down_weight=None):
     return torch.cat(
         [
-            functional.linear(hidden[:, start : start + chunk_size], weight).argmax(-1)
+            project_output(
+                hidden[:, start : start + chunk_size], weight, down_weight
+            ).argmax(-1)
             for start in range(0, hidden.shape[1], chunk_size)
         ],
         dim=1,
@@ -143,7 +147,6 @@ def predict_chunks(hidden, weight, chunk_size):
 
 
 def chunked_training_step(objective, hidden, step, step_mask):
-    model = objective.model
     width = hidden.shape[1] - step
     plans = (
         objective.teacher_cache.plan_chunks(width, objective.chunk_size, start=step)
@@ -153,7 +156,7 @@ def chunked_training_step(objective, hidden, step, step_mask):
     gradients = main_head_gradients(objective, hidden, step, step_mask[:, step:])
     parts = [[] for _ in objective.loss_config]
     predictions, target_ids, overlaps = [], [], []
-    candidate_mask = objective.valid[:, :width] & step_mask[:, step:]
+    candidate_mask = objective.step_candidate_mask
     candidate_scale = objective.decay**step / candidate_mask.sum(
         dtype=torch.float32
     ).clamp_min(1)
@@ -161,7 +164,7 @@ def chunked_training_step(objective, hidden, step, step_mask):
         _project_chunk,
         loss_config=objective.loss_config,
         metrics=objective.collect_metrics,
-        candidate=model.candidate_head is not None,
+        candidate=objective.candidate_loss is not None,
         predict=objective.need_predictions or objective.collect_metrics,
         shared_normalization=objective.shared_normalization,
     )
@@ -184,6 +187,7 @@ def chunked_training_step(objective, hidden, step, step_mask):
             objective.targets[:, start + step : end + step],
             objective.draft_weight,
             objective.teacher_weight,
+            objective.down_weight,
         )
         result = (
             gradients.project(project, arguments, slice(start, end))
@@ -202,7 +206,7 @@ def chunked_training_step(objective, hidden, step, step_mask):
         if objective.collect_metrics:
             target_ids.append(labels)
             overlaps.append(overlap)
-        if model.candidate_head is not None:
+        if objective.candidate_loss is not None:
             # Use the full step's denominator for every chunk, never a per-chunk mean.
             objective.add_candidate(
                 hidden[:, start:end],
@@ -220,7 +224,10 @@ def chunked_training_step(objective, hidden, step, step_mask):
     if step and objective.need_predictions:
         predictions.append(
             predict_chunks(
-                hidden[:, width:], objective.draft_weight, objective.chunk_size
+                hidden[:, width:],
+                objective.draft_weight,
+                objective.chunk_size,
+                objective.down_weight,
             )
         )
     loss = _reduce_terms(

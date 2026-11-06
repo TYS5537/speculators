@@ -31,6 +31,7 @@ def make_model(
     window=None,
     reduced=False,
     candidate_head=False,
+    candidate_rerank=True,
 ):
     decoder = Qwen3Config(
         vocab_size=24,
@@ -53,6 +54,7 @@ def make_model(
         aux_hidden_state_layer_ids=[0, 1],
         num_loops=loops,
         candidate_head=candidate_head,
+        candidate_rerank=candidate_rerank,
         candidate_head_rank=4,
         candidate_head_top_k=3,
         candidate_head_chunk_size=2,

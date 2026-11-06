@@ -1,8 +1,9 @@
-"""Optional low-rank retrieval followed by exact, full-width candidate scoring.
+"""Low-rank vocabulary scoring with optional full-width candidate rescoring.
 
 The original LM head stays intact. Returned logits have the draft vocabulary's
 shape, with -inf outside the retrieved set. They describe the *actual* proposal
-distribution, including its restricted support, for rejection sampling.
+distribution, including its restricted support, for rejection sampling. Disabling
+rescoring returns the low-rank logits over the entire draft vocabulary.
 """
 
 import torch
@@ -12,6 +13,20 @@ from torch.nn import functional
 from speculators.models.leagle.candidate_loss import CandidateLossAccumulator
 from speculators.models.leagle.candidate_recompute import RecomputedCandidateLoss
 from speculators.models.leagle.sparse_candidates import SparseCandidateLogits
+
+
+def rescore_candidates(hidden_states, coarse, full_weight, top_k, *, sparse=False):
+    """Score retrieved rows with the original hidden state and output matrix."""
+    vocab_size = coarse.shape[-1]
+    if not 1 <= top_k <= vocab_size:
+        raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
+    candidates = coarse.topk(top_k, dim=-1, sorted=False).indices
+    rows = functional.embedding(candidates, full_weight)
+    exact = torch.matmul(rows, hidden_states.unsqueeze(-1)).squeeze(-1)
+    if sparse:
+        return SparseCandidateLogits(candidates, exact, vocab_size)
+    logits = hidden_states.new_full((*hidden_states.shape[:-1], vocab_size), -torch.inf)
+    return logits.scatter_(-1, candidates, exact)
 
 
 class LowRankCandidateHead(nn.Module):
@@ -62,19 +77,17 @@ class LowRankCandidateHead(nn.Module):
         )
         return accumulator.loss(), recall, count
 
-    def forward(self, hidden_states, full_weight, top_k: int, *, sparse=False):
-        vocab_size = self.up_proj.out_features
-        if not 1 <= top_k <= vocab_size:
-            raise ValueError("Candidate top_k must be in [1, draft_vocab_size]")
-        candidates = (
-            self.coarse_logits(hidden_states).topk(top_k, dim=-1, sorted=False).indices
+    def forward(
+        self, hidden_states, full_weight, top_k: int, *, sparse=False, rerank=True
+    ):
+        if not rerank:
+            if sparse:
+                raise ValueError("Sparse candidates require candidate reranking")
+            return self.coarse_logits(hidden_states)
+        return rescore_candidates(
+            hidden_states,
+            self.coarse_logits(hidden_states),
+            full_weight,
+            top_k,
+            sparse=sparse,
         )
-        # Only M rows of W[V,H] take part in the full-width dot product.
-        rows = functional.embedding(candidates, full_weight)
-        exact = torch.matmul(rows, hidden_states.unsqueeze(-1)).squeeze(-1)
-        if sparse:
-            return SparseCandidateLogits(candidates, exact, vocab_size)
-        logits = hidden_states.new_full(
-            (*hidden_states.shape[:-1], vocab_size), -torch.inf
-        )
-        return logits.scatter_(-1, candidates, exact)

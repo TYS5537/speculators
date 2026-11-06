@@ -116,6 +116,12 @@ class DraftArgs(_Group):
         description="LEAGLE: jointly train a low-rank candidate output head.",
         json_schema_extra=_CLI_BOOL_OPTIONAL,
     )
+    candidate_rerank: bool = Field(
+        default=True,
+        description="LEAGLE: train auxiliary retrieval for exact rescoring. "
+        "Use --no-candidate-rerank with --candidate-head for a low-rank main loss.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
     candidate_head_rank: int = Field(default=256, gt=0)
     candidate_head_top_k: int = Field(default=128, gt=0)
     candidate_head_loss_weight: float = Field(
@@ -128,6 +134,13 @@ class DraftArgs(_Group):
         default=32,
         gt=0,
         description="Rows per streamed candidate KL chunk; bounds temporary memory.",
+    )
+    candidate_head_train_stride: int = Field(
+        default=1,
+        gt=0,
+        description="LEAGLE: train auxiliary candidate KL on every Nth eligible "
+        "position; 1 keeps all. Main loss and validation stay complete. "
+        "Changes candidate supervision; saved in run.yaml, not model config.",
     )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
@@ -1079,9 +1092,14 @@ class TrainConfig(BaseSettings):
 
     @model_validator(mode="after")
     def _validate_candidate_head(self) -> "TrainConfig":
-        if self.draft.candidate_head and self.speculator_type != "leagle":
+        if (
+            self.draft.candidate_head
+            or not self.draft.candidate_rerank
+            or self.draft.candidate_head_train_stride > 1
+        ) and self.speculator_type != "leagle":
             raise ValueError(
-                "--candidate-head is only supported by --speculator-type leagle"
+                "--candidate-head / --no-candidate-rerank are only supported "
+                "by --speculator-type leagle"
             )
         return self
 
