@@ -142,6 +142,17 @@ class DraftArgs(_Group):
         "position; 1 keeps all. Main loss and validation stay complete. "
         "Changes candidate supervision; saved in run.yaml, not model config.",
     )
+    candidate_head_only: bool = Field(
+        default=False,
+        description="LEAGLE second stage: load --from-pretrained, freeze the draft "
+        "and train only candidate KL. Runtime training policy; not model config.",
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+    )
+    candidate_head_init: Literal["svd", "random"] = Field(
+        default="svd",
+        description="Initialization for a missing second-stage candidate head; "
+        "existing checkpoint factors are always retained. Saved in run.yaml only.",
+    )
     draft_arch: Literal["llama", "qwen3"] | None = Field(
         default=None,
         description="Architecture for draft decoder layers "
@@ -1094,12 +1105,33 @@ class TrainConfig(BaseSettings):
     def _validate_candidate_head(self) -> "TrainConfig":
         if (
             self.draft.candidate_head
+            or self.draft.candidate_head_only
             or not self.draft.candidate_rerank
             or self.draft.candidate_head_train_stride > 1
         ) and self.speculator_type != "leagle":
             raise ValueError(
                 "--candidate-head / --no-candidate-rerank are only supported "
                 "by --speculator-type leagle"
+            )
+        if self.draft.candidate_head_only and (
+            not self.draft.from_pretrained or not self.draft.candidate_rerank
+        ):
+            raise ValueError(
+                "--candidate-head-only requires --from-pretrained "
+                "and candidate reranking"
+            )
+        if self.draft.candidate_head_only and any(
+            value is not None
+            for value in (
+                self.draft.draft_vocab_size,
+                self.draft.d2t_path,
+                self.draft.t2d_path,
+                self.draft.token_freq_path,
+            )
+        ):
+            raise ValueError(
+                "Candidate-only training inherits vocabulary mappings; "
+                "omit vocabulary overrides"
             )
         return self
 

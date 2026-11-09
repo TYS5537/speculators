@@ -123,6 +123,12 @@ def main(cfg: TrainConfig):  # noqa: C901
     # New code should read cfg.<group>.<field> directly and must NOT add new
     # args.* accesses below this line.
     cfg = _resolve_checkpoint_recipe(cfg)
+    if cfg.draft.candidate_head_only:
+        from speculators.train.leagle_candidate import (  # noqa: PLC0415
+            validate_candidate_destination,
+        )
+
+        validate_candidate_destination(cfg.draft.from_pretrained, cfg.trainer.save_path)
     args = argparse.Namespace(**cfg.flatten())
     provided = {key for key, source in cfg.provenance.items() if source != "default"}
     vars(args)["_provided_model_config_dests"] = provided
@@ -187,6 +193,9 @@ def main(cfg: TrainConfig):  # noqa: C901
         # transformer_layer_config is resolved later in build_draft_model.
         d2t, t2d, draft_vocab_size = None, None, None
         args.mask_token_id = None
+    elif cfg.draft.candidate_head_only:
+        # A frozen draft must retain its checkpoint-resident token mapping.
+        d2t, t2d, draft_vocab_size = None, None, None
     else:
         d2t, t2d, draft_vocab_size = parse_vocab_mappings(args)
 

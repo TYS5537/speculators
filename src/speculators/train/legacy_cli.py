@@ -61,7 +61,7 @@ _LEGACY_FIELDS = """
     log_dir run_name num_layers num_loops draft_arch draft_hidden_act
     candidate_head candidate_rerank candidate_head_rank candidate_head_top_k
     candidate_head_loss_weight candidate_head_chunk_size
-    candidate_head_train_stride
+    candidate_head_train_stride candidate_head_only candidate_head_init
     draft_mrope_full_head_hack
     target_layer_ids target_hidden_state_format dsv4_external_arrow token_freq_path
     draft_vocab_size d2t_path t2d_path mask_token_id ttt_steps num_speculative_steps
@@ -254,10 +254,30 @@ def _validate_leagle_args(parser, args) -> None:
     _validate_leagle_optimizations(parser, args)
     if (
         args.candidate_head
+        or args.candidate_head_only
         or not args.candidate_rerank
         or args.candidate_head_train_stride > 1
     ) and args.speculator_type != "leagle":
         parser.error("--candidate-head is only supported by --speculator-type leagle")
+    if args.candidate_head_only and (
+        not args.from_pretrained or not args.candidate_rerank
+    ):
+        parser.error(
+            "--candidate-head-only requires --from-pretrained and candidate reranking"
+        )
+    if args.candidate_head_only and any(
+        value is not None
+        for value in (
+            args.draft_vocab_size,
+            args.d2t_path,
+            args.t2d_path,
+            args.token_freq_path,
+        )
+    ):
+        parser.error(
+            "Candidate-only training inherits vocabulary mappings; "
+            "omit vocabulary overrides"
+        )
     if (
         min(
             args.candidate_head_rank,

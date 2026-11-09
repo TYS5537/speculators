@@ -23,7 +23,7 @@ NUM_LAYERS="${NUM_LAYERS:-1}"
 NUM_LOOPS="${NUM_LOOPS:-1}"
 DATA_PATH="${DATA_PATH:-../../datasets/open_perfectblend_qwen3_4b_700k}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs}"
-RUN_NAME="leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs"
+RUN_NAME="${RUN_NAME:-leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs}"
 VLLM_PORT="${VLLM_PORT:-8003}"
 VLLM_ENDPOINT="http://127.0.0.1:${VLLM_PORT}/v1"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
@@ -67,6 +67,9 @@ LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-legacy}"
 # Optional candidate head, created and trained from scratch with the draft.
 # RERANK=0 trains it directly through the main loss; RERANK=1 adds detached KL.
 CANDIDATE_HEAD="${CANDIDATE_HEAD:-0}"
+CANDIDATE_HEAD_ONLY="${CANDIDATE_HEAD_ONLY:-0}"  # Second stage: freeze a loaded draft, train candidate KL only.
+CANDIDATE_HEAD_INIT="${CANDIDATE_HEAD_INIT:-svd}"  # New second-stage head: svd or random; existing head weights are retained.
+DRAFT_MODEL="${DRAFT_MODEL:-}"  # Required for a new CANDIDATE_HEAD_ONLY=1 run.
 CANDIDATE_RERANK="${CANDIDATE_RERANK:-1}"  # 0: low-rank main loss; 1: dense main loss + auxiliary retrieval KL.
 CANDIDATE_HEAD_RANK="${CANDIDATE_HEAD_RANK:-256}"
 CANDIDATE_TOP_K="${CANDIDATE_TOP_K:-128}"
@@ -122,12 +125,22 @@ RESUME="${RESUME:-0}"
 DRY_RUN="${DRY_RUN:-0}"  # Print the resolved launch command without loading models.
 
 # ============ Launch ============
-for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN CANDIDATE_HEAD CANDIDATE_RERANK; do
+for setting in FSDP_SHARD ACTIVATION_CHECKPOINTING RESUME DRY_RUN CANDIDATE_HEAD CANDIDATE_RERANK CANDIDATE_HEAD_ONLY; do
     if [[ "${!setting}" != 0 && "${!setting}" != 1 ]]; then
         echo "$setting must be 0 or 1." >&2
         exit 2
     fi
 done
+if [[ "$CANDIDATE_HEAD_ONLY" == 1 && "$RESUME" == 0 ]]; then
+    if [[ -z "$DRAFT_MODEL" || "$CANDIDATE_RERANK" != 1 ]]; then
+        echo 'Candidate-only training requires DRAFT_MODEL and CANDIDATE_RERANK=1.' >&2; exit 2
+    fi
+    case "$CANDIDATE_HEAD_INIT" in
+        svd|random) ;;
+        *) echo 'CANDIDATE_HEAD_INIT must be svd or random.' >&2; exit 2 ;;
+    esac
+    CANDIDATE_HEAD=1
+fi
 if [[ ! "$LOG_FREQ" =~ ^[1-9][0-9]*$ ]]; then
     echo "LOG_FREQ must be a positive integer." >&2
     exit 2
@@ -154,7 +167,7 @@ if [[ "$RESUME" == 0 && "$DRY_RUN" == 0 ]] && [[ ! -d "$MODEL" || ! -d "$DATA_PA
 fi
 # Upstream uses size-keyed mappings. Do not silently fall back to full vocabulary
 # when only another experiment's legacy t2d.npy/d2t.npy files are present.
-if [[ "$RESUME" == 0 && "$DRY_RUN" == 0 && ! -f "$TOKEN_FREQ_PATH" ]] &&
+if [[ "$RESUME" == 0 && "$DRY_RUN" == 0 && "$CANDIDATE_HEAD_ONLY" == 0 && ! -f "$TOKEN_FREQ_PATH" ]] &&
    [[ ! -f "$DATA_PATH/d2t-${DRAFT_VOCAB_SIZE}.npy" ||
       ! -f "$DATA_PATH/t2d-${DRAFT_VOCAB_SIZE}.npy" ]]; then
     echo "Need $TOKEN_FREQ_PATH or paired d2t-${DRAFT_VOCAB_SIZE}.npy/t2d-${DRAFT_VOCAB_SIZE}.npy in DATA_PATH." >&2
@@ -210,12 +223,7 @@ TRAIN_ARGS=(
     --log-freq "$LOG_FREQ" \
     --total-seq-len "$SEQ_LENGTH" --train-data-ratio "$TRAIN_DATA_RATIO" \
     --hidden-states-dtype bfloat16 --noise-std "$NOISE_STD" \
-    --speculator-type leagle --num-layers "$NUM_LAYERS" --num-loops "$NUM_LOOPS" \
-    --draft-arch "$DRAFT_ARCH" \
-    --draft-vocab-size "$DRAFT_VOCAB_SIZE" --token-freq-path "$TOKEN_FREQ_PATH" \
-    --target-layer-ids "${TARGET_LAYER_IDS[@]}" \
-    --draft-attn-impl "$DRAFT_ATTN_IMPL" --full-attention-indices "${FULL_ATTENTION_INDICES[@]}" \
-    --no-norm-before-fc --norm-output --no-embed-requires-grad \
+    --speculator-type leagle --draft-attn-impl "$DRAFT_ATTN_IMPL" \
     --ttt-steps "$TTT_STEPS" --ttt-step-loss-decay "$TTT_STEP_LOSS_DECAY" \
     --loss-fn "$LOSS_FN" --on-missing generate --on-generate delete \
 )
@@ -228,6 +236,17 @@ if [[ "$RESUME" == 1 ]]; then
         --save-path "$OUTPUT_DIR/checkpoints" --log-dir "$OUTPUT_DIR/tensorboard"
         --vllm-endpoint "$VLLM_ENDPOINT" --hidden-states-path "$HIDDEN_STATES_PATH")
 else
+    if [[ "$CANDIDATE_HEAD_ONLY" == 1 ]]; then
+        TRAIN_ARGS+=(--from-pretrained "$DRAFT_MODEL" --candidate-head-only
+            --candidate-head-init "$CANDIDATE_HEAD_INIT")
+    else
+        TRAIN_ARGS+=(--num-layers "$NUM_LAYERS" --num-loops "$NUM_LOOPS"
+            --draft-arch "$DRAFT_ARCH"
+            --draft-vocab-size "$DRAFT_VOCAB_SIZE" --token-freq-path "$TOKEN_FREQ_PATH"
+            --target-layer-ids "${TARGET_LAYER_IDS[@]}"
+            --full-attention-indices "${FULL_ATTENTION_INDICES[@]}"
+            --no-norm-before-fc --norm-output --no-embed-requires-grad)
+    fi
     if [[ "$CANDIDATE_HEAD" == 1 ]]; then
         TRAIN_ARGS+=(--candidate-head --candidate-head-rank "$CANDIDATE_HEAD_RANK"
             --candidate-head-top-k "$CANDIDATE_TOP_K"

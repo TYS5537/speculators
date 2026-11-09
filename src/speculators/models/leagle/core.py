@@ -15,6 +15,7 @@ from speculators.models.attention import create_float_mask
 from speculators.models.leagle.attention import rollout_mask, trajectory_mask
 from speculators.models.leagle.cache import ReusableDraftKV, StaticDraftKV
 from speculators.models.leagle.candidate_head import LowRankCandidateHead
+from speculators.models.leagle.candidate_training import CandidateOnlyObjective
 from speculators.models.leagle.config import LEagleSpeculatorConfig
 from speculators.models.leagle.model_definitions import DraftKV, LEagleDecoderLayer
 from speculators.models.leagle.objective import TrainingObjective
@@ -100,6 +101,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     initializer_range=decoder.initializer_range,
                 )
         self.candidate_head_enabled = config.candidate_head
+        self.candidate_head_only = False
         self.svd_candidate_head = None
         self.candidate_rerank = config.candidate_rerank
         self.candidate_top_k = config.candidate_head_top_k
@@ -149,6 +151,14 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
     def low_rank_main(self) -> bool:
         """Training architecture, independent of inference-time scoring overrides."""
         return self.config.candidate_head and not self.config.candidate_rerank
+
+    def train(self, mode=True):
+        super().train(mode)
+        if getattr(self, "candidate_head_only", False):
+            for name, module in self.named_children():
+                if name != "candidate_head":
+                    module.eval()
+        return self
 
     def share_output_head(self):
         return share_output_head(self)
@@ -230,6 +240,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
 
     def gradient_clip_groups(self):
         """Clip the auxiliary head separately so it cannot rescale backbone updates."""
+        if self.candidate_head_only:
+            return [list(self.candidate_head.parameters())]
         if self.candidate_head is None or self.low_rank_main:
             return [list(self.parameters())]
         backbone = [
@@ -317,6 +329,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     layer_args = (*layer_args, training_context_cache[index], True)
                 recompute = (
                     self.training
+                    and not self.candidate_head_only
                     and self.activation_checkpointing
                     and (
                         self.activation_checkpoint_layers is None
@@ -537,9 +550,12 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         """
         if ttt_steps < 1:
             raise ValueError("ttt_steps must be positive")
-        return_loss = verifier_last_hidden_states is not None
+        return_loss = (
+            verifier_last_hidden_states is not None or self.candidate_head_only
+        )
         chunked_head = (
-            leagle_chunked_loss
+            self.candidate_head_only
+            or leagle_chunked_loss
             or leagle_teacher_cache
             or leagle_masked_head
             or leagle_shared_loss_normalization
@@ -581,14 +597,29 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             hidden_states, input_ids, document_ids, position_ids
         )
         teacher_forcing = return_loss if teacher_forcing is None else teacher_forcing
-        context = self.hidden_norm(self.fc(hidden_states))
+        with torch.set_grad_enabled(
+            torch.is_grad_enabled() and not self.candidate_head_only
+        ):
+            context = self.hidden_norm(self.fc(hidden_states))
         mask_cache = (
             TrajectoryMaskCache(leagle_attention_mask_cache_mb * 1024 * 1024)
             if leagle_cache_attention_masks
             else None
         )
         objective = (
-            TrainingObjective(
+            CandidateOnlyObjective(
+                self,
+                document_ids,
+                loss_mask,
+                ttt_step_loss_decay,
+                collect_metrics,
+                stride=candidate_head_train_stride if self.training else 1,
+                grad_addmm=leagle_candidate_grad_addmm,
+                backward_recompute=leagle_candidate_backward_recompute,
+                need_predictions=return_predictions or not teacher_forcing,
+            )
+            if self.candidate_head_only
+            else TrainingObjective(
                 self,
                 verifier_last_hidden_states,
                 document_ids,
@@ -630,19 +661,22 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 leagle_attn_chunk_size if leagle_sparse_attention else 0,
                 mask_cache,
             )
-            logits, state, caches, normalized = self._step(
-                tokens,
-                state,
-                context,
-                positions - 1,
-                positions + step,
-                masks,
-                caches,
-                training_context_cache=context_cache,
-                compute_logits=not chunked_head,
-                selective_checkpoint=leagle_selective_checkpoint,
-                low_rank_output=self.low_rank_main,
-            )
+            with torch.set_grad_enabled(
+                torch.is_grad_enabled() and not self.candidate_head_only
+            ):
+                logits, state, caches, normalized = self._step(
+                    tokens,
+                    state,
+                    context,
+                    positions - 1,
+                    positions + step,
+                    masks,
+                    caches,
+                    training_context_cache=context_cache,
+                    compute_logits=not chunked_head,
+                    selective_checkpoint=leagle_selective_checkpoint,
+                    low_rank_output=self.low_rank_main,
+                )
             draft_ids = (
                 objective.step(logits, normalized, step)
                 if objective is not None

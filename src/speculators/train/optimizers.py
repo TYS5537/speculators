@@ -88,9 +88,14 @@ def build_optimizers(model: Module, config) -> list[torch.optim.Optimizer]:
         getattr(config, "adam_beta2", 0.999),
     )
     if config.optimizer == "adamw":
+        parameters = model.named_parameters()
+        if getattr(getattr(model, "module", model), "candidate_head_only", False):
+            parameters = [
+                (name, param) for name, param in parameters if param.requires_grad
+            ]
         return [
             torch.optim.AdamW(
-                model.named_parameters(),
+                parameters,
                 lr=config.lr,
                 weight_decay=config.weight_decay,
                 betas=betas,

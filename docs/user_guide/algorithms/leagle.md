@@ -523,6 +523,86 @@ bash examples/evaluate/leagle_qwen3_4b_700k.sh
 `CANDIDATE_RERANK=0` 对照纯低秩输出，但此时不能指定精筛数量或开启稀疏候选采样。
 SVD 不保证候选召回率或接受长度与完整头相同，应在相同模型、数据和温度下对照。
 
+### 已有 draft 的候选头第二阶段训练
+
+使用 `--from-pretrained CHECKPOINT --candidate-head-only` 加载已训练好的 LEAGLE，
+冻结全部主干、embedding、norm 和原始输出矩阵 W，只更新候选头的 A/B 两个矩阵。
+源 checkpoint 不会改写；训练必须使用独立输出目录。已有候选头时继承其权重，
+不会重新初始化；缺失或损坏的已声明候选权重仍报错。低秩主输出模式的 checkpoint
+不支持直接转换成此模式。
+
+没有候选头时，`--candidate-head-init svd`（默认）用 W 的 SVD 初始化两个可训练
+矩阵；`random` 使用随机初始化。SVD 初始化只发生在新头创建时，训练后保存的是
+学习得到的矩阵。模式和初始化方法只记录在 `run.yaml` / 训练命令中；模型配置仅保存
+推理所需的 `candidate_head=true`、rank、`candidate_rerank=true` 等候选结构信息。
+
+训练 loss 为 `KL(softmax(W h) || softmax(A B h))`，h 来自冻结 draft 的 TTT 轨迹，
+不反传主干、不计算主 CE/TV 或 target 词表 logits。主干保持 eval 状态，候选头参与训练；
+仍需要 target 的辅助 hidden states 作为 LEAGLE 输入，可继续用原来的 vLLM 服务和
+已预处理数据。TTT 默认 7，沿用 packed document/loss mask、逐步衰减和候选采样 stride。
+验证始终使用全部有效候选位置。日志报告 `loss`、`candidate_kl`、`candidate_recall`；
+此阶段不报告主 loss 或 target 接受长度，真实接受长度使用离线评估。
+
+对应脚本为 `examples/train/leagle_qwen3_4b_700k/train_candidate_head.sh`，与 E2E 的
+`train.sh` 同目录、同 Bash 格式，环境、路径和参数均集中在文件中，可直接编辑。
+它独立启动共享训练入口，沿用 E2E 的模型/数据路径、NPU 2–7、DDP/FSDP、后台日志、
+PID、TensorBoard、checkpoint 和续训方式。默认 LR=6e-4、5 epochs、rank=640、
+top-k=512、候选 chunk=32；第二阶段默认关闭主干 activation checkpointing，输入噪声为 0。
+层数、loop、词表映射和辅助层取自源 checkpoint；不要通过训练参数覆盖。
+服务的模型和辅助层必须与源 checkpoint 匹配；下面示例使用已有 Qwen3-4B 五辅助层配方：
+
+```bash
+# 终端 1：服务目录与第二阶段训练一致。
+OUTPUT_DIR=./output/leagle_candidate_r640 \
+bash examples/train/leagle_qwen3_4b_700k/server.sh
+
+# 终端 2：指定已经训练好的 draft。
+DRAFT_MODEL=/path/to/trained/leagle/checkpoint \
+OUTPUT_DIR=./output/leagle_candidate_r640 \
+CANDIDATE_HEAD_INIT=svd CANDIDATE_HEAD_RANK=640 CANDIDATE_TOP_K=512 \
+bash examples/train/leagle_qwen3_4b_700k/train_candidate_head.sh
+
+# 续训读取第二阶段目录里的 run.yaml 和进度，不改变原始训练任务。
+RESUME=1 OUTPUT_DIR=./output/leagle_candidate_r640 \
+bash examples/train/leagle_qwen3_4b_700k/train_candidate_head.sh
+```
+
+设置 `DRY_RUN=1` 只打印完整启动命令。正式启动前会拒绝复用源 checkpoint 目录，
+续训也会检查保存的任务确实为候选头第二阶段。运行记录保存在独立输出目录的
+`logs/`、`tensorboard/` 和 `checkpoints/`；优化开关仍沿用 E2E 的环境变量名。
+
+保存的 checkpoint 可直接交给原有 LEAGLE 评估脚本。`CANDIDATE_HEAD=auto`
+自动使用训练好的候选矩阵；`CANDIDATE_HEAD=0` 进行原完整头对照。评估训练成果时
+保持 `CANDIDATE_SVD_RANK` 为空，否则会以新分解的 SVD 矩阵覆盖本次学习得到的头。
+第二阶段自动停用主 loss 的缓存、流式 loss 和主干反向相关优化，保留适用的
+KV/attention、候选梯度及分布式选项。候选训练的加速幅度和召回改善需在目标设备实测。
+
+也可使用参数集中在单个文件中的 Python 启动脚本
+`examples/train/leagle_candidate_head/train.py`。此脚本默认 rank=640、top-k=512，
+其余训练配方保持 LR=6e-4、5 epochs、FSDP、SDPA、TTT=7 和 700k 已预处理数据。
+在文件顶部填写 `DRAFT_MODEL` 并调整 `TRAIN_SETTINGS`，或使用同名 CLI 参数覆盖。
+相对路径以仓库根目录为基准；脚本自动启动 torchrun，使用当前 Python 环境，训练在前台运行。
+层数、loop 和词表从源 checkpoint 继承，输出头蒸馏和 provenance 复用现有训练入口。
+
+```bash
+# 终端 1：模型与提取层必须匹配源 checkpoint。
+OUTPUT_DIR=./output/leagle_candidate_r640 \
+bash examples/train/leagle_qwen3_4b_700k/server.sh
+
+# 终端 2：直接用 python 启动，不要再套一层 torchrun。
+python examples/train/leagle_candidate_head/train.py \
+    --from-pretrained /path/to/trained/leagle/checkpoint
+
+# 添加 --dry-run 仅打印完整启动命令，不加载模型或写运行目录。
+# 续训保留 run.yaml 中的全部训练设置，包括原始 checkpoint、rank 和 LR。
+python examples/train/leagle_candidate_head/train.py \
+    --resume --output-dir ./output/leagle_candidate_r640
+```
+
+Python 脚本的 `--resume` 只允许启动路径、设备与 endpoint 使用当前设置；
+`TRAIN_SETTINGS` 及其 CLI 覆盖值不覆盖保存的训练配置。第二阶段结果的评估仍需清空
+`CANDIDATE_SVD_RANK`，使用学习得到的候选矩阵。
+
 ### 可选低秩候选输出头训练（仅 LEAGLE）
 
 训练默认 `CANDIDATE_HEAD=0`，使用完整输出头；设置为 1 时从头创建并训练两个低秩矩阵，直接保存在 checkpoint 中，无需转换脚本或另做 SVD。`CANDIDATE_RERANK` 将两种训练方式分开：
@@ -595,7 +675,7 @@ CANDIDATE_RERANK=1 CANDIDATE_HEAD_RANK=256 CANDIDATE_TOP_K=128 \
 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-测试低秩主输出时，换一组匹配的服务/训练输出目录，并设 `CANDIDATE_HEAD=1 CANDIDATE_RERANK=0`。不带候选头的对照实验设置 `CANDIDATE_HEAD=0`。其余数据、seed、层数、loop、LR 和 epoch 保持一致。同 seed 下候选头初始化不会消耗主干初始化或训练随机数。`RESUME=1` 从原 `run.yaml` 恢复开关及参数；不能在同一次训练中途增删候选头、改变 rank 或切换主输出训练方式。新 checkpoint 的权重和配置可直接加载；训练入口不自动转换已有 dense checkpoint，纯推理可使用上面的 SVD 运行时头。
+测试低秩主输出时，换一组匹配的服务/训练输出目录，并设 `CANDIDATE_HEAD=1 CANDIDATE_RERANK=0`。不带候选头的对照实验设置 `CANDIDATE_HEAD=0`。其余数据、seed、层数、loop、LR 和 epoch 保持一致。同 seed 下候选头初始化不会消耗主干初始化或训练随机数。`RESUME=1` 从原 `run.yaml` 恢复开关及参数；不能在同一次训练中途增删候选头、改变 rank 或切换主输出训练方式。普通联合训练不会隐式转换已有 dense checkpoint；已有 draft 补训候选头使用上面的 `--candidate-head-only` 第二阶段入口，纯推理可使用 SVD 运行时头。
 
 辅助模式增加三项聚合日志：`draft_loss` 为原主干 loss，`candidate_kl` 为有效 token 上的平均辅助 KL，`candidate_recall` 为候选集包含完整输出头 top-1 的比例。`loss` 是主干 loss 加上加权候选损失，候选损失沿用 TTT 的逐步衰减；普通验证同样报告这些指标。低秩主输出模式没有这三项辅助日志，`loss` 仅含主 loss。`checkpoint_best` 仍按验证 `loss` 选择。`accept_len/eal` 来自实际训练输出头的 teacher-forced 轨迹：辅助模式用完整头，低秩主输出模式用低秩头；真实接受长度仍需离线评估。
 

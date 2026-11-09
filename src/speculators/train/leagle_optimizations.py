@@ -49,6 +49,24 @@ _CHUNKED_OPTIONS = (
 )
 
 
+def _candidate_only_options(options):
+    if not options.get("candidate_head_only", False):
+        return {}
+    # Second-stage KL always chunks its own vocabulary projection. There is no
+    # target/main loss or decoder backward to cache, combine, or checkpoint.
+    return dict.fromkeys(
+        (
+            *_CHUNKED_OPTIONS,
+            "leagle_teacher_cache_supervised",
+            "leagle_cache_frozen_head_weights",
+            "leagle_cache_teacher_indices",
+            "leagle_selective_checkpoint",
+            "leagle_fsdp_keep_forward_params",
+        ),
+        False,
+    )
+
+
 def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, object]:
     """Return effective member settings without changing model/training recipes.
 
@@ -59,7 +77,7 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, obje
     """
     safe, numerical = (options.get(name) for name in GROUP_DEFAULTS)
     if safe is None and numerical is None:
-        return {}
+        return _candidate_only_options(options)
     if any(
         value is not None and not isinstance(value, bool) for value in (safe, numerical)
     ):
@@ -71,7 +89,10 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, obje
     low_rank_main = bool(options.get("candidate_head", False)) and not options.get(
         "candidate_rerank", True
     )
-    candidate = bool(options.get("candidate_head", False)) and not low_rank_main
+    candidate = (
+        bool(options.get("candidate_head", False))
+        or bool(options.get("candidate_head_only", False))
+    ) and not low_rank_main
     ddp = not bool(options.get("fsdp_shard", False))
     if numerical is not None:
         updates.update(dict.fromkeys(NUMERICAL_OPTIONS, numerical))
@@ -121,7 +142,7 @@ def resolve_optimization_groups(options: Mapping[str, object]) -> dict[str, obje
             leagle_selective_checkpoint=False,
             leagle_cache_attention_masks=False,
         )
-    return updates
+    return {**updates, **_candidate_only_options(options)}
 
 
 def apply_runtime_optimization_groups(config, args, model):
@@ -130,7 +151,15 @@ def apply_runtime_optimization_groups(config, args, model):
     if model.config.speculators_model_type == "leagle":
         # Inherit the loaded output architecture before resolving runtime groups,
         # even when neither master was explicitly supplied on the command line.
-        for name in ("candidate_head", "candidate_rerank"):
+        names = ["candidate_head", "candidate_rerank"]
+        if getattr(args, "candidate_head_only", False):
+            names += [
+                "candidate_head_rank",
+                "candidate_head_top_k",
+                "candidate_head_loss_weight",
+                "candidate_head_chunk_size",
+            ]
+        for name in names:
             value = getattr(model.config, name, name == "candidate_rerank")
             architecture_updated |= getattr(config.draft, name) != value
             setattr(args, name, value)

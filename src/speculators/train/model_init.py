@@ -88,6 +88,15 @@ def build_draft_model(
     flags and ``--draft-config`` do not apply.
     """
     logger = _LOGGER if logger is None else logger
+    if getattr(args, "candidate_head_only", False):
+        from speculators.train.leagle_candidate import (  # noqa: PLC0415
+            build_candidate_training_model,
+        )
+
+        if not args.from_pretrained:
+            raise ValueError("Candidate-only training requires --from-pretrained")
+        config = SpeculatorModelConfig.from_pretrained(args.from_pretrained)
+        return build_candidate_training_model(args, config, t2d, d2t)
     if args.from_pretrained:
         if is_config_only_dir(args.from_pretrained):
             logger.info(
