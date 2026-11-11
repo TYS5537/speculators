@@ -19,7 +19,7 @@ LEAGLE 是用于深度 / loop 对照实验的自回归 drafter：保留 DFlash /
 每生成一个候选 token：
 
 1. 将当前已知 token 的 embedding 与上一 token 的 draft hidden state 分别归一化，拼接后用 `input_fc` 映射回 hidden size。第一步的 state 来自最后一个目标位置的融合特征。
-2. 对同一组 `num_layers` 层执行 `num_loops` 次，每轮继续更新同一个位置的 hidden state，所有轮次共享权重。
+2. 默认 `loop_mode=full` 对同一组 `num_layers` 层执行 `num_loops` 次；也可在每个物理层内只重复 attention 或 FFN。每轮继续更新同一个位置的 hidden state，同类子层的各轮共享权重和 Norm。
 3. 最后一次 loop 后使用冻结的目标 LM head 预测一个 token，将 token 和 hidden state 传给下一个自回归步骤。
 
 这里的 token/state 融合层位于共享 decoder stack 外部；这是一种新的 KV-conditioned EAGLE 变体，并非原版 EAGLE-3 checkpoint 的兼容加载器。当前 decoder 支持 Qwen3，draft 与 target 使用相同 hidden size。
@@ -31,14 +31,47 @@ LEAGLE 没有并行 mask-token backbone、Markov/RNN correction head、confidenc
 | 参数           | 含义                            | 默认示例 |
 | -------------- | ------------------------------- | -------- |
 | `--num-layers` | 具有独立参数的物理 decoder 层数 | 1        |
-| `--num-loops`  | 每个 token 对同一组层的执行次数 | 1        |
+| `--num-loops`  | 每个 token 的层栈或选定子层循环次数 | 1        |
 | `--ttt-steps`  | 训练时向前展开的 token 步数     | 7        |
 
-有效 decoder 深度 = `num_layers × num_loops`，不包含融合层和输出头。增加 loop 不增加 decoder 参数量，但增加计算量与缓存需求。
+默认完整循环的有效 decoder 深度 = `num_layers × num_loops`，不包含融合层和输出头。增加 loop 不增加 decoder 参数量，但增加计算量。子层循环的 attention / FFN 执行次数分别统计，不能把它当作同等数量的完整 decoder 层。
 
-循环内位置编号不增加，只有进入下一个 token 时才增加。每个 `(loop, layer)` 使用独立的草稿 KV 历史；目标上下文不会重复追加进草稿缓存。反向传播覆盖所有 loop 和 token steps，没有 detach 或截断。
+循环内位置编号不增加，只有进入下一个 token 时才增加。每次逻辑 attention 调用使用独立的草稿 KV 历史；目标上下文不会重复追加进草稿缓存。反向传播覆盖所有 loop 和 token steps，没有 detach 或截断。
 
 首批对照可使用 `(层数, loop)` = `(1,1)`、`(2,1)`、`(4,1)`、`(1,2)`、`(1,4)`、`(2,2)`。后四种中的 `(4,1)`、`(1,4)`、`(2,2)` 具有相同有效深度，能比较独立层和共享层。DFlash 的五层对照还需单独训练 `(5,1)`；有效深度相同不等于训练 FLOPs 或实测延迟完全相同。
+
+### Sublayer looping
+
+用 `LOOP_MODE=full|attn|ffn`（CLI `--loop-mode`）选择循环方式。设 D 个物理层、R 次循环，
+`A_i(h)=h+Attention_i(Norm_i(h))`，`F_i(h)=h+FFN_i(Norm_i(h))`：
+
+| 模式 | 多层执行顺序 | Attention 次数 / draft KV 份数 | FFN 次数 |
+| --- | --- | --- | --- |
+| `full`（默认） | `[A₁ F₁ A₂ F₂ … Aᴅ Fᴅ]` 整体重复 R 次 | D×R | D×R |
+| `attn` | `A₁^R F₁ A₂^R F₂ … Aᴅ^R Fᴅ` | D×R | D |
+| `ffn` | `A₁ F₁^R A₂ F₂^R … Aᴅ Fᴅ^R` | D | D×R |
+
+每次调用都对更新后的 hidden 重新执行 Norm、子层和 residual。FFN 循环不追加 KV；
+attention 循环的 draft KV 按 `(physical layer, attention repeat)` 隔离。
+目标特征不变，同一物理层的 target KV 可继续通过现有开关复用。
+单次循环 R=1 时三种模式等价。训练与推理使用同一执行路径，支持现有 SDPA、
+activation checkpointing、分块 loss、候选头，以及静态 / 跨投机轮 KV 缓存。
+子层循环在一个物理层调用内完成，保留 FSDP 的物理层包装边界。
+
+`loop_mode` 属于模型架构，保存在模型 `config.json` 和训练 YAML 的 `draft` 组。
+旧 checkpoint 缺少此字段时默认 `full`。加载已有 checkpoint 时不能通过 CLI 改变其模式；
+续训和候选头第二阶段训练继承已保存的架构。离线评估直接从 checkpoint 读取模式，
+并记录 `loop_mode`、`attention_depth`、`ffn_depth`。保留的 `effective_depth=D×R`
+表示两种子层执行深度的最大值，不表示子层循环执行了 D×R 个完整 decoder 层。
+
+```bash
+# 两个终端分别运行；改成 LOOP_MODE=attn 即可测试 attention 循环。
+NUM_LAYERS=1 NUM_LOOPS=3 LOOP_MODE=ffn bash examples/train/leagle_qwen3_4b_700k/server.sh
+NUM_LAYERS=1 NUM_LOOPS=3 LOOP_MODE=ffn bash examples/train/leagle_qwen3_4b_700k/train.sh
+```
+
+`full` 保留原默认输出目录；`attn/ffn` 分别在目录的 `_rR` 后增加 `_attn/_ffn`，
+防止不同结构写入同一实验。手动设置 `OUTPUT_DIR` 时以手动值为准，服务与训练必须一致。
 
 ## 训练
 
@@ -121,11 +154,48 @@ NUM_LAYERS=2 NUM_LOOPS=3 bash examples/train/leagle_qwen3_4b_700k/server.sh
 NUM_LAYERS=2 NUM_LOOPS=3 bash examples/train/leagle_qwen3_4b_700k/train.sh
 ```
 
-也可通过统一入口使用 `--speculator-type leagle --num-layers D --num-loops R --ttt-steps 7`，或把对应字段放进训练 YAML 的 `draft` 和 `loss` 组。保存的 checkpoint 包含 `num_loops`。继续训练已有 checkpoint 时不能静默改变这一值。
+也可通过统一入口使用 `--speculator-type leagle --num-layers D --num-loops R --loop-mode full --ttt-steps 7`，或把对应字段放进训练 YAML 的 `draft` 和 `loss` 组。保存的 checkpoint 包含 `num_loops` 和 `loop_mode`。继续训练已有 checkpoint 时不能静默改变这两个值。
 
 训练继续复用预处理数据中的 token IDs 和 loss masks，不重新生成回答。脚本不包含真实接受长度评估；评估限制见下节。
 
 训练使用 EAGLE 的 `shift_batch` 对齐和 ground-truth-token TTT：token 输入采用数据中的 token，hidden state 则由 draft 自己逐步递推。目标 KV 的可见范围固定在各自的起始前缀；训练步骤增加不会开放未来目标特征。packed document 边界与 padding 不计入跨边界预测损失。
+
+### 中间 loop 的 hidden-state 对齐
+
+可用 `LEAGLE_LOOP_HS_LOSS=1` / `--leagle-loop-hs-loss` 开启辅助监督，默认关闭。
+`full` 在每次完整执行 D 个 decoder 层后，对第 1 至 R−1 个 loop 的结果分支计算 MSE：
+`model.norm(draft_hidden)` 对齐 `verifier_norm(teacher_last_hidden)`，比较和归约使用 FP32。
+teacher 分支 detach；传给下一 loop 的原始 hidden 和 KV 不变，中间监督不执行词表投影。
+所有层执行完成后继续使用原 CE / TV / KL 主损失。
+
+`attn/ffn` 则监督每个物理层内指定子层的前 R−1 次 residual 输出，共 D×(R−1) 个位置，
+并对这些监督点取平均。`attn` 的监督点位于 FFN 之前，`ffn` 位于 FFN residual 之后；
+两者仍使用同一个 teacher 末层目标。这是不同强度的表示约束，接受长度需要实验确认。
+切换 `LOOP_MODE` 不会自动启用 HS loss，三种模式默认都关闭辅助监督。
+
+辅助项对 hidden 维度和有效位置取均值，再对上述中间监督点取平均；各 TTT 步按
+`TTT_STEP_LOSS_DECAY` 加权求和。TTT 第 s 步将 draft 位置 i 对齐 teacher 位置 i+s，
+与现有 token loss 使用相同的目标 mask、文档边界和序列尾部规则。
+总损失为 `原损失 + LEAGLE_LOOP_HS_LOSS_WEIGHT × loop_hs_loss`，权重默认 `0.1`，
+只是实验起点。权重为 0 或 `NUM_LOOPS=1` 时不建立辅助分支。
+启用 activation checkpointing 时该 MSE 分支也重算，避免保留每轮的 FP32 差值张量。
+
+```bash
+# 服务端使用相同 NUM_LAYERS、NUM_LOOPS 和 OUTPUT_DIR。
+NUM_LAYERS=1 NUM_LOOPS=4 \
+LEAGLE_LOOP_HS_LOSS=1 LEAGLE_LOOP_HS_LOSS_WEIGHT=0.1 \
+bash examples/train/leagle_qwen3_4b_700k/train.sh
+```
+
+两项设置属于训练 YAML 的 `loss` 组，只写入 `run.yaml` 和启动记录，不加入模型
+`config.json` 或权重；不受 SAFE / NUMERICAL 总开关控制。环境变量留空时续训继承原值，
+`LEAGLE_LOOP_HS_LOSS=0` 显式关闭。新旧 checkpoint 的推理结构和输出路径不变。
+此功能用于训练 draft 主干，不能与 `--candidate-head-only` 同时启用。
+
+验证集使用相同辅助目标，`loss` 包含加权辅助项，`draft_loss` 保留原主损失，
+`loop_hs_loss` 单独报告未乘辅助权重的值；不逐 loop 增加日志字段。
+开启后 `checkpoint_best` 仍按总 validation loss 选择；接受长度需另外评估，
+不能直接比较开启和关闭辅助项时的总 loss 大小来判断优劣。
 
 ### 训练与验证指标
 

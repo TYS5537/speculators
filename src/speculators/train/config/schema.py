@@ -108,8 +108,13 @@ class DraftArgs(_Group):
     num_loops: int = Field(
         default=1,
         ge=1,
-        description="LEAGLE shared decoder-stack visits per token; independent of "
+        description="LEAGLE shared stack/sublayer visits per token; independent of "
         "--num-layers and --ttt-steps. Other algorithms require 1.",
+    )
+    loop_mode: Literal["full", "attn", "ffn"] = Field(
+        default="full",
+        description="LEAGLE: repeat the full stack, or only attention/FFN within "
+        "each physical layer. Saved as checkpoint architecture.",
     )
     candidate_head: bool = Field(
         default=False,
@@ -385,6 +390,20 @@ class LossArgs(_Group):
         default=1.0,
         description="Multiplicative loss weight decay applied per TTT step "
         "(1.0 = weight every step equally).",
+    )
+    leagle_loop_hs_loss: bool = Field(
+        default=False,
+        json_schema_extra=_CLI_BOOL_OPTIONAL,
+        description="LEAGLE: align intermediate-loop normalized hidden states "
+        "to the teacher with FP32 MSE. Final-loop token loss stays unchanged. "
+        "Training policy only; saved in run.yaml, not model config.",
+    )
+    leagle_loop_hs_loss_weight: float = Field(
+        default=0.1,
+        ge=0,
+        allow_inf_nan=False,
+        description="Weight of loop HS loss, averaged over intermediate loops "
+        "and summed over TTT steps with the existing decay. Zero disables it.",
     )
 
     @field_validator("loss_fn")
@@ -1100,6 +1119,21 @@ class TrainConfig(BaseSettings):
             self.loss.loss_fn = "ce" if is_dflash else "kl_div"
         if self.dflash.block_size is None:
             self.dflash.block_size = 16 if is_dflash else 8
+
+    @model_validator(mode="after")
+    def _validate_loop_training(self) -> "TrainConfig":
+        if self.draft.loop_mode != "full" and self.speculator_type != "leagle":
+            raise ValueError(
+                "--loop-mode is only supported by --speculator-type leagle"
+            )
+        if self.loss.leagle_loop_hs_loss and (
+            self.speculator_type != "leagle" or self.draft.candidate_head_only
+        ):
+            raise ValueError(
+                "Loop HS alignment requires --speculator-type leagle and backbone "
+                "training; --candidate-head-only is unsupported"
+            )
+        return self
 
     @model_validator(mode="after")
     def _validate_candidate_head(self) -> "TrainConfig":

@@ -425,12 +425,16 @@ def load_models(args):
         args.verifier_model, trust_remote_code=args.trust_remote_code
     )
     logger.info(
-        "%s D=%d R=%d effective_depth=%d | K=%d | target=%s draft=%s | %s",
+        "%s D=%d R=%d loop_mode=%s attention_depth=%d ffn_depth=%d | "
+        "K=%d | target=%s draft=%s | %s",
         config.speculators_model_type,
         config.transformer_layer_config.num_hidden_layers,
         getattr(config, "num_loops", 1),
-        config.transformer_layer_config.num_hidden_layers
-        * getattr(config, "num_loops", 1),
+        getattr(config, "loop_mode", "full"),
+        getattr(
+            config, "attention_depth", config.transformer_layer_config.num_hidden_layers
+        ),
+        getattr(config, "ffn_depth", config.transformer_layer_config.num_hidden_layers),
         args.spec_tokens,
         args.target_attn_impl,
         args.draft_attn_impl,

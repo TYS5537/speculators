@@ -35,7 +35,7 @@ class LEagleCachedProposer:
                 "Static verified-prefix KV requires an explicit request capacity"
             )
         self.rollout_buffers = (
-            [ReusableDraftKV(capacity) for _ in range(draft.config.effective_depth)]
+            [ReusableDraftKV(capacity) for _ in range(draft.config.attention_depth)]
             if draft.reuse_rollout_buffers
             else None
         )
@@ -81,8 +81,10 @@ class LEagleCachedProposer:
         self.length = length
         rollout_kwargs = {}
         if self.rollout_buffers is not None:
-            for index, buffer in enumerate(self.rollout_buffers):
-                buffer.begin_round(*self.context_kv[index % len(draft.layers)])
+            for index, buffer in zip(
+                draft.config.attention_layer_indices, self.rollout_buffers, strict=True
+            ):
+                buffer.begin_round(*self.context_kv[index])
             rollout_kwargs["rollout_buffers"] = self.rollout_buffers
         return draft.propose(
             hidden_states,

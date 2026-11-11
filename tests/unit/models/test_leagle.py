@@ -32,6 +32,7 @@ def make_model(
     reduced=False,
     candidate_head=False,
     candidate_rerank=True,
+    loop_mode="full",
 ):
     decoder = Qwen3Config(
         vocab_size=24,
@@ -53,6 +54,7 @@ def make_model(
         draft_vocab_size=12 if reduced else 24,
         aux_hidden_state_layer_ids=[0, 1],
         num_loops=loops,
+        loop_mode=loop_mode,
         candidate_head=candidate_head,
         candidate_rerank=candidate_rerank,
         candidate_head_rank=4,
@@ -319,7 +321,10 @@ def test_both_cli_paths_parse_loop_count_and_protect_checkpoint_policy():
     assert inherited["num_loops"] == 4
 
 
-def test_optimizer_step_and_real_checkpoint_reload_with_local_verifier(tmp_path):
+@pytest.mark.parametrize("loop_mode", ["full", "attn", "ffn"])
+def test_optimizer_step_and_real_checkpoint_reload_with_local_verifier(
+    tmp_path, loop_mode
+):
     template = make_model(loops=2)
     verifier = tmp_path / "verifier"
     verifier.mkdir()
@@ -341,6 +346,7 @@ def test_optimizer_step_and_real_checkpoint_reload_with_local_verifier(tmp_path)
         target_layer_ids=[0, 1],
         draft_attn_impl="eager",
         num_loops=2,
+        loop_mode=loop_mode,
         ttt_steps=7,
     )
     optimizer = torch.optim.AdamW(
@@ -375,5 +381,6 @@ def test_optimizer_step_and_real_checkpoint_reload_with_local_verifier(tmp_path)
     for before, after in zip(expected, actual, strict=True):
         torch.testing.assert_close(before, after)
     assert restored.config.num_loops == 2
+    assert restored.config.loop_mode == loop_mode
     assert not restored.embed_tokens.weight.requires_grad
     assert not restored.lm_head.weight.requires_grad

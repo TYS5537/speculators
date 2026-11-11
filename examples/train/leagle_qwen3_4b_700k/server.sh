@@ -20,7 +20,14 @@ export GLOO_SOCKET_IFNAME=lo
 MODEL="${MODEL:-../../Qwen3-4B}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
 NUM_LOOPS="${NUM_LOOPS:-1}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs}"
+# Only selects the paired trainer's output path; the target architecture is unchanged.
+LOOP_MODE="${LOOP_MODE:-full}"
+case "$LOOP_MODE" in
+    full) LOOP_SUFFIX="" ;;
+    attn|ffn) LOOP_SUFFIX="_${LOOP_MODE}" ;;
+    *) echo 'LOOP_MODE must be full, attn or ffn.' >&2; exit 2 ;;
+esac
+OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}${LOOP_SUFFIX}_fullvocab_5hs}"
 VLLM_PORT="${VLLM_PORT:-8003}"
 TARGET_LAYER_IDS=(1 9 17 25 33)  # Auxiliary layers only; the launcher appends teacher slot 36.
 VLLM_NPUS="${VLLM_NPUS:-0,1}"

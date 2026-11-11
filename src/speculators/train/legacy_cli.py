@@ -58,14 +58,15 @@ _LEGACY_FIELDS = """
     on_generate request_timeout max_retries legacy_data save_path epochs lr
     train_data_ratio no_resume_from_checkpoint logger total_seq_len log_freq
     profile_freq
-    log_dir run_name num_layers num_loops draft_arch draft_hidden_act
+    log_dir run_name num_layers num_loops loop_mode draft_arch draft_hidden_act
     candidate_head candidate_rerank candidate_head_rank candidate_head_top_k
     candidate_head_loss_weight candidate_head_chunk_size
     candidate_head_train_stride candidate_head_only candidate_head_init
     draft_mrope_full_head_hack
     target_layer_ids target_hidden_state_format dsv4_external_arrow token_freq_path
     draft_vocab_size d2t_path t2d_path mask_token_id ttt_steps num_speculative_steps
-    ttt_step_loss_decay loss_fn step_weight_beta seed hidden_states_dtype
+    ttt_step_loss_decay leagle_loop_hs_loss leagle_loop_hs_loss_weight
+    loss_fn step_weight_beta seed hidden_states_dtype
     deterministic_cuda norm_before_residual embed_requires_grad norm_before_fc
     fc_norm norm_output block_size sample_from_anchor max_anchors dflash_decay_gamma
     per_position_loss_weight dpace_alpha
@@ -250,8 +251,26 @@ def _apply_leagle_defaults(args: argparse.Namespace, provided: set[str]) -> None
         args.ttt_steps = 7
 
 
+def _validate_leagle_loop_args(parser, args) -> None:
+    if args.loop_mode != "full" and args.speculator_type != "leagle":
+        parser.error("--loop-mode is only supported by --speculator-type leagle")
+    if (
+        not math.isfinite(args.leagle_loop_hs_loss_weight)
+        or args.leagle_loop_hs_loss_weight < 0
+    ):
+        parser.error("--leagle-loop-hs-loss-weight must be finite and nonnegative")
+    if args.leagle_loop_hs_loss and (
+        args.speculator_type != "leagle" or args.candidate_head_only
+    ):
+        parser.error(
+            "Loop HS alignment requires --speculator-type leagle and backbone "
+            "training; --candidate-head-only is unsupported"
+        )
+
+
 def _validate_leagle_args(parser, args) -> None:
     _validate_leagle_optimizations(parser, args)
+    _validate_leagle_loop_args(parser, args)
     if (
         args.candidate_head
         or args.candidate_head_only

@@ -21,9 +21,15 @@ MODEL="${MODEL:-../../Qwen3-4B}"
 PYTHON="${PYTHON:-python}"
 NUM_LAYERS="${NUM_LAYERS:-1}"
 NUM_LOOPS="${NUM_LOOPS:-1}"
+LOOP_MODE="${LOOP_MODE:-full}"  # full: repeat stack; attn/ffn: repeat sublayer in each layer.
+case "$LOOP_MODE" in
+    full) LOOP_SUFFIX="" ;;
+    attn|ffn) LOOP_SUFFIX="_${LOOP_MODE}" ;;
+    *) echo 'LOOP_MODE must be full, attn or ffn.' >&2; exit 2 ;;
+esac
 DATA_PATH="${DATA_PATH:-../../datasets/open_perfectblend_qwen3_4b_700k}"
-OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs}"
-RUN_NAME="${RUN_NAME:-leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}_fullvocab_5hs}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}${LOOP_SUFFIX}_fullvocab_5hs}"
+RUN_NAME="${RUN_NAME:-leagle_qwen3_4b_700k_5ep_d${NUM_LAYERS}_r${NUM_LOOPS}${LOOP_SUFFIX}_fullvocab_5hs}"
 VLLM_PORT="${VLLM_PORT:-8003}"
 VLLM_ENDPOINT="http://127.0.0.1:${VLLM_PORT}/v1"
 HIDDEN_STATES_PATH="$OUTPUT_DIR/hidden_states"
@@ -40,7 +46,7 @@ PROFILE_FREQ="${PROFILE_FREQ:-}"  # Optional synchronized phase timing; 0 disabl
 NOISE_STD="${NOISE_STD:-0.05}"
 
 # LEAGLE: Qwen3 KV-conditioned layers, shared loops, and seven AR token steps.
-# NUM_LAYERS * NUM_LOOPS is the effective decoder depth per token.
+# Full loops run D*R attention/FFN visits. attn: D*R/D; ffn: D/D*R.
 # Optimizer, loss and schedule follow qwen3_4b_bestarch/train_dspark.sh.
 # Keep LEAGLE's depth/loops, vocabulary, feature layers and five-epoch budget.
 LR="${LR:-6e-4}"
@@ -63,6 +69,12 @@ DEFAULT_LOSS_FN='{"ce": 0.1, "tv": 0.9}'
 LOSS_FN="${LOSS_FN:-$DEFAULT_LOSS_FN}"
 # Match DSpark's CE/TV numerical implementation; attention still uses SDPA.
 LOSS_IMPLEMENTATION="${LOSS_IMPLEMENTATION:-legacy}"
+
+# Optional intermediate-loop hidden alignment; separate from SAFE/NUMERICAL.
+# Empty: disabled / weight 0.1 on a new run, inherit saved settings on resume.
+# Requires backbone training; NUM_LOOPS=1 has no intermediate-loop loss.
+LEAGLE_LOOP_HS_LOSS="${LEAGLE_LOOP_HS_LOSS:-}"
+LEAGLE_LOOP_HS_LOSS_WEIGHT="${LEAGLE_LOOP_HS_LOSS_WEIGHT:-}"
 
 # Optional candidate head, created and trained from scratch with the draft.
 # RERANK=0 trains it directly through the main loss; RERANK=1 adds detached KL.
@@ -241,6 +253,7 @@ else
             --candidate-head-init "$CANDIDATE_HEAD_INIT")
     else
         TRAIN_ARGS+=(--num-layers "$NUM_LAYERS" --num-loops "$NUM_LOOPS"
+            --loop-mode "$LOOP_MODE"
             --draft-arch "$DRAFT_ARCH"
             --draft-vocab-size "$DRAFT_VOCAB_SIZE" --token-freq-path "$TOKEN_FREQ_PATH"
             --target-layer-ids "${TARGET_LAYER_IDS[@]}"
@@ -268,7 +281,7 @@ if [[ -n "$PROFILE_FREQ" ]]; then
     fi
     TRAIN_ARGS+=(--profile-freq "$PROFILE_FREQ")
 fi
-for setting in LEAGLE_SAFE_OPTIMIZATIONS LEAGLE_NUMERICAL_OPTIMIZATIONS \
+for setting in LEAGLE_LOOP_HS_LOSS LEAGLE_SAFE_OPTIMIZATIONS LEAGLE_NUMERICAL_OPTIMIZATIONS \
     LEAGLE_REUSE_TRAINING_KV LEAGLE_CHUNKED_LOSS LEAGLE_SPARSE_ATTENTION \
     LEAGLE_CANDIDATE_GRAD_ADDMM LEAGLE_TEACHER_CACHE LEAGLE_CACHE_FROZEN_HEAD_WEIGHTS \
     LEAGLE_CACHE_TEACHER_INDICES \
@@ -297,6 +310,9 @@ for setting in LEAGLE_LOSS_CHUNK_SIZE LEAGLE_ATTN_CHUNK_SIZE LEAGLE_TEACHER_CACH
         TRAIN_ARGS+=("--${flag//_/-}" "${!setting}")
     fi
 done
+if [[ -n "$LEAGLE_LOOP_HS_LOSS_WEIGHT" ]]; then
+    TRAIN_ARGS+=(--leagle-loop-hs-loss-weight "$LEAGLE_LOOP_HS_LOSS_WEIGHT")
+fi
 CMD=(env ASCEND_RT_VISIBLE_DEVICES="$TRAIN_NPUS"
     PYTHONPATH="$REPO_ROOT/src:$REPO_ROOT/hs_connectors/src:$REPO_ROOT${PYTHONPATH:+:$PYTHONPATH}"
     "$PYTHON" -m torch.distributed.run

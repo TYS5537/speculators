@@ -18,7 +18,12 @@ class LEagleSpeculatorConfig(SpeculatorModelConfig):
     num_loops: int = Field(
         default=1,
         ge=1,
-        description="Visits to the same decoder stack per token; weights are shared.",
+        description="Shared stack or selected sublayer visits per token.",
+    )
+    loop_mode: Literal["full", "attn", "ffn"] = Field(
+        default="full",
+        description="full repeats the decoder stack; attn/ffn repeat that sublayer "
+        "inside each physical layer, running the other sublayer once.",
     )
     norm_output: bool = Field(
         default=True,
@@ -81,4 +86,29 @@ class LEagleSpeculatorConfig(SpeculatorModelConfig):
 
     @property
     def effective_depth(self) -> int:
+        """Maximum logical sublayer depth; use attention_depth to size KV caches."""
         return self.transformer_layer_config.num_hidden_layers * self.num_loops
+
+    @property
+    def attention_depth(self) -> int:
+        layers = self.transformer_layer_config.num_hidden_layers
+        return layers if self.loop_mode == "ffn" else layers * self.num_loops
+
+    @property
+    def ffn_depth(self) -> int:
+        layers = self.transformer_layer_config.num_hidden_layers
+        return layers if self.loop_mode == "attn" else layers * self.num_loops
+
+    @property
+    def attention_layer_indices(self) -> tuple[int, ...]:
+        """Physical layer owning each draft cache, in execution order."""
+        layers = range(self.transformer_layer_config.num_hidden_layers)
+        if self.loop_mode == "full":
+            return tuple(layers) * self.num_loops
+        repeats = self.num_loops if self.loop_mode == "attn" else 1
+        return tuple(index for index in layers for _ in range(repeats))
+
+    @property
+    def loop_supervision_count(self) -> int:
+        layers = self.transformer_layer_config.num_hidden_layers
+        return (self.num_loops - 1) * (1 if self.loop_mode == "full" else layers)

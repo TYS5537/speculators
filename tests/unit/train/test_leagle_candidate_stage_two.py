@@ -102,8 +102,9 @@ def test_invalid_policies_fail_in_both_parsers(extra):
             parse([*flags(), *extra])
 
 
-def test_load_train_save_reload_and_evaluate_existing_draft(tmp_path):
-    evaluation = save_fixture(tmp_path)
+@pytest.mark.parametrize("loop_mode", ["full", "attn", "ffn"])
+def test_load_train_save_reload_and_evaluate_existing_draft(tmp_path, loop_mode):
+    evaluation = save_fixture(tmp_path, loop_mode=loop_mode)
     source = Path(evaluation.draft_model)
     before = {
         path.name: hashlib.sha256(path.read_bytes()).digest()
@@ -113,7 +114,8 @@ def test_load_train_save_reload_and_evaluate_existing_draft(tmp_path):
     cfg = TrainConfig.resolve(flags(source, evaluation.verifier_model))
     model, args = load_stage_two(cfg)
     assert model.candidate_head_only
-    assert model.config.num_loops == 3
+    assert model.config.num_loops == args.num_loops == cfg.draft.num_loops == 3
+    assert model.config.loop_mode == args.loop_mode == cfg.draft.loop_mode == loop_mode
     assert len(model.layers) == 2
     assert model.config.aux_hidden_state_layer_ids == [1, 2]
     assert cfg.draft.candidate_head
@@ -148,6 +150,7 @@ def test_load_train_save_reload_and_evaluate_existing_draft(tmp_path):
     saved = json.loads((output / "config.json").read_text())
     assert saved["candidate_head"]
     assert saved["candidate_rerank"]
+    assert saved["loop_mode"] == loop_mode
     assert "candidate_head_only" not in saved
     assert "candidate_head_init" not in saved
     assert before == {

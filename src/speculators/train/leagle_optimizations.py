@@ -152,6 +152,11 @@ def apply_runtime_optimization_groups(config, args, model):
         # Inherit the loaded output architecture before resolving runtime groups,
         # even when neither master was explicitly supplied on the command line.
         names = ["candidate_head", "candidate_rerank"]
+        if getattr(args, "from_pretrained", None):
+            # The model loader reconciles argparse values, but run.yaml comes
+            # from the typed config. Preserve recurrence there too, otherwise
+            # a resumed head-only run could request the parser's full/1 defaults.
+            names += ["num_loops", "loop_mode"]
         if getattr(args, "candidate_head_only", False):
             names += [
                 "candidate_head_rank",

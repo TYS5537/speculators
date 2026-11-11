@@ -220,6 +220,17 @@ def write_eval_provenance(args, metadata=None, *, argv=None):
         },
         **(metadata or {}),
     }
+    if config.get("speculators_model_type") == "leagle":
+        loop_mode = config.get("loop_mode", "full")
+        record.update(
+            loop_mode=loop_mode,
+            attention_depth=layers * (1 if loop_mode == "ffn" else loops)
+            if layers is not None
+            else None,
+            ffn_depth=layers * (1 if loop_mode == "attn" else loops)
+            if layers is not None
+            else None,
+        )
     helpers.atomic_write(
         args.output_dir / "eval_config.json",
         json.dumps(record, default=str, indent=2) + "\n",

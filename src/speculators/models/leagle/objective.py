@@ -10,6 +10,7 @@ from speculators.models.leagle.chunked_loss import (
     validate_chunked_loss,
 )
 from speculators.models.leagle.head_gradients import supports_fp32_head
+from speculators.models.leagle.loop_hidden_loss import LoopHiddenAlignment
 from speculators.models.leagle.masked_loss import masked_training_step
 from speculators.models.leagle.output_head import training_output_weights
 from speculators.models.leagle.shared_loss import CandidateTeacher
@@ -56,6 +57,8 @@ class TrainingObjective:
         shared_normalization=False,
         stream_main_loss=False,
         candidate_train_stride=1,
+        loop_hs_loss=False,
+        loop_hs_loss_weight=0.1,
     ):
         self.model, self.docs, self.decay = model, docs, decay
         # Combining CE/TV adjoints before a low-precision cast changes gradients.
@@ -103,8 +106,14 @@ class TrainingObjective:
             or model.verifier_lm_head.weight.requires_grad
         ):
             raise ValueError("Streaming main loss requires frozen output matrices")
+        self.loop_hs_weight = loop_hs_loss_weight
+        self.loop_hs = None
         with torch.no_grad():
             self.targets = model.verifier_norm(teacher_hidden)
+            if loop_hs_loss and loop_hs_loss_weight > 0 and model.config.num_loops > 1:
+                self.loop_hs = LoopHiddenAlignment(
+                    model, self.targets, docs, self.valid, decay
+                )
             if not chunk_size:
                 self.targets = model.verifier_lm_head(self.targets)
         self.teacher_cache = None
@@ -238,6 +247,8 @@ class TrainingObjective:
 
     def finish(self, predictions):
         total_loss = self.loss
+        if self.loop_hs is not None:
+            total_loss = total_loss + self.loop_hs_weight * self.loop_hs.loss
         if self.candidate_loss is not None:
             total_loss = (
                 total_loss
@@ -252,11 +263,25 @@ class TrainingObjective:
                 "loss_total": total_loss.new_ones(()),
             }
         )
-        if self.metrics is not None and self.candidate_loss is not None:
+        if self.metrics is not None and (
+            self.candidate_loss is not None or self.loop_hs is not None
+        ):
             counts.update(
                 {
                     "draft_loss_sum": self.loss.detach(),
                     "draft_loss_total": self.loss.new_ones(()),
+                }
+            )
+        if self.metrics is not None and self.loop_hs is not None:
+            counts.update(
+                {
+                    "loop_hs_loss_sum": self.loop_hs.loss.detach(),
+                    "loop_hs_loss_total": total_loss.new_ones(()),
+                }
+            )
+        if self.metrics is not None and self.candidate_loss is not None:
+            counts.update(
+                {
                     "candidate_kl_sum": self.candidate_counts["kl"],
                     "candidate_kl_total": self.candidate_counts["total"],
                     "candidate_recall_sum": self.candidate_counts["recall"],

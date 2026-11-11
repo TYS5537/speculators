@@ -1,7 +1,7 @@
 """KV-conditioned decoder with explicit, immutable draft-cache inputs.
 
 Only token steps append cache entries. A caller owns one cache per logical
-depth (loop, physical layer), even though all loops share the layer weights.
+attention visit, even though loops share weights. FFN loops do not add KV caches.
 """
 
 import torch
@@ -158,7 +158,25 @@ class LEagleDecoderLayer(nn.Module):
         context_kv=None,
         return_context_kv=False,
         checkpoint_mlp=False,
+        *,
+        loop_mode="full",
+        num_loops=1,
+        return_loop_hidden=False,
     ):
+        if loop_mode != "full":
+            return self._sublayer_forward(
+                target_hidden,
+                hidden_states,
+                position_embeddings,
+                attention_mask,
+                past_draft_kv,
+                context_kv,
+                return_context_kv,
+                checkpoint_mlp,
+                loop_mode,
+                num_loops,
+                return_loop_hidden,
+            )
         result = self.self_attn(
             self.input_layernorm(hidden_states),
             target_hidden,
@@ -170,6 +188,10 @@ class LEagleDecoderLayer(nn.Module):
         )
         attention, present = result[:2]
         hidden_states = hidden_states + attention
+        hidden_states = self._residual_mlp(hidden_states, checkpoint_mlp)
+        return hidden_states, present, *result[2:]
+
+    def _residual_mlp(self, hidden_states, checkpoint_mlp):
         mlp_output = (
             checkpoint(
                 self._mlp_forward,
@@ -180,8 +202,56 @@ class LEagleDecoderLayer(nn.Module):
             if checkpoint_mlp and torch.is_grad_enabled()
             else self._mlp_forward(hidden_states)
         )
-        hidden_states = hidden_states + mlp_output
-        return hidden_states, present, *result[2:]
+        return hidden_states + mlp_output
+
+    def _sublayer_forward(
+        self,
+        target_hidden,
+        hidden_states,
+        position_embeddings,
+        attention_mask,
+        past_draft_kv,
+        context_kv,
+        return_context_kv,
+        checkpoint_mlp,
+        loop_mode,
+        num_loops,
+        return_loop_hidden,
+    ):
+        """A^R F or A F^R, returning intermediate states without side effects.
+
+        Loop supervision is attached by the caller outside layer checkpointing;
+        recomputing this function must never accumulate an auxiliary loss twice.
+        The enclosing layer call also preserves FSDP's parameter-gather boundary.
+        """
+        attention_loops = num_loops if loop_mode == "attn" else 1
+        ffn_loops = num_loops if loop_mode == "ffn" else 1
+        if len(past_draft_kv) != attention_loops:
+            raise ValueError("Sublayer loop needs one draft cache per attention visit")
+        presents, intermediate = [], []
+        for repeat in range(attention_loops):
+            result = self.self_attn(
+                self.input_layernorm(hidden_states),
+                target_hidden,
+                position_embeddings,
+                attention_mask,
+                past_draft_kv[repeat],
+                context_kv,
+                return_context_kv,
+            )
+            attention, present = result[:2]
+            hidden_states = hidden_states + attention
+            presents.append(present)
+            if return_context_kv:
+                context_kv = result[2]
+            if return_loop_hidden and repeat + 1 < attention_loops:
+                intermediate.append(hidden_states)
+        for repeat in range(ffn_loops):
+            hidden_states = self._residual_mlp(hidden_states, checkpoint_mlp)
+            if return_loop_hidden and repeat + 1 < ffn_loops:
+                intermediate.append(hidden_states)
+        context_result = (context_kv,) if return_context_kv else ()
+        return hidden_states, presents, *context_result, tuple(intermediate)
 
     def _mlp_forward(self, hidden_states):
         return self.mlp(self.post_attention_layernorm(hidden_states))

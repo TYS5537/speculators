@@ -135,7 +135,12 @@ def test_rejected_eos_is_not_a_stop_and_first_mismatch_ends_acceptance():
 
 
 def make_real_models(
-    layers=1, loops=1, reduced=True, candidate_head=False, candidate_rerank=True
+    layers=1,
+    loops=1,
+    reduced=True,
+    candidate_head=False,
+    candidate_rerank=True,
+    loop_mode="full",
 ):
     config = Qwen3Config(
         vocab_size=32,
@@ -162,6 +167,7 @@ def make_real_models(
             draft_vocab_size=16 if reduced else 32,
             aux_hidden_state_layer_ids=[1, 2],
             num_loops=loops,
+            loop_mode=loop_mode,
             candidate_head=candidate_head,
             candidate_rerank=candidate_rerank,
             candidate_head_rank=4,
@@ -215,8 +221,8 @@ def test_check_greedy_detects_incorrect_output():
         check_greedy_output(target, inputs, response, 4, [])
 
 
-def save_fixture(tmp_path):
-    target, draft = make_real_models(layers=2, loops=3)
+def save_fixture(tmp_path, loop_mode="full"):
+    target, draft = make_real_models(layers=2, loops=3, loop_mode=loop_mode)
     target_path, draft_path = tmp_path / "target", tmp_path / "draft"
     target.save_pretrained(target_path)
     draft.save_pretrained(draft_path)

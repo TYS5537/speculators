@@ -23,6 +23,7 @@ DECODER_SHAPING_FLAGS: dict[str, str] = {
 # runtime-only subset below can safely change without adding/removing weights.
 PRETRAINED_MODEL_CONFIG_FLAGS: dict[str, str] = {
     "num_loops": "--num-loops",
+    "loop_mode": "--loop-mode",
     "candidate_head": "--candidate-head",
     "candidate_rerank": "--candidate-rerank",
     "candidate_head_rank": "--candidate-head-rank",

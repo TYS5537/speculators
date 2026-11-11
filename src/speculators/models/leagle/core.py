@@ -1,6 +1,7 @@
 """EAGLE-style token/state recurrence with DFlash-style target KV injection."""
 
 import logging
+import math
 from typing import ClassVar
 
 import torch
@@ -292,6 +293,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         compute_logits=True,
         selective_checkpoint=False,
         low_rank_output=False,
+        loop_hs_loss=None,
+        ttt_step=0,
     ):
         embeddings = self.embed_tokens(token_ids)
         hidden = self.input_fc(
@@ -310,7 +313,20 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         position_embeddings = self.rotary_emb(hidden, positions)
         next_caches: list[DraftKV | StaticDraftKV] = []
-        for loop in range(self.config.num_loops):
+        full_loop = self.config.loop_mode == "full"
+        attention_loops = (
+            self.config.num_loops if self.config.loop_mode == "attn" else 1
+        )
+        layer_options = (
+            {}
+            if full_loop
+            else {
+                "loop_mode": self.config.loop_mode,
+                "num_loops": self.config.num_loops,
+                "return_loop_hidden": loop_hs_loss is not None,
+            }
+        )
+        for loop in range(self.config.num_loops if full_loop else 1):
             for index, layer in enumerate(self.layers):
                 logical_depth = loop * len(self.layers) + index
                 mask = masks[layer.self_attn.sliding_window]
@@ -319,7 +335,11 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     hidden,
                     position_embeddings,
                     mask,
-                    caches[logical_depth],
+                    caches[logical_depth]
+                    if full_loop
+                    else caches[
+                        index * attention_loops : (index + 1) * attention_loops
+                    ],
                 )
                 if context_kv is not None:
                     # Target context and projection weights are shared by loops;
@@ -327,32 +347,25 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     layer_args = (*layer_args, context_kv[index])
                 elif training_context_cache is not None:
                     layer_args = (*layer_args, training_context_cache[index], True)
-                recompute = (
-                    self.training
-                    and not self.candidate_head_only
-                    and self.activation_checkpointing
-                    and (
-                        self.activation_checkpoint_layers is None
-                        or index in self.activation_checkpoint_layers
-                    )
+                result = self._run_layer(
+                    index, layer_args, selective_checkpoint, layer_options
                 )
-                if recompute and selective_checkpoint:
-                    # Attention already checkpoints each compact query chunk.
-                    # Keep its Q/K/V graph and recompute only the MLP here.
-                    result = layer(*layer_args, checkpoint_mlp=True)
-                elif recompute:
-                    result = checkpoint(
-                        layer,
-                        *layer_args,
-                        use_reentrant=False,
-                        preserve_rng_state=True,
-                    )
-                else:
-                    result = layer(*layer_args)
                 hidden, present = result[:2]
                 if training_context_cache is not None:
                     training_context_cache[index] = result[2]
-                next_caches.append(present)
+                if full_loop:
+                    next_caches.append(present)
+                else:
+                    next_caches.extend(present)
+                    if loop_hs_loss is not None:
+                        for intermediate in result[-1]:
+                            loop_hs_loss.add(intermediate, ttt_step)
+            if (
+                full_loop
+                and loop_hs_loss is not None
+                and loop + 1 < self.config.num_loops
+            ):
+                loop_hs_loss.add(hidden, ttt_step)
         normalized = self.norm(hidden)
         logits = (
             self.candidate_head.coarse_logits(normalized)
@@ -363,6 +376,30 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         )
         state = normalized if self.config.norm_output else hidden
         return logits, state, next_caches, normalized
+
+    def _run_layer(self, index, arguments, selective_checkpoint, options):
+        layer = self.layers[index]
+        recompute = (
+            self.training
+            and not self.candidate_head_only
+            and self.activation_checkpointing
+            and (
+                self.activation_checkpoint_layers is None
+                or index in self.activation_checkpoint_layers
+            )
+        )
+        if recompute and selective_checkpoint:
+            # Compact attention already checkpoints its query chunks.
+            return layer(*arguments, checkpoint_mlp=True, **options)
+        if recompute:
+            return checkpoint(
+                layer,
+                *arguments,
+                use_reentrant=False,
+                preserve_rng_state=True,
+                **options,
+            )
+        return layer(*arguments, **options)
 
     def _output_logits(self, normalized, use_candidate_head):
         if use_candidate_head:
@@ -494,6 +531,15 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             raise ValueError("Selective checkpoint requires activation checkpointing")
         return chunk_size
 
+    def _validate_loop_hs_loss(self, enabled, weight, teacher_hidden):
+        if not math.isfinite(weight) or weight < 0:
+            raise ValueError("Loop HS loss weight must be finite and nonnegative")
+        if enabled and (teacher_hidden is None or self.candidate_head_only):
+            raise ValueError(
+                "Loop HS alignment requires teacher hidden states and backbone "
+                "training; candidate-head-only is unsupported"
+            )
+
     def forward(
         self,
         hidden_states,
@@ -508,6 +554,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         teacher_forcing=None,
         collect_metrics=True,
         candidate_head_train_stride=1,
+        leagle_loop_hs_loss=False,
+        leagle_loop_hs_loss_weight=0.1,
         leagle_reuse_training_kv=TRAINING_DEFAULTS["leagle_reuse_training_kv"],
         leagle_chunked_loss=TRAINING_DEFAULTS["leagle_chunked_loss"],
         leagle_loss_chunk_size=TRAINING_DEFAULTS["leagle_loss_chunk_size"],
@@ -550,6 +598,11 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         """
         if ttt_steps < 1:
             raise ValueError("ttt_steps must be positive")
+        self._validate_loop_hs_loss(
+            leagle_loop_hs_loss,
+            leagle_loop_hs_loss_weight,
+            verifier_last_hidden_states,
+        )
         return_loss = (
             verifier_last_hidden_states is not None or self.candidate_head_only
         )
@@ -643,13 +696,15 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                 candidate_train_stride=candidate_head_train_stride
                 if self.training
                 else 1,
+                loop_hs_loss=leagle_loop_hs_loss,
+                loop_hs_loss_weight=leagle_loop_hs_loss_weight,
             )
             if return_loss
             else None
         )
         state, tokens = context, input_ids
         predictions = []
-        caches = [None] * self.config.effective_depth
+        caches = [None] * self.config.attention_depth
         context_cache = [None] * len(self.layers) if leagle_reuse_training_kv else None
         windows = {layer.self_attn.sliding_window for layer in self.layers}
         for step in range(ttt_steps):
@@ -676,6 +731,10 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
                     compute_logits=not chunked_head,
                     selective_checkpoint=leagle_selective_checkpoint,
                     low_rank_output=self.low_rank_main,
+                    loop_hs_loss=objective.loop_hs
+                    if leagle_loop_hs_loss and objective is not None
+                    else None,
+                    ttt_step=step,
                 )
             draft_ids = (
                 objective.step(logits, normalized, step)
@@ -702,7 +761,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             if (
                 not self.reuse_rollout_buffers
                 or prepared_context is None
-                or len(rollout_buffers) != self.config.effective_depth
+                or len(rollout_buffers) != self.config.attention_depth
                 or any(
                     not isinstance(cache, ReusableDraftKV) or cache.length != length
                     for cache in rollout_buffers
@@ -715,10 +774,10 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
         return (
             [
                 StaticDraftKV(length + num_tokens)
-                for _ in range(self.config.effective_depth)
+                for _ in range(self.config.attention_depth)
             ]
             if self.static_kv
-            else [None] * self.config.effective_depth
+            else [None] * self.config.attention_depth
         )
 
     @staticmethod
@@ -852,6 +911,7 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             draft_vocab_size=kwargs["draft_vocab_size"],
             aux_hidden_state_layer_ids=target_layers,
             num_loops=kwargs.get("num_loops", 1),
+            loop_mode=kwargs.get("loop_mode", "full"),
             norm_output=kwargs.get("norm_output", True),
             candidate_head=kwargs.get("candidate_head", False),
             candidate_rerank=kwargs.get("candidate_rerank", True),
@@ -902,6 +962,8 @@ class LEagleDraftModel(DraftVocabMixin, SpeculatorModel):
             "teacher_forcing": True,
             "collect_metrics": True,
             "candidate_head_train_stride": kwargs.get("candidate_head_train_stride", 1),
+            "leagle_loop_hs_loss": kwargs.get("leagle_loop_hs_loss", False),
+            "leagle_loop_hs_loss_weight": kwargs.get("leagle_loop_hs_loss_weight", 0.1),
             # Predictions are unused by the trainer, even on metric steps.
             "return_predictions": False,
             **{
